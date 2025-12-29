@@ -1,5 +1,5 @@
 #![allow(dead_code, unused_variables)]
-use crate::models::{WikiPage};
+use crate::models::{WikiPage, PageType};
 use anyhow::Result;
 use bzip2::read::BzDecoder;
 use quick_xml::events::Event;
@@ -46,16 +46,76 @@ impl Iterator for WikiReader {
         // there's a few ways to do this. I'm gonna reuse the buffer to speed
         // things up. I'm going to read into the buffer and match the event
         // to parse
-        let event = self.reader.read_event_into(&mut self.buf);
+        loop {
+            let event = self.reader.read_event_into(&mut self.buf);
 
-        match event {
-            Ok(Event::Start(e)) => {todo!()},
-            Ok(Event::Text(e)) => {todo!()},
-            Ok(Event::End(e)) => {todo!()},
-            Ok(Event::Eof) => {todo!()},
-            Err(_) => return None,
-            _ => (),
+            match event {
+                Ok(Event::Start(e)) => match e.name().as_ref() {
+                    b"page" => {
+                        todo!()
+                    }
+                    b"title" => in_title = true,
+                    b"id" if current_id.is_none() => in_id = true,
+                    b"text" => {
+                        if !self.skip_text {
+                            in_text = true
+                        }
+                    }
+                    b"redirect" => {
+                        if let Ok(attr) = e.try_get_attribute("title") {
+                            redirect_target =
+                                Some(String::from_utf8_lossy(&attr.unwrap().value).to_string());
+                        }
+                    },
+                    _ => (),
+
+                },
+
+                Ok(Event::Text(e)) => {
+                    if in_title {
+                        let s = String::from_utf8_lossy(&e);
+                        current_title = Some(s.into_owned());
+                    }
+                    if in_id {
+                        let s = String::from_utf8_lossy(&e);
+                        current_id = s.parse::<u32>().ok();
+                    }
+                    if in_text {
+                        let s = String::from_utf8_lossy(&e);
+                        current_text = Some(s.into_owned());
+                    }
+                }
+
+                Ok(Event::End(e)) => match e.name().as_ref() {
+                    b"title" => in_title = false,
+                    b"id" => in_id = false,
+                    b"text" => in_text = false,
+                    b"page" => {
+                        let title = current_title.take()?;
+                        let id = current_id.take()?;
+
+                        let page_type = if let Some(target) = redirect_target.take() {
+                            PageType::Redirect(target)
+                        } else if title.starts_with("File:") || title.starts_with("Category:") {
+                            PageType::Special
+                        } else {
+                            PageType::Article
+                        };
+
+                        return Some(WikiPage {
+                            id,
+                            title,
+                            page_type,
+                            text: current_text.take(),
+                        });
+                    }
+                    _ => (),
+                },
+                Ok(Event::Eof) => return None,
+                Err(_) => return None,
+                _ => (),
+            }
+            self.buf.clear();
         }
-        self.buf.clear();
     }
 }
