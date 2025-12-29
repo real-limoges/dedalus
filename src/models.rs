@@ -14,7 +14,7 @@ pub struct WikiPage {
     pub id: u32,
     pub title: String,
     pub page_type: PageType,
-    pub text: Option<String> // the first pass doesn't use this
+    pub text: Option<String>, // the first pass doesn't use this
 }
 
 #[derive(Serialize)]

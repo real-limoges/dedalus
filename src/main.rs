@@ -1,7 +1,7 @@
+mod extract;
+mod index;
 mod models;
 mod parser;
-mod index;
-mod extract;
 
 use std::time::Instant;
 
