@@ -13,3 +13,4 @@ regex = { version = "1.12.2" }
 csv = { version = "1.4.0" }
 serde_json = { version = "1.0.148" }
 quick-xml = { version = "0.31", features = ["serialize"] }
+rayon = { version = "1.11.0" }
