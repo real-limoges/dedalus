@@ -8,3 +8,7 @@ quick-xml = { version = "0.38.4", features = ["serialize"] }
 bzip2 = { version = "0.6.1" }
 serde = { version = "1.0.228", features = ["derive"] }
 anyhow = { version = "1.0.100" }
+indicatif = { version = "0.18.3" }
+clap = { version = "4.5.53", features = ["derive"] }
+regex = { version = "1.12.2" }
+csv = { version = "1.4.0" }

@@ -1,5 +1,4 @@
-#![allow(dead_code, unused_variables)]
-use crate::models::{WikiPage, PageType};
+use crate::models::{PageType, WikiPage};
 use anyhow::Result;
 use bzip2::read::BzDecoder;
 use quick_xml::events::Event;
@@ -66,9 +65,8 @@ impl Iterator for WikiReader {
                             redirect_target =
                                 Some(String::from_utf8_lossy(&attr.unwrap().value).to_string());
                         }
-                    },
+                    }
                     _ => (),
-
                 },
 
                 Ok(Event::Text(e)) => {
