@@ -46,7 +46,6 @@ impl Iterator for WikiReader {
 
         loop {
             match self.reader.read_event_into(&mut self.buf) {
-
                 // 1. START TAGS
                 Ok(Event::Start(e)) => match e.name().as_ref() {
                     b"page" => {
@@ -62,7 +61,8 @@ impl Iterator for WikiReader {
                     }
                     b"redirect" => {
                         if let Ok(Some(attr)) = e.try_get_attribute("title") {
-                            redirect_target = Some(String::from_utf8_lossy(&attr.value).to_string());
+                            redirect_target =
+                                Some(String::from_utf8_lossy(&attr.value).to_string());
                         }
                     }
                     _ => (),
@@ -76,11 +76,10 @@ impl Iterator for WikiReader {
                     } else if in_id {
                         let s = String::from_utf8_lossy(&e).trim().to_string();
                         current_id = s.parse::<u32>().ok();
-                    } else if in_text
-                        && let Ok(s) = e.unescape() {
-                            current_text = Some(s.into_owned());
-                        }
-                },
+                    } else if in_text && let Ok(s) = e.unescape() {
+                        current_text = Some(s.into_owned());
+                    }
+                }
 
                 Ok(Event::End(e)) => match e.name().as_ref() {
                     b"title" => in_title = false,
@@ -88,10 +87,12 @@ impl Iterator for WikiReader {
                     b"text" => in_text = false,
                     b"page" => {
                         if let (Some(id), Some(title)) = (current_id, current_title.take()) {
-
                             let page_type = if let Some(target) = redirect_target.take() {
                                 PageType::Redirect(target)
-                            } else if title.starts_with("File:") || title.starts_with("Category:") || title.starts_with("Template:") {
+                            } else if title.starts_with("File:")
+                                || title.starts_with("Category:")
+                                || title.starts_with("Template:")
+                            {
                                 PageType::Special
                             } else {
                                 PageType::Article
@@ -109,7 +110,11 @@ impl Iterator for WikiReader {
                 },
                 Ok(Event::Eof) => return None,
                 Err(e) => {
-                    eprintln!("XML Parse Error at position {}: {:?}", self.reader.buffer_position(), e);
+                    eprintln!(
+                        "XML Parse Error at position {}: {:?}",
+                        self.reader.buffer_position(),
+                        e
+                    );
                     return None;
                 }
                 _ => (),

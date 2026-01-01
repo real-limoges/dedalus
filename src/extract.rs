@@ -3,19 +3,18 @@
 use crate::index::WikiIndex;
 use crate::models::{ArticleBlob, PageType};
 use crate::parser::WikiReader;
+use rayon::prelude::*;
 use regex::Regex;
 use std::fs::{self, File};
 use std::sync::{Arc, Mutex};
-use rayon::prelude::*;
 
 pub fn run_extraction(path: &str, output_dir: &str, index: &WikiIndex) {
     let nodes_writer = Arc::new(Mutex::new(
-        csv::Writer::from_path(format!("{}/nodes.csv", output_dir)).unwrap()
+        csv::Writer::from_path(format!("{}/nodes.csv", output_dir)).unwrap(),
     ));
     let edges_writer = Arc::new(Mutex::new(
-        csv::Writer::from_path(format!("{}/edges.csv", output_dir)).unwrap()
+        csv::Writer::from_path(format!("{}/edges.csv", output_dir)).unwrap(),
     ));
-
 
     let reader = WikiReader::new(path, true).expect("Failed to open wiki dump");
     // there's no way I didn't look this up haha
@@ -53,7 +52,9 @@ pub fn run_extraction(path: &str, output_dir: &str, index: &WikiIndex) {
                 if !local_edges.is_empty() {
                     let mut writer = edges_writer.lock().unwrap();
                     for (start, end) in local_edges {
-                        writer.write_record(&[start, end, "LINKS_TO".to_string()]).unwrap();
+                        writer
+                            .write_record(&[start, end, "LINKS_TO".to_string()])
+                            .unwrap();
                     }
                 }
 
