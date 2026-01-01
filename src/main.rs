@@ -19,13 +19,17 @@ fn main() {
     println!("# ----- Mapping ----- #");
     let start_indexing = Instant::now();
     let index = index::WikiIndex::build(&args.input);
-    println!("Mapping Took: {:?}", start_indexing.elapsed().as_secs_f64());
+    println!(
+        "--- Mapping Took: {:?} ---",
+        start_indexing.elapsed().as_secs_f64()
+    );
 
     println!("# ----- Extracting ----- #");
     let start_extracting = Instant::now();
     extract::run_extraction(&args.input, &args.output, &index);
     println!(
-        "Extracting Took: {:?}",
+        "--- Extracting Took: {:?} ---",
         start_extracting.elapsed().as_secs_f64(),
     );
+    println!("# ----- Completed Successfully! ----- #")
 }
