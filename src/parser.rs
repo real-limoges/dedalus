@@ -7,6 +7,13 @@ use std::fs::File;
 use std::io::BufReader;
 use std::str;
 
+#[cfg(test)]
+use bzip2::write::BzEncoder;
+#[cfg(test)]
+use bzip2::Compression;
+#[cfg(test)]
+use std::io::Write;
+
 pub struct WikiReader {
     reader: Reader<BufReader<BzDecoder<File>>>,
     buf: Vec<u8>,
@@ -68,6 +75,15 @@ impl Iterator for WikiReader {
                     _ => (),
                 },
 
+                Ok(Event::Empty(e)) => {
+                    if e.name().as_ref() == b"redirect" {
+                        if let Ok(Some(attr)) = e.try_get_attribute("title") {
+                            redirect_target =
+                                Some(String::from_utf8_lossy(&attr.value).to_string());
+                        }
+                    }
+                }
+
                 Ok(Event::Text(e)) => {
                     if in_title {
                         if let Ok(s) = e.unescape() {
@@ -124,5 +140,268 @@ impl Iterator for WikiReader {
             // reuse memory
             self.buf.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+
+    fn create_bz2_xml(xml: &str) -> NamedTempFile {
+        let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(xml.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&compressed).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    #[test]
+    fn parse_single_article() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Rust</title>
+                <id>1</id>
+                <revision>
+                    <id>100</id>
+                    <text>Rust is a systems programming language.</text>
+                </revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, 1);
+        assert_eq!(pages[0].title, "Rust");
+        assert!(matches!(pages[0].page_type, PageType::Article));
+        assert_eq!(
+            pages[0].text.as_deref(),
+            Some("Rust is a systems programming language.")
+        );
+    }
+
+    #[test]
+    fn parse_skip_text_mode() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Rust</title>
+                <id>1</id>
+                <revision>
+                    <id>100</id>
+                    <text>This text should be skipped.</text>
+                </revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, 1);
+        assert!(pages[0].text.is_none());
+    }
+
+    #[test]
+    fn parse_redirect_page() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Rust lang</title>
+                <id>2</id>
+                <redirect title="Rust (programming language)" />
+                <revision>
+                    <id>200</id>
+                    <text>#REDIRECT [[Rust (programming language)]]</text>
+                </revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, 2);
+        assert_eq!(pages[0].title, "Rust lang");
+        match &pages[0].page_type {
+            PageType::Redirect(target) => {
+                assert_eq!(target, "Rust (programming language)");
+            }
+            _ => panic!("Expected Redirect page type"),
+        }
+    }
+
+    #[test]
+    fn classify_special_pages() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>File:Example.jpg</title>
+                <id>10</id>
+            </page>
+            <page>
+                <title>Category:Programming languages</title>
+                <id>11</id>
+            </page>
+            <page>
+                <title>Template:Infobox</title>
+                <id>12</id>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 3);
+        for page in &pages {
+            assert!(
+                matches!(page.page_type, PageType::Special),
+                "Expected Special for '{}'",
+                page.title
+            );
+        }
+    }
+
+    #[test]
+    fn parse_multiple_pages() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Rust</title>
+                <id>1</id>
+                <revision><id>100</id><text>Article about Rust.</text></revision>
+            </page>
+            <page>
+                <title>Python</title>
+                <id>2</id>
+                <revision><id>200</id><text>Article about Python.</text></revision>
+            </page>
+            <page>
+                <title>JavaScript</title>
+                <id>3</id>
+                <revision><id>300</id><text>Article about JavaScript.</text></revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].title, "Rust");
+        assert_eq!(pages[1].title, "Python");
+        assert_eq!(pages[2].title, "JavaScript");
+        assert_eq!(pages[0].id, 1);
+        assert_eq!(pages[1].id, 2);
+        assert_eq!(pages[2].id, 3);
+    }
+
+    #[test]
+    fn first_id_tag_is_page_id() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Test</title>
+                <id>42</id>
+                <revision>
+                    <id>99999</id>
+                    <text>Content</text>
+                </revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages[0].id, 42);
+    }
+
+    #[test]
+    fn parse_empty_dump() {
+        let xml = r#"<mediawiki></mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn parse_mixed_page_types() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Regular Article</title>
+                <id>1</id>
+                <revision><id>100</id><text>Content</text></revision>
+            </page>
+            <page>
+                <title>Old Name</title>
+                <id>2</id>
+                <redirect title="Regular Article" />
+                <revision><id>200</id><text>#REDIRECT [[Regular Article]]</text></revision>
+            </page>
+            <page>
+                <title>File:Photo.png</title>
+                <id>3</id>
+                <revision><id>300</id><text>File description</text></revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 3);
+        assert!(matches!(pages[0].page_type, PageType::Article));
+        assert!(matches!(pages[1].page_type, PageType::Redirect(_)));
+        assert!(matches!(pages[2].page_type, PageType::Special));
+    }
+
+    #[test]
+    fn parse_unicode_content() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>日本語</title>
+                <id>1</id>
+                <revision><id>100</id><text>日本語の記事 with [[リンク]]</text></revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].title, "日本語");
+        assert!(pages[0].text.as_deref().unwrap().contains("日本語の記事"));
+    }
+
+    #[test]
+    fn parse_xml_entities_in_title() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>AT&amp;T</title>
+                <id>1</id>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].title, "AT&T");
+    }
+
+    #[test]
+    fn nonexistent_file_returns_error() {
+        let result = WikiReader::new("/nonexistent/path.xml.bz2", false);
+        assert!(result.is_err());
     }
 }
