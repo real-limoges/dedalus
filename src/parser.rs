@@ -76,8 +76,10 @@ impl Iterator for WikiReader {
                     } else if in_id {
                         let s = String::from_utf8_lossy(&e).trim().to_string();
                         current_id = s.parse::<u32>().ok();
-                    } else if in_text && let Ok(s) = e.unescape() {
-                        current_text = Some(s.into_owned());
+                    } else if in_text {
+                        if let Ok(s) = e.unescape() {
+                            current_text = Some(s.into_owned());
+                        }
                     }
                 }
 
