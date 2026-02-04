@@ -1,10 +1,3 @@
-mod config;
-mod extract;
-mod index;
-mod models;
-mod parser;
-mod stats;
-
 use anyhow::Result;
 use clap::Parser;
 use std::process::ExitCode;
@@ -44,7 +37,7 @@ struct Cli {
 fn run(args: Cli) -> Result<()> {
     info!("Starting indexing pass");
     let start_indexing = Instant::now();
-    let index = index::WikiIndex::build(&args.input)?;
+    let index = dedalus::index::WikiIndex::build(&args.input)?;
     let indexing_duration = start_indexing.elapsed();
     info!(
         duration_secs = indexing_duration.as_secs_f64(),
@@ -53,8 +46,13 @@ fn run(args: Cli) -> Result<()> {
 
     info!("Starting extraction pass");
     let start_extracting = Instant::now();
-    let stats =
-        extract::run_extraction(&args.input, &args.output, &index, args.limit, args.dry_run)?;
+    let stats = dedalus::extract::run_extraction(
+        &args.input,
+        &args.output,
+        &index,
+        args.limit,
+        args.dry_run,
+    )?;
     let extraction_duration = start_extracting.elapsed();
     info!(
         duration_secs = extraction_duration.as_secs_f64(),

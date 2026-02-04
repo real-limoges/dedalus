@@ -61,7 +61,7 @@ pub fn run_extraction(
             csv::Writer::from_writer(Box::new(file) as Box<dyn Write + Send>)
         }));
 
-    let reader = WikiReader::new(path, true)
+    let reader = WikiReader::new(path, false)
         .with_context(|| format!("Failed to open wiki dump: {}", path))?;
 
     nodes_writer
@@ -174,4 +174,97 @@ pub fn run_extraction(
             invalid_links: std::sync::atomic::AtomicU64::new(arc.invalid()),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_regex_simple_link() {
+        let caps: Vec<_> = LINK_REGEX.captures_iter("See [[Rust]]").collect();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(&caps[0][1], "Rust");
+    }
+
+    #[test]
+    fn link_regex_piped_link() {
+        let caps: Vec<_> = LINK_REGEX
+            .captures_iter("See [[Rust (programming language)|Rust]]")
+            .collect();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(&caps[0][1], "Rust (programming language)");
+    }
+
+    #[test]
+    fn link_regex_multiple_links() {
+        let text = "[[Rust]] and [[Python]] are languages.";
+        let targets: Vec<&str> = LINK_REGEX
+            .captures_iter(text)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        assert_eq!(targets, vec!["Rust", "Python"]);
+    }
+
+    #[test]
+    fn link_regex_no_links() {
+        let caps: Vec<_> = LINK_REGEX.captures_iter("No links here").collect();
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn link_regex_link_with_spaces() {
+        let caps: Vec<_> = LINK_REGEX
+            .captures_iter("[[United States of America]]")
+            .collect();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(&caps[0][1], "United States of America");
+    }
+
+    #[test]
+    fn link_regex_link_with_parentheses() {
+        let caps: Vec<_> = LINK_REGEX.captures_iter("[[Mercury (planet)]]").collect();
+        assert_eq!(caps.len(), 1);
+        assert_eq!(&caps[0][1], "Mercury (planet)");
+    }
+
+    #[test]
+    fn link_regex_adjacent_links() {
+        let text = "[[A]][[B]][[C]]";
+        let targets: Vec<&str> = LINK_REGEX
+            .captures_iter(text)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        assert_eq!(targets, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn link_regex_ignores_single_brackets() {
+        let caps: Vec<_> = LINK_REGEX.captures_iter("[not a link]").collect();
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn link_regex_empty_brackets() {
+        // [[]] should not match because the regex requires at least one char
+        let caps: Vec<_> = LINK_REGEX.captures_iter("[[]]").collect();
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn shard_calculation() {
+        assert_eq!(0 % SHARD_COUNT, 0);
+        assert_eq!(1 % SHARD_COUNT, 1);
+        assert_eq!(999 % SHARD_COUNT, 999);
+        assert_eq!(1000 % SHARD_COUNT, 0);
+        assert_eq!(1001 % SHARD_COUNT, 1);
+        assert_eq!(123456 % SHARD_COUNT, 456);
+    }
+
+    #[test]
+    fn shard_stays_within_bounds() {
+        for id in [0u32, 1, 500, 999, 1000, 99999, u32::MAX] {
+            assert!(id % SHARD_COUNT < SHARD_COUNT);
+        }
+    }
 }

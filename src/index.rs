@@ -15,7 +15,7 @@ impl WikiIndex {
     pub fn build(path: &str) -> Result<Self> {
         let mut title_to_id = HashMap::new();
         let mut redirects = HashMap::new();
-        let reader = WikiReader::new(path, false)
+        let reader = WikiReader::new(path, true)
             .with_context(|| format!("Failed to open wiki dump at: {}", path))?;
         let pb = ProgressBar::new_spinner();
 
@@ -68,5 +68,121 @@ impl WikiIndex {
         }
         debug!(title = title, "Redirect chain too deep");
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_index(articles: Vec<(&str, u32)>, redirects: Vec<(&str, &str)>) -> WikiIndex {
+        WikiIndex {
+            title_to_id: articles
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            redirects: redirects
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_direct_title() {
+        let index = make_index(vec![("Rust", 1), ("Python", 2)], vec![]);
+        assert_eq!(index.resolve_id("Rust"), Some(1));
+        assert_eq!(index.resolve_id("Python"), Some(2));
+    }
+
+    #[test]
+    fn resolve_single_redirect() {
+        let index = make_index(
+            vec![("Rust (programming language)", 1)],
+            vec![("Rust", "Rust (programming language)")],
+        );
+        assert_eq!(index.resolve_id("Rust"), Some(1));
+    }
+
+    #[test]
+    fn resolve_redirect_chain() {
+        let index = make_index(vec![("C", 1)], vec![("A", "B"), ("B", "C")]);
+        assert_eq!(index.resolve_id("A"), Some(1));
+    }
+
+    #[test]
+    fn resolve_redirect_at_max_depth() {
+        // Chain of exactly REDIRECT_MAX_DEPTH hops should still resolve
+        let mut redirects = Vec::new();
+        for i in 0..(REDIRECT_MAX_DEPTH - 1) {
+            redirects.push((format!("R{}", i), format!("R{}", i + 1)));
+        }
+        let final_title = format!("R{}", REDIRECT_MAX_DEPTH - 1);
+        let articles = vec![(final_title.as_str(), 1u32)];
+
+        let index = WikiIndex {
+            title_to_id: articles
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            redirects: redirects.into_iter().map(|(k, v)| (k, v)).collect(),
+        };
+
+        assert_eq!(index.resolve_id("R0"), Some(1));
+    }
+
+    #[test]
+    fn resolve_redirect_exceeds_max_depth() {
+        // Chain of REDIRECT_MAX_DEPTH + 1 redirects should fail
+        let mut redirects = Vec::new();
+        for i in 0..=REDIRECT_MAX_DEPTH {
+            redirects.push((format!("R{}", i), format!("R{}", i + 1)));
+        }
+        let final_title = format!("R{}", REDIRECT_MAX_DEPTH + 1);
+
+        let index = WikiIndex {
+            title_to_id: [(final_title, 1)].into_iter().collect(),
+            redirects: redirects.into_iter().collect(),
+        };
+
+        assert_eq!(index.resolve_id("R0"), None);
+    }
+
+    #[test]
+    fn resolve_circular_redirect() {
+        let index = make_index(vec![], vec![("A", "B"), ("B", "C"), ("C", "A")]);
+        assert_eq!(index.resolve_id("A"), None);
+    }
+
+    #[test]
+    fn resolve_self_redirect() {
+        let index = make_index(vec![], vec![("A", "A")]);
+        assert_eq!(index.resolve_id("A"), None);
+    }
+
+    #[test]
+    fn resolve_nonexistent_title() {
+        let index = make_index(vec![("Rust", 1)], vec![]);
+        assert_eq!(index.resolve_id("Python"), None);
+    }
+
+    #[test]
+    fn resolve_redirect_to_nonexistent() {
+        let index = make_index(vec![], vec![("A", "B")]);
+        assert_eq!(index.resolve_id("A"), None);
+    }
+
+    #[test]
+    fn resolve_empty_index() {
+        let index = make_index(vec![], vec![]);
+        assert_eq!(index.resolve_id("Anything"), None);
+    }
+
+    #[test]
+    fn resolve_case_sensitive() {
+        let index = make_index(vec![("Rust", 1)], vec![]);
+        assert_eq!(index.resolve_id("Rust"), Some(1));
+        assert_eq!(index.resolve_id("rust"), None);
+        assert_eq!(index.resolve_id("RUST"), None);
     }
 }
