@@ -1,8 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use dedalus::cache;
+use dedalus::checkpoint::{self, CheckpointManager};
+use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
@@ -32,17 +36,103 @@ struct Cli {
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Resume from last checkpoint if available
+    #[arg(long)]
+    resume: bool,
+
+    /// Force rebuild of index cache
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Checkpoint interval in articles processed
+    #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL)]
+    checkpoint_interval: u32,
+
+    /// Clear existing checkpoint and outputs before starting
+    #[arg(long)]
+    clean: bool,
 }
 
 fn run(args: Cli) -> Result<()> {
-    info!("Starting indexing pass");
+    if args.clean {
+        let output_path = Path::new(&args.output);
+        if output_path.exists() {
+            info!("Cleaning output directory: {}", args.output);
+            fs::remove_dir_all(output_path)
+                .with_context(|| format!("Failed to clean output directory: {}", args.output))?;
+        }
+    }
+
+    fs::create_dir_all(&args.output)
+        .with_context(|| format!("Failed to create output directory: {}", args.output))?;
+
+    // Index loading: try cache first unless --no-cache
     let start_indexing = Instant::now();
-    let index = dedalus::index::WikiIndex::build(&args.input)?;
+    let cache_path = cache::cache_path(&args.output);
+
+    let index = if args.no_cache {
+        info!("Cache disabled, building fresh index");
+        let idx = dedalus::index::WikiIndex::build(&args.input)?;
+        // Still save the cache for future runs
+        if !args.dry_run {
+            if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
+                warn!(error = %e, "Failed to save index cache");
+            }
+        }
+        idx
+    } else if cache::is_cache_valid(&cache_path, &args.input)? {
+        info!("Loading index from cache");
+        cache::load_index(&cache_path)?
+    } else {
+        info!("Building index (cache miss or invalid)");
+        let idx = dedalus::index::WikiIndex::build(&args.input)?;
+        if !args.dry_run {
+            if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
+                warn!(error = %e, "Failed to save index cache");
+            }
+        }
+        idx
+    };
+
     let indexing_duration = start_indexing.elapsed();
     info!(
         duration_secs = indexing_duration.as_secs_f64(),
         "Indexing complete"
     );
+
+    let checkpoint_mgr = if !args.dry_run {
+        Some(CheckpointManager::new(
+            &args.input,
+            &args.output,
+            args.shard_count,
+            args.checkpoint_interval,
+        )?)
+    } else {
+        None
+    };
+
+    let checkpoint = if args.resume && !args.clean {
+        match checkpoint::load_if_valid(&args.input, &args.output, args.shard_count)? {
+            Some(cp) => {
+                info!(
+                    last_id = cp.last_processed_id,
+                    articles = cp.stats.articles_processed,
+                    "Resuming from checkpoint"
+                );
+                if let Some(ref mgr) = checkpoint_mgr {
+                    mgr.set_last_id(cp.last_processed_id);
+                }
+                Some(cp)
+            }
+            None => {
+                info!("No valid checkpoint found, starting fresh");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     info!("Starting extraction pass");
     let start_extracting = Instant::now();
@@ -50,8 +140,11 @@ fn run(args: Cli) -> Result<()> {
         &args.input,
         &args.output,
         &index,
+        args.shard_count,
         args.limit,
         args.dry_run,
+        checkpoint.as_ref(),
+        checkpoint_mgr.as_ref(),
     )?;
     let extraction_duration = start_extracting.elapsed();
     info!(
@@ -59,7 +152,12 @@ fn run(args: Cli) -> Result<()> {
         "Extraction complete"
     );
 
-    // Print summary
+    if let Some(ref mgr) = checkpoint_mgr {
+        if let Err(e) = mgr.clear() {
+            warn!(error = %e, "Failed to clear checkpoint");
+        }
+    }
+
     println!();
     println!("=== Summary ===");
     println!(
@@ -77,8 +175,14 @@ fn run(args: Cli) -> Result<()> {
     println!();
     println!("Articles processed: {}", stats.articles());
     println!("Edges extracted:    {}", stats.edges());
+    println!("See also edges:     {}", stats.see_also_edges());
     println!("Blobs written:      {}", stats.blobs());
     println!("Invalid links:      {}", stats.invalid());
+    println!("Categories found:   {}", stats.categories());
+    println!("Category edges:     {}", stats.category_edges());
+    println!("Infoboxes found:    {}", stats.infoboxes());
+    println!("Images found:       {}", stats.images());
+    println!("External links:     {}", stats.external_links());
 
     Ok(())
 }
@@ -86,7 +190,6 @@ fn run(args: Cli) -> Result<()> {
 fn main() -> ExitCode {
     let args = Cli::parse();
 
-    // Initialize tracing based on verbosity
     let level = match args.verbose {
         0 => Level::WARN,
         1 => Level::INFO,

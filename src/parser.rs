@@ -45,11 +45,15 @@ impl Iterator for WikiReader {
         let mut current_title: Option<String> = None;
         let mut current_text: Option<String> = None;
         let mut redirect_target = None;
+        let mut current_ns: Option<i32> = None;
+        let mut current_timestamp: Option<String> = None;
 
         // flags
         let mut in_title = false;
         let mut in_id = false;
         let mut in_text = false;
+        let mut in_ns = false;
+        let mut in_timestamp = false;
 
         loop {
             match self.reader.read_event_into(&mut self.buf) {
@@ -60,6 +64,8 @@ impl Iterator for WikiReader {
                     }
                     b"title" => in_title = true,
                     b"id" if current_id.is_none() => in_id = true,
+                    b"ns" => in_ns = true,
+                    b"timestamp" => in_timestamp = true,
                     b"text" => {
                         // skip text first time around
                         if !self.skip_text {
@@ -92,6 +98,13 @@ impl Iterator for WikiReader {
                     } else if in_id {
                         let s = String::from_utf8_lossy(&e).trim().to_string();
                         current_id = s.parse::<u32>().ok();
+                    } else if in_ns {
+                        let s = String::from_utf8_lossy(&e).trim().to_string();
+                        current_ns = s.parse::<i32>().ok();
+                    } else if in_timestamp {
+                        if let Ok(s) = e.unescape() {
+                            current_timestamp = Some(s.into_owned());
+                        }
                     } else if in_text {
                         if let Ok(s) = e.unescape() {
                             current_text = Some(s.into_owned());
@@ -102,11 +115,19 @@ impl Iterator for WikiReader {
                 Ok(Event::End(e)) => match e.name().as_ref() {
                     b"title" => in_title = false,
                     b"id" => in_id = false,
+                    b"ns" => in_ns = false,
+                    b"timestamp" => in_timestamp = false,
                     b"text" => in_text = false,
                     b"page" => {
                         if let (Some(id), Some(title)) = (current_id, current_title.take()) {
                             let page_type = if let Some(target) = redirect_target.take() {
                                 PageType::Redirect(target)
+                            } else if let Some(ns) = current_ns {
+                                if ns == 0 {
+                                    PageType::Article
+                                } else {
+                                    PageType::Special
+                                }
                             } else if title.starts_with("File:")
                                 || title.starts_with("Category:")
                                 || title.starts_with("Template:")
@@ -121,6 +142,8 @@ impl Iterator for WikiReader {
                                 title,
                                 page_type,
                                 text: current_text.take(),
+                                ns: current_ns,
+                                timestamp: current_timestamp.take(),
                             });
                         }
                     }

@@ -50,6 +50,38 @@ impl WikiIndex {
         })
     }
 
+    /// Convert index to serializable form for caching
+    #[allow(clippy::type_complexity)]
+    pub fn to_serializable(&self) -> (Vec<(String, u32)>, Vec<(String, String)>) {
+        let articles: Vec<(String, u32)> = self
+            .title_to_id
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let redirects: Vec<(String, String)> = self
+            .redirects
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (articles, redirects)
+    }
+
+    /// Reconstruct index from serialized data
+    pub fn from_serializable(
+        articles: Vec<(String, u32)>,
+        redirects: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            title_to_id: articles.into_iter().collect(),
+            redirects: redirects.into_iter().collect(),
+        }
+    }
+
+    /// Get counts of articles and redirects in the index
+    pub fn stats(&self) -> (usize, usize) {
+        (self.title_to_id.len(), self.redirects.len())
+    }
+
     pub fn resolve_id(&self, title: &str) -> Option<u32> {
         let mut current = title;
         let mut depth = 0;
@@ -184,5 +216,41 @@ mod tests {
         assert_eq!(index.resolve_id("Rust"), Some(1));
         assert_eq!(index.resolve_id("rust"), None);
         assert_eq!(index.resolve_id("RUST"), None);
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let original = make_index(
+            vec![("Rust", 1), ("Python", 2), ("Go", 3)],
+            vec![("RS", "Rust"), ("Py", "Python")],
+        );
+
+        let (articles, redirects) = original.to_serializable();
+        let restored = WikiIndex::from_serializable(articles, redirects);
+
+        assert_eq!(restored.resolve_id("Rust"), Some(1));
+        assert_eq!(restored.resolve_id("Python"), Some(2));
+        assert_eq!(restored.resolve_id("Go"), Some(3));
+        assert_eq!(restored.resolve_id("RS"), Some(1));
+        assert_eq!(restored.resolve_id("Py"), Some(2));
+    }
+
+    #[test]
+    fn stats_returns_correct_counts() {
+        let index = make_index(
+            vec![("A", 1), ("B", 2), ("C", 3)],
+            vec![("X", "A"), ("Y", "B")],
+        );
+        let (article_count, redirect_count) = index.stats();
+        assert_eq!(article_count, 3);
+        assert_eq!(redirect_count, 2);
+    }
+
+    #[test]
+    fn stats_empty_index() {
+        let index = make_index(vec![], vec![]);
+        let (article_count, redirect_count) = index.stats();
+        assert_eq!(article_count, 0);
+        assert_eq!(redirect_count, 0);
     }
 }

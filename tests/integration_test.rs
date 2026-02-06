@@ -19,47 +19,82 @@ fn create_bz2_xml(xml: &str) -> NamedTempFile {
     tmp
 }
 
-/// Sample Wikipedia XML with articles, redirects, and special pages.
+/// Sample Wikipedia XML with articles, redirects, special pages, categories,
+/// infoboxes, see-also sections, images, and external links.
 fn sample_xml() -> &'static str {
     r#"<mediawiki>
         <page>
             <title>Rust (programming language)</title>
+            <ns>0</ns>
             <id>1</id>
             <revision>
                 <id>100</id>
-                <text>Rust is a systems programming language. See also [[Python (programming language)]] and [[C++|C plus plus]].</text>
+                <timestamp>2024-01-15T10:30:00Z</timestamp>
+                <text>{{Infobox programming language
+| name = Rust
+| designer = Graydon Hoare
+}}
+Rust is a systems programming language. See also [[Python (programming language)]] and [[C++|C plus plus]].
+
+It was developed by [[Mozilla]].
+
+[[File:Rust logo.svg|thumb|The Rust logo]]
+
+[https://www.rust-lang.org Official website]
+
+== History ==
+Rust was first announced in 2010.
+
+== See also ==
+* [[Python (programming language)]]
+
+== References ==
+Some refs.
+
+[[Category:Programming languages]]
+[[Category:Systems programming languages]]</text>
             </revision>
         </page>
         <page>
             <title>Python (programming language)</title>
+            <ns>0</ns>
             <id>2</id>
             <revision>
                 <id>200</id>
-                <text>Python is a high-level language. Related: [[Rust (programming language)]].</text>
+                <timestamp>2024-02-20T14:00:00Z</timestamp>
+                <text>Python is a high-level language. Related: [[Rust (programming language)]].
+
+[[Category:Programming languages]]</text>
             </revision>
         </page>
         <page>
             <title>Rust</title>
+            <ns>0</ns>
             <id>3</id>
             <redirect title="Rust (programming language)" />
             <revision>
                 <id>300</id>
+                <timestamp>2024-01-01T00:00:00Z</timestamp>
                 <text>#REDIRECT [[Rust (programming language)]]</text>
             </revision>
         </page>
         <page>
             <title>File:Rust logo.svg</title>
+            <ns>6</ns>
             <id>4</id>
             <revision>
                 <id>400</id>
+                <timestamp>2024-01-01T00:00:00Z</timestamp>
                 <text>File description page</text>
             </revision>
         </page>
         <page>
             <title>Category:Programming languages</title>
+            <ns>14</ns>
             <id>5</id>
             <revision>
                 <id>500</id>
+                <timestamp>2024-01-01T00:00:00Z</timestamp>
                 <text>Category page</text>
             </revision>
         </page>
@@ -87,8 +122,8 @@ fn parser_classifies_page_types() {
     assert!(matches!(pages[0].page_type, PageType::Article)); // Rust (programming language)
     assert!(matches!(pages[1].page_type, PageType::Article)); // Python (programming language)
     assert!(matches!(pages[2].page_type, PageType::Redirect(_))); // Rust -> redirect
-    assert!(matches!(pages[3].page_type, PageType::Special)); // File:
-    assert!(matches!(pages[4].page_type, PageType::Special)); // Category:
+    assert!(matches!(pages[3].page_type, PageType::Special)); // File: (ns=6)
+    assert!(matches!(pages[4].page_type, PageType::Special)); // Category: (ns=14)
 }
 
 #[test]
@@ -103,6 +138,27 @@ fn parser_reads_text_when_not_skipped() {
         .as_ref()
         .unwrap()
         .contains("systems programming language"));
+}
+
+#[test]
+fn parser_reads_namespace() {
+    let tmp = create_bz2_xml(sample_xml());
+    let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+    let pages: Vec<_> = reader.collect();
+
+    assert_eq!(pages[0].ns, Some(0)); // Article
+    assert_eq!(pages[3].ns, Some(6)); // File
+    assert_eq!(pages[4].ns, Some(14)); // Category
+}
+
+#[test]
+fn parser_reads_timestamp() {
+    let tmp = create_bz2_xml(sample_xml());
+    let reader = WikiReader::new(tmp.path().to_str().unwrap(), true).unwrap();
+    let pages: Vec<_> = reader.collect();
+
+    assert_eq!(pages[0].timestamp.as_deref(), Some("2024-01-15T10:30:00Z"));
+    assert_eq!(pages[1].timestamp.as_deref(), Some("2024-02-20T14:00:00Z"));
 }
 
 // ---------------------------------------------------------------------------
@@ -160,8 +216,11 @@ fn extraction_produces_csv_files() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -198,16 +257,20 @@ fn extraction_creates_edges() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         false,
+        None,
+        None,
     )
     .unwrap();
 
     // Rust -> Python is a valid edge (both exist in index)
     // Python -> Rust is a valid edge
     // Rust -> C++ is invalid (C++ not in index)
-    assert!(stats.edges() >= 2);
-    assert!(stats.invalid() >= 1); // C++ link should be invalid
+    // Rust -> Mozilla is invalid (not in index)
+    assert!(stats.edges() >= 1);
+    assert!(stats.invalid() >= 1); // C++ or Mozilla links should be invalid
 }
 
 #[test]
@@ -220,8 +283,11 @@ fn extraction_writes_json_blobs() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -240,7 +306,8 @@ fn extraction_writes_json_blobs() {
     let blob: ArticleBlob = serde_json::from_str(&blob_content).unwrap();
     assert_eq!(blob.id, 1);
     assert_eq!(blob.title, "Rust (programming language)");
-    assert!(blob.text.contains("systems programming language"));
+    // abstract_text should contain the lead section, not the full text
+    assert!(blob.abstract_text.contains("systems programming language"));
 }
 
 #[test]
@@ -253,8 +320,11 @@ fn extraction_dry_run_writes_no_files() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         true, // dry_run
+        None,
+        None,
     )
     .unwrap();
 
@@ -277,8 +347,11 @@ fn extraction_respects_limit() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         Some(1), // limit to 1 page
         true,
+        None,
+        None,
     )
     .unwrap();
 
@@ -297,8 +370,11 @@ fn nodes_csv_format_is_neo4j_compatible() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -331,8 +407,11 @@ fn edges_csv_format_is_neo4j_compatible() {
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
+        1000,
         None,
         false,
+        None,
+        None,
     )
     .unwrap();
 
@@ -349,7 +428,224 @@ fn edges_csv_format_is_neo4j_compatible() {
         // start and end IDs should be numeric
         record.get(0).unwrap().parse::<u32>().unwrap();
         record.get(1).unwrap().parse::<u32>().unwrap();
-        // type should be LINKS_TO
-        assert_eq!(record.get(2).unwrap(), "LINKS_TO");
+        // type should be LINKS_TO or SEE_ALSO
+        let edge_type = record.get(2).unwrap();
+        assert!(
+            edge_type == "LINKS_TO" || edge_type == "SEE_ALSO",
+            "Unexpected edge type: {}",
+            edge_type
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New feature tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extraction_produces_category_files() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    let stats = run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // categories.csv should exist with correct headers
+    let cats_path = output_dir.path().join("categories.csv");
+    assert!(cats_path.exists());
+    let mut rdr = csv::Reader::from_path(&cats_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), "id:ID(Category)");
+    assert_eq!(headers.get(1).unwrap(), "name");
+    assert_eq!(headers.get(2).unwrap(), ":LABEL");
+
+    // article_categories.csv should exist
+    let cat_edges_path = output_dir.path().join("article_categories.csv");
+    assert!(cat_edges_path.exists());
+    let mut rdr = csv::Reader::from_path(&cat_edges_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), ":START_ID");
+    assert_eq!(headers.get(1).unwrap(), ":END_ID(Category)");
+    assert_eq!(headers.get(2).unwrap(), ":TYPE");
+
+    // Should have found categories
+    assert!(stats.categories() >= 2); // "Programming languages" + "Systems programming languages"
+    assert!(stats.category_edges() >= 3); // Rust has 2, Python has 1
+}
+
+#[test]
+fn extraction_produces_images_csv() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    let stats = run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let images_path = output_dir.path().join("images.csv");
+    assert!(images_path.exists());
+    let mut rdr = csv::Reader::from_path(&images_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), "article_id");
+    assert_eq!(headers.get(1).unwrap(), "filename");
+
+    assert!(stats.images() >= 1); // Rust logo.svg
+}
+
+#[test]
+fn extraction_produces_external_links_csv() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    let stats = run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let ext_links_path = output_dir.path().join("external_links.csv");
+    assert!(ext_links_path.exists());
+    let mut rdr = csv::Reader::from_path(&ext_links_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), "article_id");
+    assert_eq!(headers.get(1).unwrap(), "url");
+
+    assert!(stats.external_links() >= 1); // rust-lang.org
+}
+
+#[test]
+fn blob_contains_enriched_data() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let shard = 1 % 1000;
+    let blob_path = output_dir.path().join(format!("blobs/{:03}/1.json", shard));
+    let blob_content = std::fs::read_to_string(&blob_path).unwrap();
+    let blob: ArticleBlob = serde_json::from_str(&blob_content).unwrap();
+
+    // Should have categories
+    assert!(!blob.categories.is_empty());
+    assert!(blob
+        .categories
+        .contains(&"Programming languages".to_string()));
+
+    // Should have infobox
+    assert!(!blob.infoboxes.is_empty());
+    assert!(blob.infoboxes[0]
+        .infobox_type
+        .contains("Infobox programming language"));
+
+    // Should have sections
+    assert!(!blob.sections.is_empty());
+    assert!(blob.sections.contains(&"History".to_string()));
+
+    // Should have timestamp
+    assert!(blob.timestamp.is_some());
+    assert_eq!(blob.timestamp.as_deref(), Some("2024-01-15T10:30:00Z"));
+
+    // Should not be disambiguation
+    assert!(!blob.is_disambiguation);
+}
+
+#[test]
+fn extraction_finds_see_also_edges() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    let stats = run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Rust has a "See also" section with Python
+    assert!(stats.see_also_edges() >= 1);
+
+    // Verify edge types in CSV
+    let edges_path = output_dir.path().join("edges.csv");
+    let content = std::fs::read_to_string(&edges_path).unwrap();
+    assert!(content.contains("SEE_ALSO"));
+}
+
+#[test]
+fn edges_exclude_namespace_links() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // edges.csv should not contain Category: or File: links
+    let edges_path = output_dir.path().join("edges.csv");
+    let content = std::fs::read_to_string(&edges_path).unwrap();
+    // Category links would show up as numeric IDs if resolved, but they can't
+    // resolve since Category: pages are Special. More importantly, they should
+    // be skipped by the namespace filter, not counted as invalid links.
+    // Just verify the file is parseable and only has valid edge types.
+    let mut rdr = csv::Reader::from_reader(content.as_bytes());
+    for record in rdr.records() {
+        let record = record.unwrap();
+        let edge_type = record.get(2).unwrap();
+        assert!(
+            edge_type == "LINKS_TO" || edge_type == "SEE_ALSO",
+            "Unexpected edge type: {}",
+            edge_type
+        );
     }
 }

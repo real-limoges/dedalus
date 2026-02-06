@@ -1,6 +1,10 @@
+pub mod cache;
+pub mod checkpoint;
 pub mod config;
+pub mod content;
 pub mod extract;
 pub mod index;
+pub mod infobox;
 pub mod models;
 pub mod parser;
 pub mod stats;
