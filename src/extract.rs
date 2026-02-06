@@ -1,5 +1,7 @@
 use crate::checkpoint::{Checkpoint, CheckpointManager};
+use crate::config::PROGRESS_INTERVAL;
 use crate::content;
+use crate::content::LINK_REGEX;
 use crate::index::WikiIndex;
 use crate::infobox;
 use crate::models::{ArticleBlob, PageType};
@@ -7,18 +9,14 @@ use crate::parser::WikiReader;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
 use dashmap::DashSet;
-use once_cell::sync::Lazy;
+use indicatif::ProgressBar;
 use rayon::prelude::*;
-use regex::Regex;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
-
-static LINK_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[\[([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
 
 fn is_namespace_link(target: &str) -> bool {
     target.starts_with("Category:")
@@ -61,11 +59,15 @@ fn create_csv_writer(
         };
         csv::WriterBuilder::new()
             .has_headers(false)
-            .from_writer(Box::new(file) as Box<dyn Write + Send>)
+            .from_writer(
+                Box::new(BufWriter::with_capacity(64 * 1024, file)) as Box<dyn Write + Send>
+            )
     } else {
         let file = File::create(format!("{}/{}", output_dir, filename))
             .with_context(|| format!("Failed to create {}", filename))?;
-        csv::Writer::from_writer(Box::new(file) as Box<dyn Write + Send>)
+        csv::Writer::from_writer(
+            Box::new(BufWriter::with_capacity(64 * 1024, file)) as Box<dyn Write + Send>
+        )
     })))
 }
 
@@ -106,6 +108,14 @@ pub fn run_extraction(
         fs::write(&test_file, "test")
             .with_context(|| format!("Output directory is not writable: {}", output_dir))?;
         fs::remove_file(&test_file).ok();
+
+        // Pre-create all blob shard directories once, avoiding millions of
+        // redundant create_dir_all calls inside the parallel loop.
+        for shard in 0..shard_count {
+            let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
+            fs::create_dir_all(&dir_path)
+                .with_context(|| format!("Failed to create blob directory: {}", dir_path))?;
+        }
     }
 
     info!("Starting extraction from: {}", path);
@@ -150,6 +160,16 @@ pub fn run_extraction(
 
     let max_completed_id = Arc::new(AtomicU32::new(resume_after_id));
 
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let pb = Arc::new(pb);
+    let pb_clone = Arc::clone(&pb);
+
     reader
         .filter(|page| page.id > resume_after_id)
         .par_bridge()
@@ -174,11 +194,10 @@ pub fn run_extraction(
                 if let Some(text) = &page.text {
                     let see_also_start = content::see_also_section_start(text);
 
-                    let mut local_edges: Vec<(String, String, &str)> = Vec::new();
+                    let mut local_edges: Vec<(String, &str)> = Vec::new();
                     let mut invalid_count = 0u64;
 
-                    for m in LINK_REGEX.find_iter(text) {
-                        let caps = LINK_REGEX.captures(m.as_str()).unwrap();
+                    for caps in LINK_REGEX.captures_iter(text) {
                         let raw_target = &caps[1];
 
                         let target_title = strip_section_anchor(raw_target);
@@ -189,32 +208,30 @@ pub fn run_extraction(
 
                         if let Some(target_id) = index.resolve_id(target_title) {
                             let edge_type = match see_also_start {
-                                Some(sa_start) if m.start() >= sa_start => "SEE_ALSO",
+                                Some(sa_start) if caps.get(0).unwrap().start() >= sa_start => {
+                                    "SEE_ALSO"
+                                }
                                 _ => "LINKS_TO",
                             };
-                            local_edges.push((id_str.clone(), target_id.to_string(), edge_type));
+                            local_edges.push((target_id.to_string(), edge_type));
                         } else {
                             invalid_count += 1;
                         }
                     }
 
-                    let links_to_count = local_edges
-                        .iter()
-                        .filter(|(_, _, t)| *t == "LINKS_TO")
-                        .count() as u64;
-                    let see_also_count = local_edges
-                        .iter()
-                        .filter(|(_, _, t)| *t == "SEE_ALSO")
-                        .count() as u64;
+                    let links_to_count =
+                        local_edges.iter().filter(|(_, t)| *t == "LINKS_TO").count() as u64;
+                    let see_also_count =
+                        local_edges.iter().filter(|(_, t)| *t == "SEE_ALSO").count() as u64;
                     stats_clone.add_edges(links_to_count);
                     stats_clone.add_see_also_edges(see_also_count);
                     stats_clone.add_invalid_links(invalid_count);
 
                     if !local_edges.is_empty() {
                         if let Ok(mut writer) = edges_writer.lock() {
-                            for (start, end, edge_type) in &local_edges {
+                            for (end, edge_type) in &local_edges {
                                 if let Err(e) =
-                                    writer.write_record([start.as_str(), end.as_str(), edge_type])
+                                    writer.write_record([id_str.as_str(), end.as_str(), edge_type])
                                 {
                                     warn!(error = %e, "Failed to write edge record");
                                 }
@@ -224,12 +241,21 @@ pub fn run_extraction(
 
                     let categories = content::extract_categories(text);
                     if !categories.is_empty() {
+                        // Collect newly-seen categories locally, then lock once.
+                        let mut new_cats: Vec<&str> = Vec::new();
                         for cat_name in &categories {
-                            if seen_categories.insert(cat_name.clone()) {
-                                stats_clone.inc_categories();
-                                if let Ok(mut writer) = categories_writer.lock() {
+                            if !seen_categories.contains(cat_name.as_str())
+                                && seen_categories.insert(cat_name.clone())
+                            {
+                                new_cats.push(cat_name);
+                            }
+                        }
+                        if !new_cats.is_empty() {
+                            stats_clone.add_categories(new_cats.len() as u64);
+                            if let Ok(mut writer) = categories_writer.lock() {
+                                for cat_name in &new_cats {
                                     if let Err(e) =
-                                        writer.write_record([cat_name, cat_name, "Category"])
+                                        writer.write_record([*cat_name, *cat_name, "Category"])
                                     {
                                         warn!(error = %e, "Failed to write category record");
                                     }
@@ -288,26 +314,23 @@ pub fn run_extraction(
                     if !dry_run {
                         let shard = page.id % shard_count;
                         let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
-                        if let Err(e) = fs::create_dir_all(&dir_path) {
-                            warn!(error = %e, path = %dir_path, "Failed to create blob directory");
-                            return;
-                        }
 
                         let blob = ArticleBlob {
                             id: page.id,
-                            title: page.title.clone(),
+                            title: page.title,
                             abstract_text,
                             categories,
                             infoboxes,
                             sections,
-                            timestamp: page.timestamp.clone(),
+                            timestamp: page.timestamp,
                             is_disambiguation: is_disambig,
                         };
 
                         let blob_path = format!("{}/{}.json", dir_path, page.id);
                         match File::create(&blob_path) {
-                            Ok(mut f) => {
-                                if let Err(e) = serde_json::to_writer_pretty(&mut f, &blob) {
+                            Ok(f) => {
+                                let mut w = BufWriter::new(f);
+                                if let Err(e) = serde_json::to_writer(&mut w, &blob) {
                                     warn!(error = %e, path = %blob_path, "Failed to write blob");
                                 } else {
                                     stats_clone.inc_blobs();
@@ -329,8 +352,20 @@ pub fn run_extraction(
                         warn!(error = %e, "Failed to save checkpoint");
                     }
                 }
+
+                let articles = stats_clone.articles();
+                if articles.is_multiple_of(PROGRESS_INTERVAL as u64) {
+                    pb_clone.set_message(format!(
+                        "Extracting: {} articles, {} edges, {} blobs",
+                        articles,
+                        stats_clone.edges(),
+                        stats_clone.blobs()
+                    ));
+                }
             }
         });
+
+    pb.finish_and_clear();
 
     info!(
         articles = stats.articles(),

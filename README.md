@@ -9,8 +9,9 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 - **Two-pass streaming pipeline** -- indexing pass builds a title-to-ID map, extraction pass produces output in parallel
 - **Memory-efficient** -- event-based XML parsing with `quick-xml`; never loads the full dump into memory
 - **Parallel extraction** -- uses `rayon` for multi-core article processing
+- **Parallel decompression** -- automatically uses `lbzip2` or `pbzip2` when available on PATH; falls back to in-process `MultiBzDecoder`
 - **Redirect resolution** -- follows redirect chains (up to 5 hops) to resolve target article IDs
-- **Neo4J-compatible output** -- `nodes.csv`, `edges.csv`, `categories.csv`, `article_categories.csv` formatted for `neo4j-admin import`
+- **Neo4J-compatible output** -- `nodes.csv`, `edges.csv`, `categories.csv`, `article_categories.csv` formatted for `neo4j-admin import`; `images.csv` and `external_links.csv` loadable via `LOAD CSV`
 - **Rich content extraction** -- categories, infoboxes, abstracts, see-also links, images, external links, section headings, disambiguation detection, revision timestamps
 - **Namespace-aware** -- parses `<ns>` XML tag for page classification; filters namespace-prefixed links from article edges
 - **Sharded JSON blobs** -- enriched article content stored as `blobs/{shard}/{id}.json` (1000 shards by default)
@@ -103,7 +104,7 @@ output/
 
 ### Two-Pass Pipeline
 
-1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `HashMap<String, u32>` of title-to-ID mappings and a redirect resolution table. No article text is read.
+1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` (from `rustc-hash`) of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects. No article text is read.
 
 2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, this time reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. Resolves link targets through the index and writes all output files concurrently.
 
@@ -112,15 +113,15 @@ output/
 | Module | Purpose |
 |--------|---------|
 | `main.rs` | CLI parsing (`clap`), orchestrates two-pass pipeline, summary output |
-| `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>` |
-| `index.rs` | `WikiIndex` -- title-to-ID mapping with redirect chain resolution |
+| `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>`; auto-detects `lbzip2`/`pbzip2` for parallel decompression |
+| `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution |
 | `extract.rs` | Parallel extraction of nodes, edges, categories, images, external links, and article blobs |
 | `models.rs` | Core types: `WikiPage`, `PageType`, `ArticleBlob` |
-| `content.rs` | Text extraction helpers: abstract, sections, see-also links, categories, images, external links, disambiguation detection |
+| `content.rs` | Text extraction helpers: abstract, sections, see-also links, categories, images, external links, disambiguation detection; CSV field sanitization |
 | `infobox.rs` | Brace-matching `{{Infobox ...}}` parser producing structured key-value data |
 | `stats.rs` | `ExtractionStats` -- atomic counters for thread-safe metrics |
 | `config.rs` | Constants: redirect depth, shard count, progress interval, cache/checkpoint versions |
-| `cache.rs` | Index persistence -- save/load index cache with validation |
+| `cache.rs` | Index persistence -- zero-copy serialization (`IndexCacheSer` borrows data) and single-pass `try_load_index` |
 | `checkpoint.rs` | Extraction checkpointing -- save/load progress for resumable processing |
 
 ## Loading into Neo4j
@@ -149,7 +150,31 @@ CREATE CONSTRAINT category_name IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS
 EOF
 ```
 
-See `scripts/import-neo4j.sh` for a ready-to-use script. See `docs/IMPLEMENTATION_GUIDE_PHASES_6-9.md` for verification queries and sample Cypher.
+See `scripts/import-neo4j.sh` for a ready-to-use bulk import script. See `docs/IMPLEMENTATION_GUIDE_PHASES_6-9.md` for verification queries and sample Cypher.
+
+### Loading Images and External Links
+
+`images.csv` and `external_links.csv` use plain headers and are not compatible with `neo4j-admin import`. After Neo4j is running, load them with `LOAD CSV`:
+
+```cypher
+// Create Image nodes and HAS_IMAGE relationships
+LOAD CSV WITH HEADERS FROM 'file:///images.csv' AS row
+MATCH (p:Page) WHERE p.id = toInteger(row.article_id)
+MERGE (i:Image {filename: row.filename})
+CREATE (p)-[:HAS_IMAGE]->(i);
+
+// Create ExternalLink nodes and HAS_LINK relationships
+LOAD CSV WITH HEADERS FROM 'file:///external_links.csv' AS row
+MATCH (p:Page) WHERE p.id = toInteger(row.article_id)
+MERGE (e:ExternalLink {url: row.url})
+CREATE (p)-[:HAS_LINK]->(e);
+
+// Create indexes for the new node types
+CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);
+CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);
+```
+
+**Note:** Copy `images.csv` and `external_links.csv` to the Neo4j import directory (typically `<NEO4J_HOME>/import/`) or adjust the file paths accordingly.
 
 ## Development
 

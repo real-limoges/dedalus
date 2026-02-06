@@ -3,23 +3,32 @@ use crate::models::PageType;
 use crate::parser::WikiReader;
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use tracing::{debug, info};
 
 pub struct WikiIndex {
-    title_to_id: HashMap<String, u32>,
-    redirects: HashMap<String, String>,
+    title_to_id: FxHashMap<String, u32>,
+    redirects: FxHashMap<String, String>,
 }
 
 impl WikiIndex {
     pub fn build(path: &str) -> Result<Self> {
-        let mut title_to_id = HashMap::new();
-        let mut redirects = HashMap::new();
+        let mut title_to_id: FxHashMap<String, u32> =
+            FxHashMap::with_capacity_and_hasher(8_000_000, Default::default());
+        let mut redirects: FxHashMap<String, String> =
+            FxHashMap::with_capacity_and_hasher(10_000_000, Default::default());
         let reader = WikiReader::new(path, true)
             .with_context(|| format!("Failed to open wiki dump at: {}", path))?;
         let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
         info!("Building index from: {}", path);
+        let mut page_count: u64 = 0;
 
         for page in reader {
             match page.page_type {
@@ -31,8 +40,14 @@ impl WikiIndex {
                 }
                 _ => {}
             }
-            if page.id % PROGRESS_INTERVAL == 0 {
-                pb.tick();
+            page_count += 1;
+            if page_count.is_multiple_of(PROGRESS_INTERVAL as u64) {
+                pb.set_message(format!(
+                    "Indexing: {} pages ({} articles, {} redirects)",
+                    page_count,
+                    title_to_id.len(),
+                    redirects.len()
+                ));
             }
         }
 
@@ -50,7 +65,24 @@ impl WikiIndex {
         })
     }
 
-    /// Convert index to serializable form for caching
+    /// Borrow the underlying maps for zero-copy serialization.
+    pub fn maps(&self) -> (&FxHashMap<String, u32>, &FxHashMap<String, String>) {
+        (&self.title_to_id, &self.redirects)
+    }
+
+    /// Reconstruct index directly from deserialized maps.
+    pub fn from_maps(
+        title_to_id: FxHashMap<String, u32>,
+        redirects: FxHashMap<String, String>,
+    ) -> Self {
+        Self {
+            title_to_id,
+            redirects,
+        }
+    }
+
+    /// Convert index to serializable form for caching (legacy, clones all data).
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub fn to_serializable(&self) -> (Vec<(String, u32)>, Vec<(String, String)>) {
         let articles: Vec<(String, u32)> = self
@@ -66,7 +98,8 @@ impl WikiIndex {
         (articles, redirects)
     }
 
-    /// Reconstruct index from serialized data
+    /// Reconstruct index from serialized data (legacy, used in tests).
+    #[cfg(test)]
     pub fn from_serializable(
         articles: Vec<(String, u32)>,
         redirects: Vec<(String, String)>,

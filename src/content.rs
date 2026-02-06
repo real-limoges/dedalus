@@ -22,7 +22,7 @@ static SEE_ALSO_HEADER: Lazy<Regex> =
 
 static NEXT_SECTION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^={2,}\s*[^=]").unwrap());
 
-static WIKILINK_REGEX: Lazy<Regex> =
+pub static LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
 
 /// Returns the lead section (before first `==` heading) with templates stripped.
@@ -65,7 +65,7 @@ pub fn extract_see_also_links(text: &str) -> Vec<String> {
 
     let see_also_text = &after_header[..section_end];
 
-    WIKILINK_REGEX
+    LINK_REGEX
         .captures_iter(see_also_text)
         .map(|c| c[1].trim().to_string())
         .filter(|s| !s.is_empty())
@@ -75,15 +75,28 @@ pub fn extract_see_also_links(text: &str) -> Vec<String> {
 pub fn extract_categories(text: &str) -> Vec<String> {
     CATEGORY_REGEX
         .captures_iter(text)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| sanitize_field(c[1].trim()))
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Replace newlines and carriage returns with spaces so CSV fields never span
+/// multiple lines (Neo4j's bulk importer rejects multi-line fields).
+fn sanitize_field(s: &str) -> String {
+    if s.contains('\n') || s.contains('\r') {
+        s.replace(['\n', '\r'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn extract_images(text: &str) -> Vec<String> {
     IMAGE_REGEX
         .captures_iter(text)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| sanitize_field(c[1].trim()))
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -91,7 +104,7 @@ pub fn extract_images(text: &str) -> Vec<String> {
 pub fn extract_external_links(text: &str) -> Vec<String> {
     EXTERNAL_LINK_REGEX
         .captures_iter(text)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| sanitize_field(c[1].trim()))
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -109,9 +122,14 @@ fn strip_templates(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
+    let mut run_start = 0;
 
     while i < bytes.len() {
         if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            // Flush the non-template run preceding this template as a single slice.
+            if run_start < i {
+                result.push_str(&text[run_start..i]);
+            }
             let mut depth: i32 = 0;
             while i + 1 < bytes.len() {
                 if bytes[i] == b'{' && bytes[i + 1] == b'{' {
@@ -128,12 +146,16 @@ fn strip_templates(text: &str) -> String {
                     i += 1;
                 }
             }
-            // Unclosed template: skip to end rather than resetting (avoids infinite loop).
+            // Unclosed template: i stays at end, run_start will skip the template.
+            run_start = i;
         } else {
-            let ch = text[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
+            i += 1;
         }
+    }
+
+    // Flush any trailing non-template text.
+    if run_start < bytes.len() {
+        result.push_str(&text[run_start..]);
     }
 
     result
@@ -160,6 +182,13 @@ mod tests {
         let text = "[[Category:Science]]\n[[Category:Physics]]";
         let cats = extract_categories(text);
         assert_eq!(cats, vec!["Science", "Physics"]);
+    }
+
+    #[test]
+    fn category_newlines_sanitized() {
+        let text = "[[Category:Explorers from n\nNew France]]";
+        let cats = extract_categories(text);
+        assert_eq!(cats, vec!["Explorers from n New France"]);
     }
 
     #[test]
