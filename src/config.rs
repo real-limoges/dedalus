@@ -8,7 +8,7 @@ pub const SHARD_COUNT: u32 = 1000;
 pub const PROGRESS_INTERVAL: u32 = 1000;
 
 /// Version number for index cache format (bump when format changes)
-pub const CACHE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 2;
 
 /// Version number for checkpoint format (bump when format changes)
 pub const CHECKPOINT_VERSION: u32 = 2;

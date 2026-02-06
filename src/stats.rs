@@ -41,6 +41,10 @@ impl ExtractionStats {
         self.categories_found.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_categories(&self, count: u64) {
+        self.categories_found.fetch_add(count, Ordering::Relaxed);
+    }
+
     pub fn add_category_edges(&self, count: u64) {
         self.category_edges.fetch_add(count, Ordering::Relaxed);
     }

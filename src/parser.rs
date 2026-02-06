@@ -1,11 +1,13 @@
 use crate::models::{PageType, WikiPage};
 use anyhow::{Context, Result};
-use bzip2::read::BzDecoder;
+use bzip2::read::MultiBzDecoder;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
+use std::process::{Child, Command, Stdio};
 use std::str;
+use tracing::{info, warn};
 
 #[cfg(test)]
 use bzip2::write::BzEncoder;
@@ -15,24 +17,99 @@ use bzip2::Compression;
 use std::io::Write;
 
 pub struct WikiReader {
-    reader: Reader<BufReader<BzDecoder<File>>>,
+    reader: Reader<BufReader<Box<dyn Read + Send>>>,
     buf: Vec<u8>,
     skip_text: bool,
+    _child: Option<Child>,
+}
+
+fn find_decompressor() -> Option<&'static str> {
+    ["lbzip2", "pbzip2"].into_iter().find(|cmd| {
+        Command::new(cmd)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+fn spawn_decompressor(cmd: &str, path: &str) -> Result<Child> {
+    Command::new(cmd)
+        .arg("-dc")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to spawn {}", cmd))
 }
 
 impl WikiReader {
     pub fn new(path: &str, skip_text: bool) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;
-        let decoder = BzDecoder::new(file);
-        let reader = BufReader::new(decoder);
+        // Fail fast if the file doesn't exist, before spawning a subprocess
+        if !std::path::Path::new(path).exists() {
+            return Err(anyhow::anyhow!("Could not open file: {}", path));
+        }
 
+        let (source, child): (Box<dyn Read + Send>, Option<Child>) = if let Some(cmd) =
+            find_decompressor()
+        {
+            match spawn_decompressor(cmd, path) {
+                Ok(mut child) => {
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from {}", cmd))?;
+                    info!(decompressor = cmd, "Using external parallel decompressor");
+                    (Box::new(stdout), Some(child))
+                }
+                Err(e) => {
+                    warn!(error = %e, "External decompressor failed, falling back to in-process");
+                    let file = File::open(path)
+                        .with_context(|| format!("Could not open file: {}", path))?;
+                    (Box::new(MultiBzDecoder::new(file)), None)
+                }
+            }
+        } else {
+            let file =
+                File::open(path).with_context(|| format!("Could not open file: {}", path))?;
+            (Box::new(MultiBzDecoder::new(file)), None)
+        };
+
+        let reader = BufReader::with_capacity(256 * 1024, source);
         let xml_reader = Reader::from_reader(reader);
 
         Ok(Self {
             reader: xml_reader,
-            buf: Vec::with_capacity(1024), // Pre-allocate a reasonable buffer
+            buf: Vec::with_capacity(1024),
             skip_text,
+            _child: child,
         })
+    }
+
+    /// Constructor that forces in-process decompression, bypassing external tool detection.
+    #[cfg(test)]
+    fn new_inprocess(path: &str, skip_text: bool) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;
+        let source: Box<dyn Read + Send> = Box::new(MultiBzDecoder::new(file));
+        let reader = BufReader::with_capacity(256 * 1024, source);
+        let xml_reader = Reader::from_reader(reader);
+
+        Ok(Self {
+            reader: xml_reader,
+            buf: Vec::with_capacity(1024),
+            skip_text,
+            _child: None,
+        })
+    }
+}
+
+impl Drop for WikiReader {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self._child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -96,11 +173,11 @@ impl Iterator for WikiReader {
                             current_title = Some(s.into_owned());
                         }
                     } else if in_id {
-                        let s = String::from_utf8_lossy(&e).trim().to_string();
-                        current_id = s.parse::<u32>().ok();
+                        let s = String::from_utf8_lossy(&e);
+                        current_id = s.trim().parse::<u32>().ok();
                     } else if in_ns {
-                        let s = String::from_utf8_lossy(&e).trim().to_string();
-                        current_ns = s.parse::<i32>().ok();
+                        let s = String::from_utf8_lossy(&e);
+                        current_ns = s.trim().parse::<i32>().ok();
                     } else if in_timestamp {
                         if let Ok(s) = e.unescape() {
                             current_timestamp = Some(s.into_owned());
@@ -426,5 +503,24 @@ mod tests {
     fn nonexistent_file_returns_error() {
         let result = WikiReader::new("/nonexistent/path.xml.bz2", false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_with_inprocess_fallback() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Test</title>
+                <id>1</id>
+                <revision><id>100</id><text>Content here.</text></revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new_inprocess(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].title, "Test");
+        assert_eq!(pages[0].text.as_deref(), Some("Content here."));
     }
 }

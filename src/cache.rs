@@ -2,6 +2,7 @@ use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
 use anyhow::{bail, Context, Result};
 use bincode::Options;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
@@ -20,12 +21,20 @@ pub struct CacheMetadata {
     pub redirect_count: usize,
 }
 
-/// Complete index cache including metadata and serialized index data
-#[derive(Serialize, Deserialize)]
-pub struct IndexCache {
-    pub metadata: CacheMetadata,
-    pub articles: Vec<(String, u32)>,
-    pub redirects: Vec<(String, String)>,
+/// Deserialization-only cache struct (owns the data, avoids cloning into Vecs).
+#[derive(Deserialize)]
+struct IndexCacheDe {
+    metadata: CacheMetadata,
+    articles: FxHashMap<String, u32>,
+    redirects: FxHashMap<String, String>,
+}
+
+/// Serialization-only cache struct (borrows the index data, avoids cloning ~17M strings).
+#[derive(Serialize)]
+struct IndexCacheSer<'a> {
+    metadata: CacheMetadata,
+    articles: &'a FxHashMap<String, u32>,
+    redirects: &'a FxHashMap<String, String>,
 }
 
 /// Returns the path to the index cache file for a given output directory
@@ -47,26 +56,25 @@ fn get_input_metadata(input_path: &str) -> Result<(u64, u64)> {
     Ok((mtime, size))
 }
 
-/// Check if an existing cache is valid for the given input file
-pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
+/// Try to load the index from cache in a single deserialization pass.
+/// Returns Ok(Some(index)) if valid, Ok(None) if cache is missing/invalid.
+pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<WikiIndex>> {
     if !cache_path.exists() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    // Get file size to use as a sanity check for bincode deserialization
     let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(cache_path).context("Failed to open cache file")?;
     let reader = BufReader::new(file);
 
-    // Use bincode options with size limit to avoid memory allocation attacks from corrupt data
-    let options = bincode::options().with_limit(file_size.saturating_add(1024)); // Allow a small buffer over file size
+    let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
-    let cache: IndexCache = match options.deserialize_from(reader) {
+    let cache: IndexCacheDe = match options.deserialize_from(reader) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "Cache file is corrupt or unreadable");
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -76,7 +84,7 @@ pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
             current = CACHE_VERSION,
             "Cache version mismatch"
         );
-        return Ok(false);
+        return Ok(None);
     }
 
     if cache.metadata.input_path != input_path {
@@ -85,7 +93,7 @@ pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
             current = input_path,
             "Cache input path mismatch"
         );
-        return Ok(false);
+        return Ok(None);
     }
 
     let (mtime, size) = get_input_metadata(input_path)?;
@@ -97,13 +105,19 @@ pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
             current_size = size,
             "Input file has changed since cache was created"
         );
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(true)
+    info!(
+        articles = cache.metadata.article_count,
+        redirects = cache.metadata.redirect_count,
+        "Index loaded from cache"
+    );
+
+    Ok(Some(WikiIndex::from_maps(cache.articles, cache.redirects)))
 }
 
-/// Save an index to the cache file
+/// Save an index to the cache file (serializes by reference, no cloning).
 pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Result<()> {
     let path = cache_path(output_dir);
 
@@ -113,10 +127,10 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     }
 
     let (mtime, size) = get_input_metadata(input_path)?;
-    let (articles, redirects) = index.to_serializable();
+    let (articles, redirects) = index.maps();
     let (article_count, redirect_count) = index.stats();
 
-    let cache = IndexCache {
+    let cache = IndexCacheSer {
         metadata: CacheMetadata {
             version: CACHE_VERSION,
             input_path: input_path.to_string(),
@@ -152,13 +166,17 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     Ok(())
 }
 
-/// Load an index from the cache file
+/// Check if an existing cache is valid (convenience wrapper around try_load_index).
+pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
+    Ok(try_load_index(cache_path, input_path)?.is_some())
+}
+
+/// Load an index from the cache file (without validation).
 pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
     if !cache_path.exists() {
         bail!("Cache file does not exist: {:?}", cache_path);
     }
 
-    // Get file size to use as a limit for bincode deserialization
     let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(cache_path)
@@ -167,11 +185,11 @@ pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
-    let cache: IndexCache = options
+    let cache: IndexCacheDe = options
         .deserialize_from(reader)
         .context("Failed to deserialize index cache")?;
 
-    let index = WikiIndex::from_serializable(cache.articles, cache.redirects);
+    let index = WikiIndex::from_maps(cache.articles, cache.redirects);
 
     info!(
         articles = cache.metadata.article_count,
@@ -232,6 +250,23 @@ mod tests {
         assert_eq!(loaded.resolve_id("Article1"), Some(1));
         assert_eq!(loaded.resolve_id("Article2"), Some(2));
         assert_eq!(loaded.resolve_id("Redirect1"), Some(1));
+    }
+
+    #[test]
+    fn try_load_validates_and_returns_index() {
+        let dir = TempDir::new().unwrap();
+        let input_path = create_test_input(&dir);
+        let input_str = input_path.to_str().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        let index = create_test_index();
+        save_index(&index, input_str, output_dir).unwrap();
+
+        let cache_file = cache_path(output_dir);
+        let loaded = try_load_index(&cache_file, input_str).unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.resolve_id("Article1"), Some(1));
     }
 
     #[test]

@@ -81,9 +81,9 @@ fn run(args: Cli) -> Result<()> {
             }
         }
         idx
-    } else if cache::is_cache_valid(&cache_path, &args.input)? {
-        info!("Loading index from cache");
-        cache::load_index(&cache_path)?
+    } else if let Some(idx) = cache::try_load_index(&cache_path, &args.input)? {
+        info!("Loaded index from cache");
+        idx
     } else {
         info!("Building index (cache miss or invalid)");
         let idx = dedalus::index::WikiIndex::build(&args.input)?;
