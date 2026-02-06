@@ -10,8 +10,11 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 - **Memory-efficient** -- event-based XML parsing with `quick-xml`; never loads the full dump into memory
 - **Parallel extraction** -- uses `rayon` for multi-core article processing
 - **Redirect resolution** -- follows redirect chains (up to 5 hops) to resolve target article IDs
-- **Neo4J-compatible output** -- `nodes.csv` and `edges.csv` formatted for `neo4j-admin import`
-- **Sharded JSON blobs** -- article content stored as `blobs/{shard}/{id}.json` (1000 shards by default)
+- **Neo4J-compatible output** -- `nodes.csv`, `edges.csv`, `categories.csv`, `article_categories.csv` formatted for `neo4j-admin import`
+- **Rich content extraction** -- categories, infoboxes, abstracts, see-also links, images, external links, section headings, disambiguation detection, revision timestamps
+- **Namespace-aware** -- parses `<ns>` XML tag for page classification; filters namespace-prefixed links from article edges
+- **Sharded JSON blobs** -- enriched article content stored as `blobs/{shard}/{id}.json` (1000 shards by default)
+- **Resumable processing** -- index caching and checkpoint-based resume to skip redundant work
 - **Dry-run mode** -- validate pipeline without writing files
 - **Progress reporting and structured logging** via `indicatif` and `tracing`
 
@@ -39,6 +42,10 @@ cargo build --release
 | `--limit <N>` | Limit number of pages to process (useful for testing) | none |
 | `--dry-run` | Run pipeline without writing output files | `false` |
 | `-v, --verbose` | Increase verbosity (`-v` INFO, `-vv` DEBUG, `-vvv` TRACE) | WARN |
+| `--resume` | Resume from last checkpoint if available | `false` |
+| `--no-cache` | Force rebuild of index cache | `false` |
+| `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
+| `--clean` | Clear existing checkpoint and outputs before starting | `false` |
 
 ### Example
 
@@ -48,6 +55,15 @@ cargo build --release
 
 # Quick test with 10,000 pages
 ./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
+
+# Resume interrupted processing (uses cached index and checkpoint)
+./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --resume -v
+
+# Force fresh start (rebuild index, clear checkpoint)
+./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --clean -v
+
+# Force index rebuild while keeping checkpoint
+./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --no-cache -v
 ```
 
 ## Output Format
@@ -55,18 +71,33 @@ cargo build --release
 ```
 output/
 ├── nodes.csv              # id:ID | title | :LABEL
-├── edges.csv              # :START_ID | :END_ID | :TYPE
+├── edges.csv              # :START_ID | :END_ID | :TYPE (LINKS_TO, SEE_ALSO)
+├── categories.csv         # id:ID(Category) | name | :LABEL
+├── article_categories.csv # :START_ID | :END_ID(Category) | :TYPE (HAS_CATEGORY)
+├── images.csv             # article_id | filename
+├── external_links.csv     # article_id | url
+├── index.cache            # Cached index for fast restarts (bincode)
+├── checkpoint.bin         # Extraction progress checkpoint (bincode)
 └── blobs/
     ├── 000/
-    │   └── {id}.json      # { "id": ..., "title": "...", "text": "..." }
+    │   └── {id}.json      # Enriched article blob (see below)
     ├── 001/
     │   └── ...
     └── 999/
 ```
 
 - **nodes.csv** -- one row per article with columns `id:ID`, `title`, `:LABEL` (compatible with `neo4j-admin import`)
-- **edges.csv** -- one row per wikilink with columns `:START_ID`, `:END_ID`, `:TYPE` (LINKS_TO)
-- **blobs/** -- article text stored as JSON, sharded by `id % shard_count`
+- **edges.csv** -- one row per wikilink with columns `:START_ID`, `:END_ID`, `:TYPE` (`LINKS_TO` for regular links, `SEE_ALSO` for links in "See also" sections). Namespace-prefixed links (Category:, File:, Template:, etc.) are excluded.
+- **categories.csv** -- deduplicated category nodes with columns `id:ID(Category)`, `name`, `:LABEL`
+- **article_categories.csv** -- article-to-category edges with columns `:START_ID`, `:END_ID(Category)`, `:TYPE` (`HAS_CATEGORY`)
+- **images.csv** -- image references extracted from `[[File:...]]` / `[[Image:...]]` wikilinks
+- **external_links.csv** -- external URLs extracted from `[http://...]` markup
+- **blobs/** -- enriched article JSON, sharded by `id % shard_count`. Each blob contains:
+  - `id`, `title`, `abstract_text` (first paragraph, templates stripped)
+  - `categories` (list), `infoboxes` (structured key-value), `sections` (heading list)
+  - `timestamp` (revision ISO 8601), `is_disambiguation` (boolean)
+- **index.cache** -- serialized index for skipping the indexing pass on subsequent runs (auto-invalidated if input file changes)
+- **checkpoint.bin** -- extraction progress checkpoint for resumable processing (cleared on successful completion)
 
 ## Architecture
 
@@ -74,7 +105,7 @@ output/
 
 1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `HashMap<String, u32>` of title-to-ID mappings and a redirect resolution table. No article text is read.
 
-2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, this time reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks via regex, resolves link targets through the index, and writes nodes/edges/blobs concurrently.
+2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, this time reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. Resolves link targets through the index and writes all output files concurrently.
 
 ### Modules
 
@@ -83,22 +114,42 @@ output/
 | `main.rs` | CLI parsing (`clap`), orchestrates two-pass pipeline, summary output |
 | `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>` |
 | `index.rs` | `WikiIndex` -- title-to-ID mapping with redirect chain resolution |
-| `extract.rs` | Parallel extraction of nodes, edges, and article blobs |
+| `extract.rs` | Parallel extraction of nodes, edges, categories, images, external links, and article blobs |
 | `models.rs` | Core types: `WikiPage`, `PageType`, `ArticleBlob` |
+| `content.rs` | Text extraction helpers: abstract, sections, see-also links, categories, images, external links, disambiguation detection |
+| `infobox.rs` | Brace-matching `{{Infobox ...}}` parser producing structured key-value data |
 | `stats.rs` | `ExtractionStats` -- atomic counters for thread-safe metrics |
-| `config.rs` | Constants: redirect depth, shard count, progress interval |
+| `config.rs` | Constants: redirect depth, shard count, progress interval, cache/checkpoint versions |
+| `cache.rs` | Index persistence -- save/load index cache with validation |
+| `checkpoint.rs` | Extraction checkpointing -- save/load progress for resumable processing |
 
-## Current Status
+## Loading into Neo4j
 
-Phases 1-3 of the [roadmap](FUTURE_IMPROVEMENTS.md) are complete:
+After running Dedalus, import the CSVs into Neo4j using `neo4j-admin`:
 
-- **Phase 1 (Core Architecture)** -- two-pass pipeline, streaming parser, index, parallel extraction
-- **Phase 2 (Data Extraction)** -- wikilink extraction, CSV output, JSON blob storage
-- **Phase 3 (CLI & Observability)** -- `clap` CLI, `indicatif` progress bars, `tracing` logging, statistics
+```bash
+# Stop Neo4j first
+neo4j stop
 
-Next up: **Phase 4 (Testing)** -- unit tests, integration tests, and test fixtures.
+# Import (or use scripts/import-neo4j.sh)
+neo4j-admin database import full \
+    --overwrite-destination \
+    --nodes=Page=output/nodes.csv \
+    --nodes=Category=output/categories.csv \
+    --relationships=output/edges.csv \
+    --relationships=output/article_categories.csv \
+    neo4j
 
-See [FUTURE_IMPROVEMENTS.md](docs/FUTURE_IMPROVEMENTS.md) for the full roadmap.
+# Start Neo4j and create indexes
+neo4j start
+cypher-shell <<'EOF'
+CREATE CONSTRAINT page_id IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE;
+CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);
+CREATE CONSTRAINT category_name IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE;
+EOF
+```
+
+See `scripts/import-neo4j.sh` for a ready-to-use script. See `docs/IMPLEMENTATION_GUIDE_PHASES_6-9.md` for verification queries and sample Cypher.
 
 ## Development
 

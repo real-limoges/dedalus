@@ -1,37 +1,107 @@
-use crate::config::SHARD_COUNT;
+use crate::checkpoint::{Checkpoint, CheckpointManager};
+use crate::content;
 use crate::index::WikiIndex;
+use crate::infobox;
 use crate::models::{ArticleBlob, PageType};
 use crate::parser::WikiReader;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
+use dashmap::DashSet;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 static LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
 
+fn is_namespace_link(target: &str) -> bool {
+    target.starts_with("Category:")
+        || target.starts_with("File:")
+        || target.starts_with("Image:")
+        || target.starts_with("Template:")
+        || target.starts_with("Wikipedia:")
+        || target.starts_with("Help:")
+        || target.starts_with("Portal:")
+        || target.starts_with("Draft:")
+        || target.starts_with("User:")
+        || target.starts_with("Module:")
+        || target.starts_with("MediaWiki:")
+}
+
+fn strip_section_anchor(target: &str) -> &str {
+    target.split('#').next().unwrap_or(target)
+}
+
+type CsvWriter = Arc<Mutex<csv::Writer<Box<dyn Write + Send>>>>;
+
+fn create_csv_writer(
+    output_dir: &str,
+    filename: &str,
+    dry_run: bool,
+    resuming: bool,
+) -> Result<CsvWriter> {
+    Ok(Arc::new(Mutex::new(if dry_run {
+        csv::Writer::from_writer(Box::new(std::io::sink()) as Box<dyn Write + Send>)
+    } else if resuming {
+        let path = format!("{}/{}", output_dir, filename);
+        let file = if Path::new(&path).exists() {
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Failed to open {} for append", filename))?
+        } else {
+            File::create(&path)
+                .with_context(|| format!("Failed to create {} during resume", filename))?
+        };
+        csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(Box::new(file) as Box<dyn Write + Send>)
+    } else {
+        let file = File::create(format!("{}/{}", output_dir, filename))
+            .with_context(|| format!("Failed to create {}", filename))?;
+        csv::Writer::from_writer(Box::new(file) as Box<dyn Write + Send>)
+    })))
+}
+
+fn write_header(writer: &CsvWriter, fields: &[&str]) -> Result<()> {
+    writer
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?
+        .write_record(fields)
+        .context("Failed to write CSV header")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_extraction(
     path: &str,
     output_dir: &str,
     index: &WikiIndex,
+    shard_count: u32,
     limit: Option<u64>,
     dry_run: bool,
+    resume_from: Option<&Checkpoint>,
+    checkpoint_mgr: Option<&CheckpointManager>,
 ) -> Result<ExtractionStats> {
-    let stats = Arc::new(ExtractionStats::new());
+    let stats = Arc::new(if let Some(cp) = resume_from {
+        ExtractionStats::from_checkpoint(&cp.stats)
+    } else {
+        ExtractionStats::new()
+    });
 
-    // Validate output directory
+    let resuming = resume_from.is_some();
+    let resume_after_id = resume_from.map(|cp| cp.last_processed_id).unwrap_or(0);
+
     let output_path = Path::new(output_dir);
     if !dry_run {
         fs::create_dir_all(output_path)
             .with_context(|| format!("Failed to create output directory: {}", output_dir))?;
 
-        // Test write permissions
         let test_file = output_path.join(".write_test");
         fs::write(&test_file, "test")
             .with_context(|| format!("Output directory is not writable: {}", output_dir))?;
@@ -39,130 +109,236 @@ pub fn run_extraction(
     }
 
     info!("Starting extraction from: {}", path);
+    if resuming {
+        info!(
+            last_id = resume_after_id,
+            articles = stats.articles(),
+            "Resuming from checkpoint"
+        );
+    }
     if dry_run {
         info!("Dry run mode - no files will be written");
     }
 
-    let nodes_writer: Arc<Mutex<csv::Writer<Box<dyn Write + Send>>>> =
-        Arc::new(Mutex::new(if dry_run {
-            csv::Writer::from_writer(Box::new(std::io::sink()) as Box<dyn Write + Send>)
-        } else {
-            let file = File::create(format!("{}/nodes.csv", output_dir))
-                .with_context(|| "Failed to create nodes.csv")?;
-            csv::Writer::from_writer(Box::new(file) as Box<dyn Write + Send>)
-        }));
-
-    let edges_writer: Arc<Mutex<csv::Writer<Box<dyn Write + Send>>>> =
-        Arc::new(Mutex::new(if dry_run {
-            csv::Writer::from_writer(Box::new(std::io::sink()) as Box<dyn Write + Send>)
-        } else {
-            let file = File::create(format!("{}/edges.csv", output_dir))
-                .with_context(|| "Failed to create edges.csv")?;
-            csv::Writer::from_writer(Box::new(file) as Box<dyn Write + Send>)
-        }));
+    let nodes_writer = create_csv_writer(output_dir, "nodes.csv", dry_run, resuming)?;
+    let edges_writer = create_csv_writer(output_dir, "edges.csv", dry_run, resuming)?;
+    let categories_writer = create_csv_writer(output_dir, "categories.csv", dry_run, resuming)?;
+    let article_categories_writer =
+        create_csv_writer(output_dir, "article_categories.csv", dry_run, resuming)?;
+    let images_writer = create_csv_writer(output_dir, "images.csv", dry_run, resuming)?;
+    let external_links_writer =
+        create_csv_writer(output_dir, "external_links.csv", dry_run, resuming)?;
 
     let reader = WikiReader::new(path, false)
         .with_context(|| format!("Failed to open wiki dump: {}", path))?;
 
-    nodes_writer
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?
-        .write_record(["id:ID", "title", ":LABEL"])
-        .context("Failed to write nodes header")?;
-
-    edges_writer
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?
-        .write_record([":START_ID", ":END_ID", ":TYPE"])
-        .context("Failed to write edges header")?;
+    if !resuming {
+        write_header(&nodes_writer, &["id:ID", "title", ":LABEL"])?;
+        write_header(&edges_writer, &[":START_ID", ":END_ID", ":TYPE"])?;
+        write_header(&categories_writer, &["id:ID(Category)", "name", ":LABEL"])?;
+        write_header(
+            &article_categories_writer,
+            &[":START_ID", ":END_ID(Category)", ":TYPE"],
+        )?;
+        write_header(&images_writer, &["article_id", "filename"])?;
+        write_header(&external_links_writer, &["article_id", "url"])?;
+    }
 
     let stats_clone = Arc::clone(&stats);
     let limit_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let seen_categories: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
-    reader.par_bridge().for_each(|page| {
-        // Check limit
-        if let Some(max) = limit {
-            let current = limit_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if current >= max {
-                return;
-            }
-        }
+    let max_completed_id = Arc::new(AtomicU32::new(resume_after_id));
 
-        if let PageType::Article = page.page_type {
-            let id_str = page.id.to_string();
-            stats_clone.inc_articles();
-
-            {
-                let mut writer = nodes_writer.lock().expect("Lock poisoned");
-                if let Err(e) = writer.write_record([&id_str, &page.title, "Page"]) {
-                    warn!(error = %e, "Failed to write node record");
+    reader
+        .filter(|page| page.id > resume_after_id)
+        .par_bridge()
+        .for_each(|page| {
+            if let Some(max) = limit {
+                let current = limit_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if current >= max {
+                    return;
                 }
             }
 
-            if let Some(text) = &page.text {
-                let mut local_edges = Vec::new();
-                let mut invalid_count = 0u64;
+            if let PageType::Article = page.page_type {
+                let id_str = page.id.to_string();
+                stats_clone.inc_articles();
 
-                for caps in LINK_REGEX.captures_iter(text) {
-                    let target_title = &caps[1];
-                    if let Some(target_id) = index.resolve_id(target_title) {
-                        local_edges.push((id_str.clone(), target_id.to_string()));
-                    } else {
-                        invalid_count += 1;
+                if let Ok(mut writer) = nodes_writer.lock() {
+                    if let Err(e) = writer.write_record([&id_str, &page.title, "Page"]) {
+                        warn!(error = %e, "Failed to write node record");
                     }
                 }
 
-                stats_clone.add_edges(local_edges.len() as u64);
-                stats_clone.add_invalid_links(invalid_count);
+                if let Some(text) = &page.text {
+                    let see_also_start = content::see_also_section_start(text);
 
-                // batch write
-                if !local_edges.is_empty() {
-                    let mut writer = edges_writer.lock().expect("Lock poisoned");
-                    for (start, end) in local_edges {
-                        if let Err(e) = writer.write_record(&[start, end, "LINKS_TO".to_string()]) {
-                            warn!(error = %e, "Failed to write edge record");
+                    let mut local_edges: Vec<(String, String, &str)> = Vec::new();
+                    let mut invalid_count = 0u64;
+
+                    for m in LINK_REGEX.find_iter(text) {
+                        let caps = LINK_REGEX.captures(m.as_str()).unwrap();
+                        let raw_target = &caps[1];
+
+                        let target_title = strip_section_anchor(raw_target);
+
+                        if target_title.is_empty() || is_namespace_link(target_title) {
+                            continue;
+                        }
+
+                        if let Some(target_id) = index.resolve_id(target_title) {
+                            let edge_type = match see_also_start {
+                                Some(sa_start) if m.start() >= sa_start => "SEE_ALSO",
+                                _ => "LINKS_TO",
+                            };
+                            local_edges.push((id_str.clone(), target_id.to_string(), edge_type));
+                        } else {
+                            invalid_count += 1;
                         }
                     }
-                }
 
-                if !dry_run {
-                    let shard = page.id % SHARD_COUNT;
-                    let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
-                    if let Err(e) = fs::create_dir_all(&dir_path) {
-                        warn!(error = %e, path = %dir_path, "Failed to create blob directory");
-                        return;
-                    }
+                    let links_to_count = local_edges
+                        .iter()
+                        .filter(|(_, _, t)| *t == "LINKS_TO")
+                        .count() as u64;
+                    let see_also_count = local_edges
+                        .iter()
+                        .filter(|(_, _, t)| *t == "SEE_ALSO")
+                        .count() as u64;
+                    stats_clone.add_edges(links_to_count);
+                    stats_clone.add_see_also_edges(see_also_count);
+                    stats_clone.add_invalid_links(invalid_count);
 
-                    let blob = ArticleBlob {
-                        id: page.id,
-                        title: page.title,
-                        text: text.clone(),
-                    };
-
-                    let blob_path = format!("{}/{}.json", dir_path, page.id);
-                    match File::create(&blob_path) {
-                        Ok(mut f) => {
-                            if let Err(e) = serde_json::to_writer_pretty(&mut f, &blob) {
-                                warn!(error = %e, path = %blob_path, "Failed to write blob");
-                            } else {
-                                stats_clone.inc_blobs();
-                                debug!(id = page.id, "Wrote blob");
+                    if !local_edges.is_empty() {
+                        if let Ok(mut writer) = edges_writer.lock() {
+                            for (start, end, edge_type) in &local_edges {
+                                if let Err(e) =
+                                    writer.write_record([start.as_str(), end.as_str(), edge_type])
+                                {
+                                    warn!(error = %e, "Failed to write edge record");
+                                }
                             }
                         }
-                        Err(e) => {
-                            warn!(error = %e, path = %blob_path, "Failed to create blob file");
+                    }
+
+                    let categories = content::extract_categories(text);
+                    if !categories.is_empty() {
+                        for cat_name in &categories {
+                            if seen_categories.insert(cat_name.clone()) {
+                                stats_clone.inc_categories();
+                                if let Ok(mut writer) = categories_writer.lock() {
+                                    if let Err(e) =
+                                        writer.write_record([cat_name, cat_name, "Category"])
+                                    {
+                                        warn!(error = %e, "Failed to write category record");
+                                    }
+                                }
+                            }
+                        }
+
+                        stats_clone.add_category_edges(categories.len() as u64);
+                        if let Ok(mut writer) = article_categories_writer.lock() {
+                            for cat_name in &categories {
+                                if let Err(e) =
+                                    writer.write_record([id_str.as_str(), cat_name, "HAS_CATEGORY"])
+                                {
+                                    warn!(error = %e, "Failed to write category edge record");
+                                }
+                            }
+                        }
+                    }
+
+                    let images = content::extract_images(text);
+                    if !images.is_empty() {
+                        stats_clone.add_images(images.len() as u64);
+                        if let Ok(mut writer) = images_writer.lock() {
+                            for filename in &images {
+                                if let Err(e) =
+                                    writer.write_record([id_str.as_str(), filename.as_str()])
+                                {
+                                    warn!(error = %e, "Failed to write image record");
+                                }
+                            }
+                        }
+                    }
+
+                    let ext_links = content::extract_external_links(text);
+                    if !ext_links.is_empty() {
+                        stats_clone.add_external_links(ext_links.len() as u64);
+                        if let Ok(mut writer) = external_links_writer.lock() {
+                            for url in &ext_links {
+                                if let Err(e) = writer.write_record([id_str.as_str(), url.as_str()])
+                                {
+                                    warn!(error = %e, "Failed to write external link record");
+                                }
+                            }
+                        }
+                    }
+
+                    let infoboxes = infobox::extract_infoboxes(text);
+                    if !infoboxes.is_empty() {
+                        stats_clone.add_infoboxes(infoboxes.len() as u64);
+                    }
+
+                    let abstract_text = content::extract_abstract(text);
+                    let sections = content::extract_sections(text);
+                    let is_disambig = content::is_disambiguation(text);
+
+                    if !dry_run {
+                        let shard = page.id % shard_count;
+                        let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
+                        if let Err(e) = fs::create_dir_all(&dir_path) {
+                            warn!(error = %e, path = %dir_path, "Failed to create blob directory");
+                            return;
+                        }
+
+                        let blob = ArticleBlob {
+                            id: page.id,
+                            title: page.title.clone(),
+                            abstract_text,
+                            categories,
+                            infoboxes,
+                            sections,
+                            timestamp: page.timestamp.clone(),
+                            is_disambiguation: is_disambig,
+                        };
+
+                        let blob_path = format!("{}/{}.json", dir_path, page.id);
+                        match File::create(&blob_path) {
+                            Ok(mut f) => {
+                                if let Err(e) = serde_json::to_writer_pretty(&mut f, &blob) {
+                                    warn!(error = %e, path = %blob_path, "Failed to write blob");
+                                } else {
+                                    stats_clone.inc_blobs();
+                                    debug!(id = page.id, "Wrote blob");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, path = %blob_path, "Failed to create blob file");
+                            }
                         }
                     }
                 }
+
+                max_completed_id.fetch_max(page.id, Ordering::Relaxed);
+
+                if let Some(mgr) = checkpoint_mgr {
+                    let highest = max_completed_id.load(Ordering::Relaxed);
+                    if let Err(e) = mgr.maybe_save(highest, &stats_clone) {
+                        warn!(error = %e, "Failed to save checkpoint");
+                    }
+                }
             }
-        }
-    });
+        });
 
     info!(
         articles = stats.articles(),
         edges = stats.edges(),
         blobs = stats.blobs(),
         invalid_links = stats.invalid(),
+        categories = stats.categories(),
+        infoboxes = stats.infoboxes(),
         "Extraction complete"
     );
 
@@ -172,6 +348,12 @@ pub fn run_extraction(
             edges_extracted: std::sync::atomic::AtomicU64::new(arc.edges()),
             blobs_written: std::sync::atomic::AtomicU64::new(arc.blobs()),
             invalid_links: std::sync::atomic::AtomicU64::new(arc.invalid()),
+            categories_found: std::sync::atomic::AtomicU64::new(arc.categories()),
+            category_edges: std::sync::atomic::AtomicU64::new(arc.category_edges()),
+            see_also_edges: std::sync::atomic::AtomicU64::new(arc.see_also_edges()),
+            infoboxes_extracted: std::sync::atomic::AtomicU64::new(arc.infoboxes()),
+            images_found: std::sync::atomic::AtomicU64::new(arc.images()),
+            external_links_found: std::sync::atomic::AtomicU64::new(arc.external_links()),
         }),
     )
 }
@@ -179,6 +361,7 @@ pub fn run_extraction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SHARD_COUNT;
 
     #[test]
     fn link_regex_simple_link() {
@@ -246,7 +429,6 @@ mod tests {
 
     #[test]
     fn link_regex_empty_brackets() {
-        // [[]] should not match because the regex requires at least one char
         let caps: Vec<_> = LINK_REGEX.captures_iter("[[]]").collect();
         assert!(caps.is_empty());
     }
@@ -266,5 +448,30 @@ mod tests {
         for id in [0u32, 1, 500, 999, 1000, 99999, u32::MAX] {
             assert!(id % SHARD_COUNT < SHARD_COUNT);
         }
+    }
+
+    #[test]
+    fn namespace_filter_works() {
+        assert!(is_namespace_link("Category:Science"));
+        assert!(is_namespace_link("File:Example.jpg"));
+        assert!(is_namespace_link("Image:Logo.png"));
+        assert!(is_namespace_link("Template:Infobox"));
+        assert!(is_namespace_link("Wikipedia:About"));
+        assert!(is_namespace_link("Help:Editing"));
+        assert!(is_namespace_link("Portal:Science"));
+        assert!(is_namespace_link("Draft:New article"));
+        assert!(!is_namespace_link("Rust (programming language)"));
+        assert!(!is_namespace_link("Python"));
+    }
+
+    #[test]
+    fn strip_section_anchor_works() {
+        assert_eq!(strip_section_anchor("Article#Section"), "Article");
+        assert_eq!(strip_section_anchor("Article"), "Article");
+        assert_eq!(
+            strip_section_anchor("United States#History"),
+            "United States"
+        );
+        assert_eq!(strip_section_anchor("#Section_only"), "");
     }
 }

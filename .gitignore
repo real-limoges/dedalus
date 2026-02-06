@@ -26,3 +26,5 @@ output_data/
 # Added by cargo
 
 /target
+
+/docs/**/*
