@@ -25,7 +25,7 @@ static NEXT_SECTION_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^={2,}\s*
 pub static LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
 
-/// Returns the lead section (before first `==` heading) with templates stripped.
+/// Returns the lead section (before the first `==` heading) with templates stripped.
 pub fn extract_abstract(text: &str) -> String {
     // Strip templates first so headings inside {{Infobox ...}} don't truncate the lead.
     let stripped = strip_templates(text);
@@ -80,8 +80,7 @@ pub fn extract_categories(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Replace newlines and carriage returns with spaces so CSV fields never span
-/// multiple lines (Neo4j's bulk importer rejects multi-line fields).
+/// Collapses newlines into spaces so CSV fields stay on a single line.
 fn sanitize_field(s: &str) -> String {
     if s.contains('\n') || s.contains('\r') {
         s.replace(['\n', '\r'], " ")
@@ -109,7 +108,7 @@ pub fn extract_external_links(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Byte offset of the "See also" header, used for position-based edge classification.
+/// Byte offset of the "See also" header, for position-based edge classification.
 pub fn see_also_section_start(text: &str) -> Option<usize> {
     SEE_ALSO_HEADER.find(text).map(|m| m.start())
 }
@@ -126,7 +125,6 @@ fn strip_templates(text: &str) -> String {
 
     while i < bytes.len() {
         if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            // Flush the non-template run preceding this template as a single slice.
             if run_start < i {
                 result.push_str(&text[run_start..i]);
             }
@@ -146,14 +144,12 @@ fn strip_templates(text: &str) -> String {
                     i += 1;
                 }
             }
-            // Unclosed template: i stays at end, run_start will skip the template.
             run_start = i;
         } else {
             i += 1;
         }
     }
 
-    // Flush any trailing non-template text.
     if run_start < bytes.len() {
         result.push_str(&text[run_start..]);
     }

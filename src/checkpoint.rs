@@ -32,6 +32,7 @@ pub struct Checkpoint {
     pub input_mtime: u64,
     pub output_dir: String,
     pub shard_count: u32,
+    pub csv_shards: u32,
     pub last_processed_id: u32,
     pub stats: CheckpointStats,
 }
@@ -56,6 +57,7 @@ pub fn load_if_valid(
     input_path: &str,
     output_dir: &str,
     shard_count: u32,
+    csv_shards: u32,
 ) -> Result<Option<Checkpoint>> {
     let path = checkpoint_path(output_dir);
 
@@ -124,6 +126,15 @@ pub fn load_if_valid(
         return Ok(None);
     }
 
+    if checkpoint.csv_shards != csv_shards {
+        info!(
+            cached = checkpoint.csv_shards,
+            current = csv_shards,
+            "Checkpoint CSV shard count mismatch"
+        );
+        return Ok(None);
+    }
+
     info!(
         last_id = checkpoint.last_processed_id,
         articles = checkpoint.stats.articles_processed,
@@ -149,6 +160,7 @@ pub struct CheckpointManager {
     input_mtime: u64,
     output_dir: String,
     shard_count: u32,
+    csv_shards: u32,
     interval: u32,
     last_saved_id: AtomicU32,
     pages_since_save: AtomicU32,
@@ -160,6 +172,7 @@ impl CheckpointManager {
         input_path: &str,
         output_dir: &str,
         shard_count: u32,
+        csv_shards: u32,
         interval: u32,
     ) -> Result<Self> {
         let input_mtime = get_input_mtime(input_path)?;
@@ -169,6 +182,7 @@ impl CheckpointManager {
             input_mtime,
             output_dir: output_dir.to_string(),
             shard_count,
+            csv_shards,
             interval,
             last_saved_id: AtomicU32::new(0),
             pages_since_save: AtomicU32::new(0),
@@ -213,6 +227,7 @@ impl CheckpointManager {
             input_mtime: self.input_mtime,
             output_dir: self.output_dir.clone(),
             shard_count: self.shard_count,
+            csv_shards: self.csv_shards,
             last_processed_id: page_id,
             stats: stats.to_checkpoint(),
         };
@@ -281,6 +296,7 @@ mod tests {
             input_path.to_str().unwrap(),
             dir.path().to_str().unwrap(),
             1000,
+            1,
         )
         .unwrap();
         assert!(result.is_none());
@@ -293,7 +309,7 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 100).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
 
         let stats = ExtractionStats::new();
         stats.inc_articles();
@@ -302,7 +318,9 @@ mod tests {
 
         manager.save(42, &stats).unwrap();
 
-        let loaded = load_if_valid(input_str, output_dir, 1000).unwrap().unwrap();
+        let loaded = load_if_valid(input_str, output_dir, 1000, 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.last_processed_id, 42);
         assert_eq!(loaded.stats.articles_processed, 2);
         assert_eq!(loaded.stats.edges_extracted, 10);
@@ -315,7 +333,7 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 100).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
         manager.save(42, &ExtractionStats::new()).unwrap();
 
         // mtime has second granularity
@@ -323,7 +341,7 @@ mod tests {
         let mut file = File::create(&input_path).unwrap();
         writeln!(file, "modified content").unwrap();
 
-        let loaded = load_if_valid(input_str, output_dir, 1000).unwrap();
+        let loaded = load_if_valid(input_str, output_dir, 1000, 1).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -334,10 +352,10 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 100).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
         manager.save(42, &ExtractionStats::new()).unwrap();
 
-        let loaded = load_if_valid(input_str, output_dir, 500).unwrap();
+        let loaded = load_if_valid(input_str, output_dir, 500, 1).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -348,10 +366,10 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 100).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
         manager.save(42, &ExtractionStats::new()).unwrap();
 
-        let loaded = load_if_valid(input_str, "/different/output", 1000).unwrap();
+        let loaded = load_if_valid(input_str, "/different/output", 1000, 1).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -362,7 +380,7 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 100).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
         manager.save(42, &ExtractionStats::new()).unwrap();
 
         let path = checkpoint_path(output_dir);
@@ -386,7 +404,7 @@ mod tests {
         let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 3).unwrap();
+        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 3).unwrap();
         let stats = ExtractionStats::new();
 
         assert!(!manager.maybe_save(1, &stats).unwrap());
@@ -412,6 +430,7 @@ mod tests {
             input_path.to_str().unwrap(),
             dir.path().to_str().unwrap(),
             1000,
+            1,
         )
         .unwrap();
         assert!(result.is_none());

@@ -27,8 +27,7 @@ pub fn extract_infoboxes(text: &str) -> Vec<Infobox> {
     results
 }
 
-/// Case-insensitive search on original bytes (not `.to_lowercase()`) to preserve
-/// byte offsets in the presence of non-ASCII characters.
+/// Case-insensitive search on raw bytes to preserve byte offsets with non-ASCII text.
 fn find_infobox_start(bytes: &[u8]) -> Option<usize> {
     let needle = b"{{infobox";
     if bytes.len() < needle.len() {
@@ -40,7 +39,6 @@ fn find_infobox_start(bytes: &[u8]) -> Option<usize> {
             .zip(needle.iter())
             .all(|(a, b)| a.to_ascii_lowercase() == *b)
         {
-            // Word boundary check to avoid matching e.g. {{infoboxer}}
             let next_idx = i + needle.len();
             if next_idx >= bytes.len() {
                 return Some(i);
@@ -112,7 +110,7 @@ fn parse_infobox_inner(inner: &str) -> Option<Infobox> {
     })
 }
 
-/// Split on `|` at brace depth 0, respecting nested `{{ }}`.
+/// Splits on `|` at brace depth 0, respecting nested `{{ }}`.
 fn split_at_depth_zero(content: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let bytes = content.as_bytes();

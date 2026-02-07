@@ -217,6 +217,7 @@ fn extraction_produces_csv_files() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -258,6 +259,7 @@ fn extraction_creates_edges() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -284,6 +286,7 @@ fn extraction_writes_json_blobs() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -321,6 +324,7 @@ fn extraction_dry_run_writes_no_files() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         true, // dry_run
         None,
@@ -348,6 +352,7 @@ fn extraction_respects_limit() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         Some(1), // limit to 1 page
         true,
         None,
@@ -371,6 +376,7 @@ fn nodes_csv_format_is_neo4j_compatible() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -408,6 +414,7 @@ fn edges_csv_format_is_neo4j_compatible() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -453,6 +460,7 @@ fn extraction_produces_category_files() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -494,6 +502,7 @@ fn extraction_produces_images_csv() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -522,6 +531,7 @@ fn extraction_produces_external_links_csv() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -550,6 +560,7 @@ fn blob_contains_enriched_data() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -597,6 +608,7 @@ fn extraction_finds_see_also_edges() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -624,6 +636,7 @@ fn edges_exclude_namespace_links() {
         output_dir.path().to_str().unwrap(),
         &index,
         1000,
+        1,
         None,
         false,
         None,
@@ -648,4 +661,97 @@ fn edges_exclude_namespace_links() {
             edge_type
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// CSV sharding tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sharded_csv_produces_numbered_files() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    let stats = run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        4, // csv_shards
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(stats.articles(), 2);
+
+    // With csv_shards=4, should produce numbered files, not the single-file names
+    assert!(!output_dir.path().join("nodes.csv").exists());
+    assert!(!output_dir.path().join("edges.csv").exists());
+
+    // Should have 4 shard files for each CSV type
+    for base in &[
+        "nodes",
+        "edges",
+        "categories",
+        "article_categories",
+        "images",
+        "external_links",
+    ] {
+        for shard in 0..4u32 {
+            let path = output_dir.path().join(format!("{}_{:03}.csv", base, shard));
+            assert!(path.exists(), "Missing shard file: {:?}", path);
+        }
+    }
+
+    // Each shard file should have a header
+    for shard in 0..4u32 {
+        let path = output_dir.path().join(format!("nodes_{:03}.csv", shard));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.trim().lines().collect();
+        assert!(lines[0].contains("id:ID"), "Shard {} missing header", shard);
+    }
+
+    // All node records across shards should total 2 articles
+    let mut total_records = 0;
+    for shard in 0..4u32 {
+        let path = output_dir.path().join(format!("nodes_{:03}.csv", shard));
+        let mut rdr = csv::Reader::from_path(&path).unwrap();
+        total_records += rdr.records().count();
+    }
+    assert_eq!(total_records, 2, "Total node records across shards");
+}
+
+#[test]
+fn single_csv_shard_produces_original_filenames() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+
+    run_extraction(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1000,
+        1, // csv_shards = 1 (default)
+        None,
+        false,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // With csv_shards=1, should produce original filenames
+    assert!(output_dir.path().join("nodes.csv").exists());
+    assert!(output_dir.path().join("edges.csv").exists());
+    assert!(output_dir.path().join("categories.csv").exists());
+    assert!(output_dir.path().join("article_categories.csv").exists());
+    assert!(output_dir.path().join("images.csv").exists());
+    assert!(output_dir.path().join("external_links.csv").exists());
+
+    // Should NOT have numbered files
+    assert!(!output_dir.path().join("nodes_000.csv").exists());
 }

@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
-/// Metadata stored with the index cache for validation
 #[derive(Serialize, Deserialize)]
 pub struct CacheMetadata {
     pub version: u32,
@@ -21,7 +20,6 @@ pub struct CacheMetadata {
     pub redirect_count: usize,
 }
 
-/// Deserialization-only cache struct (owns the data, avoids cloning into Vecs).
 #[derive(Deserialize)]
 struct IndexCacheDe {
     metadata: CacheMetadata,
@@ -29,7 +27,7 @@ struct IndexCacheDe {
     redirects: FxHashMap<String, String>,
 }
 
-/// Serialization-only cache struct (borrows the index data, avoids cloning ~17M strings).
+/// Borrows the index data to avoid cloning ~17M strings during serialization.
 #[derive(Serialize)]
 struct IndexCacheSer<'a> {
     metadata: CacheMetadata,
@@ -37,12 +35,10 @@ struct IndexCacheSer<'a> {
     redirects: &'a FxHashMap<String, String>,
 }
 
-/// Returns the path to the index cache file for a given output directory
 pub fn cache_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("index.cache")
 }
 
-/// Get input file metadata (mtime as seconds since epoch, size in bytes)
 fn get_input_metadata(input_path: &str) -> Result<(u64, u64)> {
     let metadata = fs::metadata(input_path)
         .with_context(|| format!("Failed to get metadata for: {}", input_path))?;
@@ -56,8 +52,7 @@ fn get_input_metadata(input_path: &str) -> Result<(u64, u64)> {
     Ok((mtime, size))
 }
 
-/// Try to load the index from cache in a single deserialization pass.
-/// Returns Ok(Some(index)) if valid, Ok(None) if cache is missing/invalid.
+/// Returns `Ok(Some(index))` if the cache is valid, `Ok(None)` if missing or stale.
 pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<WikiIndex>> {
     if !cache_path.exists() {
         return Ok(None);
@@ -117,7 +112,7 @@ pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<Wiki
     Ok(Some(WikiIndex::from_maps(cache.articles, cache.redirects)))
 }
 
-/// Save an index to the cache file (serializes by reference, no cloning).
+/// Serializes the index by reference (no cloning) and writes atomically via rename.
 pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Result<()> {
     let path = cache_path(output_dir);
 
@@ -143,7 +138,6 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
         redirects,
     };
 
-    // Write to temporary file first, then rename atomically
     let tmp_path = path.with_extension("cache.tmp");
     let file = File::create(&tmp_path)
         .with_context(|| format!("Failed to create temp cache file: {:?}", tmp_path))?;
@@ -166,12 +160,11 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     Ok(())
 }
 
-/// Check if an existing cache is valid (convenience wrapper around try_load_index).
 pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
     Ok(try_load_index(cache_path, input_path)?.is_some())
 }
 
-/// Load an index from the cache file (without validation).
+/// Loads an index from the cache file without validating staleness.
 pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
     if !cache_path.exists() {
         bail!("Cache file does not exist: {:?}", cache_path);

@@ -13,9 +13,12 @@ pub struct WikiPage {
     pub id: u32,
     pub title: String,
     pub page_type: PageType,
-    pub text: Option<String>,      // the first pass doesn't use this
-    pub ns: Option<i32>,           // namespace number from <ns> tag
-    pub timestamp: Option<String>, // revision timestamp from <timestamp> tag
+    /// `None` during the indexing pass (skip_text mode).
+    pub text: Option<String>,
+    /// Namespace number from `<ns>` tag.
+    pub ns: Option<i32>,
+    /// Revision timestamp from `<timestamp>` tag.
+    pub timestamp: Option<String>,
 }
 
 fn is_false(v: &bool) -> bool {
