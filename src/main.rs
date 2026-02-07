@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use dedalus::cache;
 use dedalus::checkpoint::{self, CheckpointManager};
+use dedalus::import::ImportConfig;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -11,8 +12,26 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
 #[command(name = "dedalus")]
-#[command(about = "Extract Wikipedia dumps into Neo4J-compatible format")]
+#[command(about = "Extract Wikipedia dumps and import into graph databases")]
 struct Cli {
+    /// Verbosity level (-v, -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Extract Wikipedia dumps into CSV/JSON format
+    Extract(ExtractArgs),
+    /// Import extracted CSV files into Neo4j
+    Import(ImportArgs),
+}
+
+#[derive(Args)]
+struct ExtractArgs {
     /// Path to the Wikipedia dump file (.xml.bz2)
     #[arg(short, long)]
     input: String,
@@ -25,6 +44,10 @@ struct Cli {
     #[arg(long, default_value_t = 1000)]
     shard_count: u32,
 
+    /// Number of CSV output shards for parallel import (1 = single file)
+    #[arg(long, default_value_t = 1)]
+    csv_shards: u32,
+
     /// Limit number of pages to process (for testing)
     #[arg(long)]
     limit: Option<u64>,
@@ -32,10 +55,6 @@ struct Cli {
     /// Dry run - don't write output files
     #[arg(long)]
     dry_run: bool,
-
-    /// Verbosity level (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
 
     /// Resume from last checkpoint if available
     #[arg(long)]
@@ -54,7 +73,42 @@ struct Cli {
     clean: bool,
 }
 
-fn run(args: Cli) -> Result<()> {
+#[derive(Args)]
+struct ImportArgs {
+    /// Directory containing Dedalus CSV output files
+    #[arg(short, long)]
+    output: String,
+
+    /// Neo4j Bolt URI
+    #[arg(long, default_value = dedalus::config::DEFAULT_BOLT_URI)]
+    bolt_uri: String,
+
+    /// Import file URI prefix for Neo4j LOAD CSV
+    #[arg(long, default_value = dedalus::config::DEFAULT_IMPORT_PREFIX)]
+    import_prefix: String,
+
+    /// Max parallel LOAD CSV jobs for edge operations
+    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_EDGES)]
+    max_parallel_edges: usize,
+
+    /// Max parallel LOAD CSV jobs for lighter relationship operations
+    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_LIGHT)]
+    max_parallel_light: usize,
+
+    /// Docker compose file path (auto-detected if not specified)
+    #[arg(long)]
+    compose_file: Option<String>,
+
+    /// Skip Docker management, just connect to an already-running Neo4j
+    #[arg(long)]
+    no_docker: bool,
+
+    /// Clear existing Neo4j data before importing
+    #[arg(long)]
+    clean: bool,
+}
+
+fn run_extract(args: ExtractArgs) -> Result<()> {
     if args.clean {
         let output_path = Path::new(&args.output);
         if output_path.exists() {
@@ -67,14 +121,12 @@ fn run(args: Cli) -> Result<()> {
     fs::create_dir_all(&args.output)
         .with_context(|| format!("Failed to create output directory: {}", args.output))?;
 
-    // Index loading: try cache first unless --no-cache
     let start_indexing = Instant::now();
     let cache_path = cache::cache_path(&args.output);
 
     let index = if args.no_cache {
         info!("Cache disabled, building fresh index");
         let idx = dedalus::index::WikiIndex::build(&args.input)?;
-        // Still save the cache for future runs
         if !args.dry_run {
             if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
                 warn!(error = %e, "Failed to save index cache");
@@ -106,6 +158,7 @@ fn run(args: Cli) -> Result<()> {
             &args.input,
             &args.output,
             args.shard_count,
+            args.csv_shards,
             args.checkpoint_interval,
         )?)
     } else {
@@ -113,7 +166,12 @@ fn run(args: Cli) -> Result<()> {
     };
 
     let checkpoint = if args.resume && !args.clean {
-        match checkpoint::load_if_valid(&args.input, &args.output, args.shard_count)? {
+        match checkpoint::load_if_valid(
+            &args.input,
+            &args.output,
+            args.shard_count,
+            args.csv_shards,
+        )? {
             Some(cp) => {
                 info!(
                     last_id = cp.last_processed_id,
@@ -141,6 +199,7 @@ fn run(args: Cli) -> Result<()> {
         &args.output,
         &index,
         args.shard_count,
+        args.csv_shards,
         args.limit,
         args.dry_run,
         checkpoint.as_ref(),
@@ -187,10 +246,26 @@ fn run(args: Cli) -> Result<()> {
     Ok(())
 }
 
-fn main() -> ExitCode {
-    let args = Cli::parse();
+fn run_import(args: ImportArgs) -> Result<()> {
+    let config = ImportConfig {
+        output_dir: args.output,
+        bolt_uri: args.bolt_uri,
+        import_prefix: args.import_prefix,
+        max_parallel_edges: args.max_parallel_edges,
+        max_parallel_light: args.max_parallel_light,
+        compose_file: args.compose_file,
+        no_docker: args.no_docker,
+        clean: args.clean,
+    };
 
-    let level = match args.verbose {
+    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    rt.block_on(dedalus::import::run_import(config))
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    let level = match cli.verbose {
         0 => Level::WARN,
         1 => Level::INFO,
         2 => Level::DEBUG,
@@ -204,7 +279,12 @@ fn main() -> ExitCode {
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
-    match run(args) {
+    let result = match cli.command {
+        Commands::Extract(args) => run_extract(args),
+        Commands::Import(args) => run_import(args),
+    };
+
+    match result {
         Ok(()) => {
             info!("Completed successfully");
             ExitCode::SUCCESS

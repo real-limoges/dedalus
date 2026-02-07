@@ -79,12 +79,54 @@ fn write_header(writer: &CsvWriter, fields: &[&str]) -> Result<()> {
         .context("Failed to write CSV header")
 }
 
+/// A set of CSV writers that shard rows by page ID.
+///
+/// When `csv_shards == 1`, produces a single file (e.g. `edges.csv`).
+/// When `csv_shards > 1`, produces N files (e.g. `edges_000.csv`, `edges_001.csv`, ...).
+struct ShardedCsvWriter {
+    writers: Vec<CsvWriter>,
+}
+
+impl ShardedCsvWriter {
+    fn new(
+        output_dir: &str,
+        base_name: &str,
+        csv_shards: u32,
+        dry_run: bool,
+        resuming: bool,
+    ) -> Result<Self> {
+        let mut writers = Vec::with_capacity(csv_shards as usize);
+        for shard in 0..csv_shards {
+            let filename = if csv_shards == 1 {
+                format!("{}.csv", base_name)
+            } else {
+                format!("{}_{:03}.csv", base_name, shard)
+            };
+            writers.push(create_csv_writer(output_dir, &filename, dry_run, resuming)?);
+        }
+        Ok(Self { writers })
+    }
+
+    fn write_headers(&self, fields: &[&str]) -> Result<()> {
+        for writer in &self.writers {
+            write_header(writer, fields)?;
+        }
+        Ok(())
+    }
+
+    fn shard_for(&self, page_id: u32) -> &CsvWriter {
+        let idx = (page_id as usize) % self.writers.len();
+        &self.writers[idx]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_extraction(
     path: &str,
     output_dir: &str,
     index: &WikiIndex,
     shard_count: u32,
+    csv_shards: u32,
     limit: Option<u64>,
     dry_run: bool,
     resume_from: Option<&Checkpoint>,
@@ -130,28 +172,31 @@ pub fn run_extraction(
         info!("Dry run mode - no files will be written");
     }
 
-    let nodes_writer = create_csv_writer(output_dir, "nodes.csv", dry_run, resuming)?;
-    let edges_writer = create_csv_writer(output_dir, "edges.csv", dry_run, resuming)?;
-    let categories_writer = create_csv_writer(output_dir, "categories.csv", dry_run, resuming)?;
-    let article_categories_writer =
-        create_csv_writer(output_dir, "article_categories.csv", dry_run, resuming)?;
-    let images_writer = create_csv_writer(output_dir, "images.csv", dry_run, resuming)?;
+    let nodes_writer = ShardedCsvWriter::new(output_dir, "nodes", csv_shards, dry_run, resuming)?;
+    let edges_writer = ShardedCsvWriter::new(output_dir, "edges", csv_shards, dry_run, resuming)?;
+    let categories_writer =
+        ShardedCsvWriter::new(output_dir, "categories", csv_shards, dry_run, resuming)?;
+    let article_categories_writer = ShardedCsvWriter::new(
+        output_dir,
+        "article_categories",
+        csv_shards,
+        dry_run,
+        resuming,
+    )?;
+    let images_writer = ShardedCsvWriter::new(output_dir, "images", csv_shards, dry_run, resuming)?;
     let external_links_writer =
-        create_csv_writer(output_dir, "external_links.csv", dry_run, resuming)?;
+        ShardedCsvWriter::new(output_dir, "external_links", csv_shards, dry_run, resuming)?;
 
     let reader = WikiReader::new(path, false)
         .with_context(|| format!("Failed to open wiki dump: {}", path))?;
 
     if !resuming {
-        write_header(&nodes_writer, &["id:ID", "title", ":LABEL"])?;
-        write_header(&edges_writer, &[":START_ID", ":END_ID", ":TYPE"])?;
-        write_header(&categories_writer, &["id:ID(Category)", "name", ":LABEL"])?;
-        write_header(
-            &article_categories_writer,
-            &[":START_ID", ":END_ID(Category)", ":TYPE"],
-        )?;
-        write_header(&images_writer, &["article_id", "filename"])?;
-        write_header(&external_links_writer, &["article_id", "url"])?;
+        nodes_writer.write_headers(&["id:ID", "title", ":LABEL"])?;
+        edges_writer.write_headers(&[":START_ID", ":END_ID", ":TYPE"])?;
+        categories_writer.write_headers(&["id:ID(Category)", "name", ":LABEL"])?;
+        article_categories_writer.write_headers(&[":START_ID", ":END_ID(Category)", ":TYPE"])?;
+        images_writer.write_headers(&["article_id", "filename"])?;
+        external_links_writer.write_headers(&["article_id", "url"])?;
     }
 
     let stats_clone = Arc::clone(&stats);
@@ -185,7 +230,7 @@ pub fn run_extraction(
                 let id_str = page.id.to_string();
                 stats_clone.inc_articles();
 
-                if let Ok(mut writer) = nodes_writer.lock() {
+                if let Ok(mut writer) = nodes_writer.shard_for(page.id).lock() {
                     if let Err(e) = writer.write_record([&id_str, &page.title, "Page"]) {
                         warn!(error = %e, "Failed to write node record");
                     }
@@ -228,7 +273,7 @@ pub fn run_extraction(
                     stats_clone.add_invalid_links(invalid_count);
 
                     if !local_edges.is_empty() {
-                        if let Ok(mut writer) = edges_writer.lock() {
+                        if let Ok(mut writer) = edges_writer.shard_for(page.id).lock() {
                             for (end, edge_type) in &local_edges {
                                 if let Err(e) =
                                     writer.write_record([id_str.as_str(), end.as_str(), edge_type])
@@ -252,7 +297,7 @@ pub fn run_extraction(
                         }
                         if !new_cats.is_empty() {
                             stats_clone.add_categories(new_cats.len() as u64);
-                            if let Ok(mut writer) = categories_writer.lock() {
+                            if let Ok(mut writer) = categories_writer.shard_for(page.id).lock() {
                                 for cat_name in &new_cats {
                                     if let Err(e) =
                                         writer.write_record([*cat_name, *cat_name, "Category"])
@@ -264,7 +309,8 @@ pub fn run_extraction(
                         }
 
                         stats_clone.add_category_edges(categories.len() as u64);
-                        if let Ok(mut writer) = article_categories_writer.lock() {
+                        if let Ok(mut writer) = article_categories_writer.shard_for(page.id).lock()
+                        {
                             for cat_name in &categories {
                                 if let Err(e) =
                                     writer.write_record([id_str.as_str(), cat_name, "HAS_CATEGORY"])
@@ -278,7 +324,7 @@ pub fn run_extraction(
                     let images = content::extract_images(text);
                     if !images.is_empty() {
                         stats_clone.add_images(images.len() as u64);
-                        if let Ok(mut writer) = images_writer.lock() {
+                        if let Ok(mut writer) = images_writer.shard_for(page.id).lock() {
                             for filename in &images {
                                 if let Err(e) =
                                     writer.write_record([id_str.as_str(), filename.as_str()])
@@ -292,7 +338,7 @@ pub fn run_extraction(
                     let ext_links = content::extract_external_links(text);
                     if !ext_links.is_empty() {
                         stats_clone.add_external_links(ext_links.len() as u64);
-                        if let Ok(mut writer) = external_links_writer.lock() {
+                        if let Ok(mut writer) = external_links_writer.shard_for(page.id).lock() {
                             for url in &ext_links {
                                 if let Err(e) = writer.write_record([id_str.as_str(), url.as_str()])
                                 {

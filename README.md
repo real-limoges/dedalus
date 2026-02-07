@@ -1,8 +1,8 @@
 # Dedalus
 
-A Rust data processing pipeline that extracts and transforms Wikipedia XML dumps into structured data for Neo4J graph database ingestion.
+A Rust pipeline that extracts Wikipedia XML dumps into structured graph data and imports it into [Neo4j](https://neo4j.com).
 
-Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extracts article link graphs, and outputs Neo4J-compatible CSV files alongside sharded JSON article content.
+Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extracts article link graphs, and loads everything into Neo4j as a queryable knowledge graph. It can also output raw CSV/JSON files for use with other tools.
 
 ## Features
 
@@ -11,7 +11,8 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 - **Parallel extraction** -- uses `rayon` for multi-core article processing
 - **Parallel decompression** -- automatically uses `lbzip2` or `pbzip2` when available on PATH; falls back to in-process `MultiBzDecoder`
 - **Redirect resolution** -- follows redirect chains (up to 5 hops) to resolve target article IDs
-- **Neo4J-compatible output** -- `nodes.csv`, `edges.csv`, `categories.csv`, `article_categories.csv` formatted for `neo4j-admin import`; `images.csv` and `external_links.csv` loadable via `LOAD CSV`
+- **CSV sharding** -- `--csv-shards N` splits each CSV into N files for parallel database loading
+- **Native Neo4j import** -- `dedalus import` manages Docker, connects via Bolt, and loads all CSVs with throttled parallelism
 - **Rich content extraction** -- categories, infoboxes, abstracts, see-also links, images, external links, section headings, disambiguation detection, revision timestamps
 - **Namespace-aware** -- parses `<ns>` XML tag for page classification; filters namespace-prefixed links from article edges
 - **Sharded JSON blobs** -- enriched article content stored as `blobs/{shard}/{id}.json` (1000 shards by default)
@@ -27,47 +28,98 @@ Requires Rust 1.70+ (stable).
 cargo build --release
 ```
 
-## Usage
+## Quick Start
 
 ```bash
-./target/release/dedalus --input <path-to-dump.xml.bz2> --output <output-dir>
+# Extract Wikipedia dump with 16 CSV shards
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 16 -v
+
+# Import into Neo4j (starts Docker automatically)
+dedalus import -o output/
 ```
 
-### CLI Options
+After import completes, Neo4j is available at:
+- **Bolt**: `bolt://localhost:7687`
+- **Browser**: `http://localhost:7474`
+
+## Usage
+
+Dedalus uses subcommands: `extract` and `import`.
+
+### `dedalus extract`
+
+Processes a Wikipedia dump into CSV/JSON output files.
+
+```bash
+dedalus extract -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
+```
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-i, --input <PATH>` | Path to Wikipedia dump file (`.xml.bz2`) | required |
 | `-o, --output <DIR>` | Output directory for generated files | required |
 | `--shard-count <N>` | Number of shards for blob storage | `1000` |
-| `--limit <N>` | Limit number of pages to process (useful for testing) | none |
+| `--csv-shards <N>` | Number of CSV output shards (1 = single file) | `1` |
+| `--limit <N>` | Limit pages processed (useful for testing) | none |
 | `--dry-run` | Run pipeline without writing output files | `false` |
-| `-v, --verbose` | Increase verbosity (`-v` INFO, `-vv` DEBUG, `-vvv` TRACE) | WARN |
 | `--resume` | Resume from last checkpoint if available | `false` |
 | `--no-cache` | Force rebuild of index cache | `false` |
 | `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
 | `--clean` | Clear existing checkpoint and outputs before starting | `false` |
 
-### Example
+### `dedalus import`
+
+Loads extracted CSV files into Neo4j via the Bolt protocol. Manages Docker lifecycle automatically.
+
+```bash
+dedalus import -o <output-dir> [OPTIONS]
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-o, --output <DIR>` | Directory containing Dedalus CSV output | required |
+| `--bolt-uri <URI>` | Neo4j Bolt URI | `bolt://localhost:7687` |
+| `--import-prefix <PREFIX>` | Import file URI prefix for Neo4j LOAD CSV | `file://` |
+| `--max-parallel-edges <N>` | Max concurrent edge LOAD CSV jobs | `1` |
+| `--max-parallel-light <N>` | Max concurrent light relationship LOAD CSV jobs | `4` |
+| `--compose-file <PATH>` | Docker compose file path (auto-detected if omitted) | auto |
+| `--no-docker` | Skip Docker management, connect to already-running Neo4j | `false` |
+| `--clean` | Tear down existing Neo4j volumes before importing | `false` |
+
+### Global flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-v, --verbose` | Increase verbosity (`-v` INFO, `-vv` DEBUG, `-vvv` TRACE) | WARN |
+
+### Examples
 
 ```bash
 # Process the full English Wikipedia dump
-./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ -v
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ -v
 
 # Quick test with 10,000 pages
-./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
 
-# Resume interrupted processing (uses cached index and checkpoint)
-./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --resume -v
+# Extract with CSV sharding for parallel import
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 16 -v
 
-# Force fresh start (rebuild index, clear checkpoint)
-./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --clean -v
+# Resume interrupted extraction
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --resume -v
 
-# Force index rebuild while keeping checkpoint
-./target/release/dedalus -i enwiki-latest-pages-articles.xml.bz2 -o output/ --no-cache -v
+# Import into Neo4j (Docker managed automatically)
+dedalus import -o output/
+
+# Clean import (tears down volumes, starts fresh)
+dedalus import -o output/ --clean
+
+# Import into an already-running Neo4j instance
+dedalus import -o output/ --no-docker --bolt-uri bolt://my-neo4j:7687
 ```
 
 ## Output Format
+
+With `--csv-shards 1` (default), extraction produces single files. With `--csv-shards N` (N > 1), each CSV is split into numbered shards (e.g. `edges_000.csv` through `edges_015.csv`).
 
 ```
 output/
@@ -78,114 +130,83 @@ output/
 ├── images.csv             # article_id | filename
 ├── external_links.csv     # article_id | url
 ├── index.cache            # Cached index for fast restarts (bincode)
-├── checkpoint.bin         # Extraction progress checkpoint (bincode)
+├── checkpoint.bin         # Extraction progress checkpoint (bincode, cleared on completion)
 └── blobs/
     ├── 000/
-    │   └── {id}.json      # Enriched article blob (see below)
+    │   └── {id}.json      # Enriched article blob
     ├── 001/
     │   └── ...
     └── 999/
 ```
 
-- **nodes.csv** -- one row per article with columns `id:ID`, `title`, `:LABEL` (compatible with `neo4j-admin import`)
-- **edges.csv** -- one row per wikilink with columns `:START_ID`, `:END_ID`, `:TYPE` (`LINKS_TO` for regular links, `SEE_ALSO` for links in "See also" sections). Namespace-prefixed links (Category:, File:, Template:, etc.) are excluded.
-- **categories.csv** -- deduplicated category nodes with columns `id:ID(Category)`, `name`, `:LABEL`
-- **article_categories.csv** -- article-to-category edges with columns `:START_ID`, `:END_ID(Category)`, `:TYPE` (`HAS_CATEGORY`)
-- **images.csv** -- image references extracted from `[[File:...]]` / `[[Image:...]]` wikilinks
-- **external_links.csv** -- external URLs extracted from `[http://...]` markup
-- **blobs/** -- enriched article JSON, sharded by `id % shard_count`. Each blob contains:
-  - `id`, `title`, `abstract_text` (first paragraph, templates stripped)
-  - `categories` (list), `infoboxes` (structured key-value), `sections` (heading list)
-  - `timestamp` (revision ISO 8601), `is_disambiguation` (boolean)
-- **index.cache** -- serialized index for skipping the indexing pass on subsequent runs (auto-invalidated if input file changes)
-- **checkpoint.bin** -- extraction progress checkpoint for resumable processing (cleared on successful completion)
+### CSV files
+
+- **nodes** -- one row per article: `id:ID`, `title`, `:LABEL`
+- **edges** -- one row per wikilink: `:START_ID`, `:END_ID`, `:TYPE` (`LINKS_TO` or `SEE_ALSO`). Namespace-prefixed links (Category:, File:, Template:, etc.) are excluded.
+- **categories** -- deduplicated category nodes: `id:ID(Category)`, `name`, `:LABEL`
+- **article_categories** -- article-to-category edges: `:START_ID`, `:END_ID(Category)`, `:TYPE` (`HAS_CATEGORY`)
+- **images** -- image references from `[[File:...]]` / `[[Image:...]]` wikilinks
+- **external_links** -- URLs from `[http://...]` markup
+
+### JSON blobs
+
+Enriched article content, sharded by `id % shard_count`:
+
+- `id`, `title`, `abstract_text` (first paragraph, templates stripped)
+- `categories` (list), `infoboxes` (structured key-value), `sections` (heading list)
+- `timestamp` (revision ISO 8601), `is_disambiguation` (boolean)
+
+Empty fields are omitted from the JSON for compactness.
 
 ## Architecture
 
 ### Two-Pass Pipeline
 
-1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` (from `rustc-hash`) of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects. No article text is read.
+1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects.
 
-2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, this time reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. Resolves link targets through the index and writes all output files concurrently.
+2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. `ShardedCsvWriter` distributes rows across N files by `page_id % csv_shards`.
+
+3. **Import** (`import.rs`) -- connects to Neo4j over Bolt (`neo4rs`), creates indexes, loads CSVs with throttled parallelism via `FuturesUnordered` using `CALL { ... } IN TRANSACTIONS` for memory-bounded bulk loading, then creates constraints.
 
 ### Modules
 
 | Module | Purpose |
 |--------|---------|
-| `main.rs` | CLI parsing (`clap`), orchestrates two-pass pipeline, summary output |
-| `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>`; auto-detects `lbzip2`/`pbzip2` for parallel decompression |
+| `main.rs` | CLI subcommands (`clap`), orchestrates extract/import |
+| `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>`; auto-detects parallel decompressor |
 | `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution |
-| `extract.rs` | Parallel extraction of nodes, edges, categories, images, external links, and article blobs |
+| `extract.rs` | Parallel extraction with `ShardedCsvWriter` for split CSV output |
+| `import.rs` | Neo4j import -- Docker management, Bolt connection with retry, throttled LOAD CSV |
 | `models.rs` | Core types: `WikiPage`, `PageType`, `ArticleBlob` |
-| `content.rs` | Text extraction helpers: abstract, sections, see-also links, categories, images, external links, disambiguation detection; CSV field sanitization |
+| `content.rs` | Text extraction: abstract, sections, see-also links, categories, images, external links, disambiguation |
 | `infobox.rs` | Brace-matching `{{Infobox ...}}` parser producing structured key-value data |
 | `stats.rs` | `ExtractionStats` -- atomic counters for thread-safe metrics |
-| `config.rs` | Constants: redirect depth, shard count, progress interval, cache/checkpoint versions |
-| `cache.rs` | Index persistence -- zero-copy serialization (`IndexCacheSer` borrows data) and single-pass `try_load_index` |
-| `checkpoint.rs` | Extraction checkpointing -- save/load progress for resumable processing |
+| `config.rs` | Constants for extraction and import |
+| `cache.rs` | Index persistence -- zero-copy serialization via `IndexCacheSer` |
+| `checkpoint.rs` | Extraction checkpointing with double-checked locking for resumable processing |
 
-## Loading into Neo4j
+## Docker / Neo4j Setup
 
-After running Dedalus, import the CSVs into Neo4j using `neo4j-admin`:
+Dedalus includes a Docker Compose configuration in `neo4j-platform/docker-compose.yml` that runs:
+
+- **Neo4j Community 5.x** -- graph database with Bolt protocol (port 7687) and browser UI (port 7474)
+
+The `dedalus import` command manages this container automatically. To run it manually:
 
 ```bash
-# Stop Neo4j first
-neo4j stop
-
-# Import (or use scripts/import-neo4j.sh)
-neo4j-admin database import full \
-    --overwrite-destination \
-    --nodes=Page=output/nodes.csv \
-    --nodes=Category=output/categories.csv \
-    --relationships=output/edges.csv \
-    --relationships=output/article_categories.csv \
-    neo4j
-
-# Start Neo4j and create indexes
-neo4j start
-cypher-shell <<'EOF'
-CREATE CONSTRAINT page_id IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE;
-CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);
-CREATE CONSTRAINT category_name IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE;
-EOF
+IMPORT_DIR=./output docker compose -f neo4j-platform/docker-compose.yml up -d
 ```
 
-See `scripts/import-neo4j.sh` for a ready-to-use bulk import script. See `docs/IMPLEMENTATION_GUIDE_PHASES_6-9.md` for verification queries and sample Cypher.
-
-### Loading Images and External Links
-
-`images.csv` and `external_links.csv` use plain headers and are not compatible with `neo4j-admin import`. After Neo4j is running, load them with `LOAD CSV`:
-
-```cypher
-// Create Image nodes and HAS_IMAGE relationships
-LOAD CSV WITH HEADERS FROM 'file:///images.csv' AS row
-MATCH (p:Page) WHERE p.id = toInteger(row.article_id)
-MERGE (i:Image {filename: row.filename})
-CREATE (p)-[:HAS_IMAGE]->(i);
-
-// Create ExternalLink nodes and HAS_LINK relationships
-LOAD CSV WITH HEADERS FROM 'file:///external_links.csv' AS row
-MATCH (p:Page) WHERE p.id = toInteger(row.article_id)
-MERGE (e:ExternalLink {url: row.url})
-CREATE (p)-[:HAS_LINK]->(e);
-
-// Create indexes for the new node types
-CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);
-CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);
-```
-
-**Note:** Copy `images.csv` and `external_links.csv` to the Neo4j import directory (typically `<NEO4J_HOME>/import/`) or adjust the file paths accordingly.
+The `IMPORT_DIR` environment variable controls which host directory is mounted at `/import` inside the container.
 
 ## Development
 
 ```bash
 cargo build --release          # Build optimized binary
-cargo test --verbose           # Run tests
+cargo test --verbose           # Run tests (155 tests)
 cargo fmt -- --check           # Check formatting
 cargo clippy -- -D warnings    # Lint with strict warnings
 ```
-
-CI runs formatting, linting, build, and test checks on every push and PR via GitHub Actions.
 
 ## License
 

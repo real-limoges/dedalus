@@ -46,7 +46,6 @@ fn spawn_decompressor(cmd: &str, path: &str) -> Result<Child> {
 
 impl WikiReader {
     pub fn new(path: &str, skip_text: bool) -> Result<Self> {
-        // Fail fast if the file doesn't exist, before spawning a subprocess
         if !std::path::Path::new(path).exists() {
             return Err(anyhow::anyhow!("Could not open file: {}", path));
         }
@@ -117,7 +116,6 @@ impl Iterator for WikiReader {
     type Item = WikiPage;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // state
         let mut current_id = None;
         let mut current_title: Option<String> = None;
         let mut current_text: Option<String> = None;
@@ -125,7 +123,6 @@ impl Iterator for WikiReader {
         let mut current_ns: Option<i32> = None;
         let mut current_timestamp: Option<String> = None;
 
-        // flags
         let mut in_title = false;
         let mut in_id = false;
         let mut in_text = false;
@@ -134,17 +131,14 @@ impl Iterator for WikiReader {
 
         loop {
             match self.reader.read_event_into(&mut self.buf) {
-                // 1. START TAGS
                 Ok(Event::Start(e)) => match e.name().as_ref() {
-                    b"page" => {
-                        // implicit reset
-                    }
+                    b"page" => {}
+
                     b"title" => in_title = true,
                     b"id" if current_id.is_none() => in_id = true,
                     b"ns" => in_ns = true,
                     b"timestamp" => in_timestamp = true,
                     b"text" => {
-                        // skip text first time around
                         if !self.skip_text {
                             in_text = true;
                         }
@@ -237,7 +231,6 @@ impl Iterator for WikiReader {
                 }
                 _ => (),
             }
-            // reuse memory
             self.buf.clear();
         }
     }

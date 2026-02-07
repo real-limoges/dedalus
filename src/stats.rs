@@ -1,7 +1,6 @@
 use crate::checkpoint::CheckpointStats;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Statistics collected during the extraction process
 #[derive(Default)]
 pub struct ExtractionStats {
     pub articles_processed: AtomicU64,
@@ -106,7 +105,6 @@ impl ExtractionStats {
         self.external_links_found.load(Ordering::Relaxed)
     }
 
-    /// Create stats initialized from a checkpoint
     pub fn from_checkpoint(cp: &CheckpointStats) -> Self {
         Self {
             articles_processed: AtomicU64::new(cp.articles_processed),
@@ -122,7 +120,6 @@ impl ExtractionStats {
         }
     }
 
-    /// Convert to checkpoint stats for persistence
     pub fn to_checkpoint(&self) -> CheckpointStats {
         CheckpointStats {
             articles_processed: self.articles(),

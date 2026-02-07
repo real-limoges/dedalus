@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod content;
 pub mod extract;
+pub mod import;
 pub mod index;
 pub mod infobox;
 pub mod models;

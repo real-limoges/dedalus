@@ -65,12 +65,10 @@ impl WikiIndex {
         })
     }
 
-    /// Borrow the underlying maps for zero-copy serialization.
     pub fn maps(&self) -> (&FxHashMap<String, u32>, &FxHashMap<String, String>) {
         (&self.title_to_id, &self.redirects)
     }
 
-    /// Reconstruct index directly from deserialized maps.
     pub fn from_maps(
         title_to_id: FxHashMap<String, u32>,
         redirects: FxHashMap<String, String>,
@@ -81,7 +79,6 @@ impl WikiIndex {
         }
     }
 
-    /// Convert index to serializable form for caching (legacy, clones all data).
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub fn to_serializable(&self) -> (Vec<(String, u32)>, Vec<(String, String)>) {
@@ -98,7 +95,6 @@ impl WikiIndex {
         (articles, redirects)
     }
 
-    /// Reconstruct index from serialized data (legacy, used in tests).
     #[cfg(test)]
     pub fn from_serializable(
         articles: Vec<(String, u32)>,
@@ -110,7 +106,6 @@ impl WikiIndex {
         }
     }
 
-    /// Get counts of articles and redirects in the index
     pub fn stats(&self) -> (usize, usize) {
         (self.title_to_id.len(), self.redirects.len())
     }
