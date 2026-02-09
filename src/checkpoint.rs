@@ -68,7 +68,7 @@ pub fn load_if_valid(
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(&path).context("Failed to open checkpoint file")?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(256 * 1024, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 

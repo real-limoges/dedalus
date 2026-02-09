@@ -60,13 +60,13 @@ fn create_csv_writer(
         csv::WriterBuilder::new()
             .has_headers(false)
             .from_writer(
-                Box::new(BufWriter::with_capacity(64 * 1024, file)) as Box<dyn Write + Send>
+                Box::new(BufWriter::with_capacity(128 * 1024, file)) as Box<dyn Write + Send>
             )
     } else {
         let file = File::create(format!("{}/{}", output_dir, filename))
             .with_context(|| format!("Failed to create {}", filename))?;
         csv::Writer::from_writer(
-            Box::new(BufWriter::with_capacity(64 * 1024, file)) as Box<dyn Write + Send>
+            Box::new(BufWriter::with_capacity(128 * 1024, file)) as Box<dyn Write + Send>
         )
     })))
 }
@@ -132,6 +132,20 @@ pub fn run_extraction(
     resume_from: Option<&Checkpoint>,
     checkpoint_mgr: Option<&CheckpointManager>,
 ) -> Result<ExtractionStats> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use rayon::ThreadPoolBuilder;
+        let _ = ThreadPoolBuilder::new()
+            .num_threads(8) // P-cores only
+            .spawn_handler(|thread| {
+                std::thread::Builder::new()
+                    .name(format!("dedalus-extract-{}", thread.index()))
+                    .spawn(move || thread.run())
+                    .map(|_| ())
+            })
+            .build_global();
+    }
+
     let stats = Arc::new(if let Some(cp) = resume_from {
         ExtractionStats::from_checkpoint(&cp.stats)
     } else {
@@ -183,9 +197,24 @@ pub fn run_extraction(
         dry_run,
         resuming,
     )?;
-    let images_writer = ShardedCsvWriter::new(output_dir, "images", csv_shards, dry_run, resuming)?;
-    let external_links_writer =
-        ShardedCsvWriter::new(output_dir, "external_links", csv_shards, dry_run, resuming)?;
+    let image_nodes_writer =
+        ShardedCsvWriter::new(output_dir, "image_nodes", csv_shards, dry_run, resuming)?;
+    let article_images_writer =
+        ShardedCsvWriter::new(output_dir, "article_images", csv_shards, dry_run, resuming)?;
+    let external_link_nodes_writer = ShardedCsvWriter::new(
+        output_dir,
+        "external_link_nodes",
+        csv_shards,
+        dry_run,
+        resuming,
+    )?;
+    let article_external_links_writer = ShardedCsvWriter::new(
+        output_dir,
+        "article_external_links",
+        csv_shards,
+        dry_run,
+        resuming,
+    )?;
 
     let reader = WikiReader::new(path, false)
         .with_context(|| format!("Failed to open wiki dump: {}", path))?;
@@ -195,13 +224,21 @@ pub fn run_extraction(
         edges_writer.write_headers(&[":START_ID", ":END_ID", ":TYPE"])?;
         categories_writer.write_headers(&["id:ID(Category)", "name", ":LABEL"])?;
         article_categories_writer.write_headers(&[":START_ID", ":END_ID(Category)", ":TYPE"])?;
-        images_writer.write_headers(&["article_id", "filename"])?;
-        external_links_writer.write_headers(&["article_id", "url"])?;
+        image_nodes_writer.write_headers(&["id:ID(Image)", "filename", ":LABEL"])?;
+        article_images_writer.write_headers(&[":START_ID", ":END_ID(Image)", ":TYPE"])?;
+        external_link_nodes_writer.write_headers(&["id:ID(ExternalLink)", "url", ":LABEL"])?;
+        article_external_links_writer.write_headers(&[
+            ":START_ID",
+            ":END_ID(ExternalLink)",
+            ":TYPE",
+        ])?;
     }
 
     let stats_clone = Arc::clone(&stats);
     let limit_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let seen_categories: Arc<DashSet<String>> = Arc::new(DashSet::new());
+    let seen_images: Arc<DashSet<String>> = Arc::new(DashSet::new());
+    let seen_external_links: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
     let max_completed_id = Arc::new(AtomicU32::new(resume_after_id));
 
@@ -323,13 +360,35 @@ pub fn run_extraction(
 
                     let images = content::extract_images(text);
                     if !images.is_empty() {
-                        stats_clone.add_images(images.len() as u64);
-                        if let Ok(mut writer) = images_writer.shard_for(page.id).lock() {
+                        // Collect newly-seen images locally, then lock once.
+                        let mut new_images: Vec<&str> = Vec::new();
+                        for filename in &images {
+                            if !seen_images.contains(filename.as_str())
+                                && seen_images.insert(filename.clone())
+                            {
+                                new_images.push(filename);
+                            }
+                        }
+                        if !new_images.is_empty() {
+                            stats_clone.add_images(new_images.len() as u64);
+                            if let Ok(mut writer) = image_nodes_writer.shard_for(page.id).lock() {
+                                for filename in &new_images {
+                                    if let Err(e) =
+                                        writer.write_record([*filename, *filename, "Image"])
+                                    {
+                                        warn!(error = %e, "Failed to write image node record");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Write article-image relationships
+                        if let Ok(mut writer) = article_images_writer.shard_for(page.id).lock() {
                             for filename in &images {
-                                if let Err(e) =
-                                    writer.write_record([id_str.as_str(), filename.as_str()])
+                                if let Err(e) = writer
+                                    .write_record([id_str.as_str(), filename.as_str(), "HAS_IMAGE"])
                                 {
-                                    warn!(error = %e, "Failed to write image record");
+                                    warn!(error = %e, "Failed to write article-image edge record");
                                 }
                             }
                         }
@@ -337,12 +396,39 @@ pub fn run_extraction(
 
                     let ext_links = content::extract_external_links(text);
                     if !ext_links.is_empty() {
-                        stats_clone.add_external_links(ext_links.len() as u64);
-                        if let Ok(mut writer) = external_links_writer.shard_for(page.id).lock() {
+                        // Collect newly-seen external links locally, then lock once.
+                        let mut new_links: Vec<&str> = Vec::new();
+                        for url in &ext_links {
+                            if !seen_external_links.contains(url.as_str())
+                                && seen_external_links.insert(url.clone())
+                            {
+                                new_links.push(url);
+                            }
+                        }
+                        if !new_links.is_empty() {
+                            stats_clone.add_external_links(new_links.len() as u64);
+                            if let Ok(mut writer) =
+                                external_link_nodes_writer.shard_for(page.id).lock()
+                            {
+                                for url in &new_links {
+                                    if let Err(e) =
+                                        writer.write_record([*url, *url, "ExternalLink"])
+                                    {
+                                        warn!(error = %e, "Failed to write external link node record");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Write article-external link relationships
+                        if let Ok(mut writer) =
+                            article_external_links_writer.shard_for(page.id).lock()
+                        {
                             for url in &ext_links {
-                                if let Err(e) = writer.write_record([id_str.as_str(), url.as_str()])
+                                if let Err(e) = writer
+                                    .write_record([id_str.as_str(), url.as_str(), "HAS_LINK"])
                                 {
-                                    warn!(error = %e, "Failed to write external link record");
+                                    warn!(error = %e, "Failed to write article-external link edge record");
                                 }
                             }
                         }
@@ -375,7 +461,7 @@ pub fn run_extraction(
                         let blob_path = format!("{}/{}.json", dir_path, page.id);
                         match File::create(&blob_path) {
                             Ok(f) => {
-                                let mut w = BufWriter::new(f);
+                                let mut w = BufWriter::with_capacity(256 * 1024, f);
                                 if let Err(e) = serde_json::to_writer(&mut w, &blob) {
                                     warn!(error = %e, path = %blob_path, "Failed to write blob");
                                 } else {

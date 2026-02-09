@@ -61,7 +61,7 @@ pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<Wiki
     let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(cache_path).context("Failed to open cache file")?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(256 * 1024, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
@@ -174,7 +174,7 @@ pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
 
     let file = File::open(cache_path)
         .with_context(|| format!("Failed to open cache file: {:?}", cache_path))?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(256 * 1024, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 

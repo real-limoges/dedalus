@@ -12,46 +12,56 @@ use tracing::{info, warn};
 const CYPHER_LOAD_PAGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
     CREATE (:Page {id: row.`id:ID`, title: row.title})
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_CATEGORIES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
     CREATE (:Category {id: row.`id:ID(Category)`, name: row.name})
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_EDGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
     MATCH (a:Page {id: row.`:START_ID`}), (b:Page {id: row.`:END_ID`})
     CREATE (a)-[:LINKS_TO]->(b)
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_ARTICLE_CATEGORIES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
     MATCH (p:Page {id: row.`:START_ID`}), (c:Category {id: row.`:END_ID(Category)`})
     CREATE (p)-[:HAS_CATEGORY]->(c)
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
-const CYPHER_LOAD_IMAGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
+const CYPHER_LOAD_IMAGE_NODES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
-    MATCH (p:Page {id: row.article_id})
-    MERGE (i:Image {filename: row.filename})
+    CREATE (:Image {id: row.`id:ID(Image)`, filename: row.filename})
+} IN TRANSACTIONS OF 50000 ROWS;"#;
+
+const CYPHER_LOAD_ARTICLE_IMAGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
+CALL { WITH row
+    MATCH (p:Page {id: row.`:START_ID`}), (i:Image {id: row.`:END_ID(Image)`})
     CREATE (p)-[:HAS_IMAGE]->(i)
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
-const CYPHER_LOAD_EXTERNAL_LINKS: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
+const CYPHER_LOAD_EXTERNAL_LINK_NODES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
-    MATCH (p:Page {id: row.article_id})
-    MERGE (e:ExternalLink {url: row.url})
+    CREATE (:ExternalLink {id: row.`id:ID(ExternalLink)`, url: row.url})
+} IN TRANSACTIONS OF 50000 ROWS;"#;
+
+const CYPHER_LOAD_ARTICLE_EXTERNAL_LINKS: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
+CALL { WITH row
+    MATCH (p:Page {id: row.`:START_ID`}), (e:ExternalLink {id: row.`:END_ID(ExternalLink)`})
     CREATE (p)-[:HAS_LINK]->(e)
-} IN TRANSACTIONS OF 10000 ROWS;"#;
+} IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CSV_TYPES: &[&str] = &[
     "nodes",
     "edges",
     "categories",
     "article_categories",
-    "images",
-    "external_links",
+    "image_nodes",
+    "article_images",
+    "external_link_nodes",
+    "article_external_links",
 ];
 
 pub struct ImportConfig {
@@ -63,6 +73,7 @@ pub struct ImportConfig {
     pub compose_file: Option<String>,
     pub no_docker: bool,
     pub clean: bool,
+    pub use_admin_import: bool,
 }
 
 #[derive(Debug)]
@@ -78,6 +89,247 @@ impl CsvLayout {
             CsvLayout::Sharded { count } => format!("sharded ({count} shards)"),
         }
     }
+}
+
+/// Fast bulk import using neo4j-admin import (10-100x faster than Bolt LOAD CSV)
+async fn run_admin_import(
+    config: &ImportConfig,
+    compose_file: &str,
+    layout: &CsvLayout,
+    start: Instant,
+) -> Result<()> {
+    println!();
+    println!("============================================");
+    println!("  BULK IMPORT MODE (neo4j-admin)");
+    println!("============================================");
+    println!();
+
+    // Check if CSVs are sharded - neo4j-admin import doesn't handle cross-shard duplicates
+    if !matches!(layout, CsvLayout::Single) {
+        bail!(
+            "ERROR: --admin-import requires non-sharded CSVs (--csv-shards 1)\n\
+             \n\
+             You have sharded CSVs which can contain duplicate category IDs across files.\n\
+             neo4j-admin import cannot handle this.\n\
+             \n\
+             Options:\n\
+             1. Re-extract with: dedalus extract ... --csv-shards 1\n\
+             2. Use standard Bolt import: dedalus import -o {} (slower but works with shards)\n\
+             \n\
+             For maximum speed, use --csv-shards 1 with --admin-import.",
+            config.output_dir
+        );
+    }
+
+    println!("This will WIPE the existing Neo4j database");
+    println!("and perform a fast bulk import.");
+    println!();
+
+    // Ensure Neo4j is stopped and containers are down
+    println!("==> Stopping and removing Neo4j containers ...");
+    let down_output = Command::new("docker")
+        .args(["compose", "-f", compose_file, "down"])
+        .env("IMPORT_DIR", &config.output_dir)
+        .output()
+        .await
+        .context("Failed to stop Neo4j via docker compose down")?;
+
+    if !down_output.status.success() {
+        warn!("docker compose down had non-zero exit");
+    }
+    println!("    Containers stopped and removed.");
+
+    // Build neo4j-admin import command
+    println!();
+    println!("==> Building import command ...");
+
+    let node_files = csv_files_for("nodes", layout);
+    let cat_files = csv_files_for("categories", layout);
+    let img_node_files = csv_files_for("image_nodes", layout);
+    let extlink_node_files = csv_files_for("external_link_nodes", layout);
+    let edge_files = csv_files_for("edges", layout);
+    let artcat_files = csv_files_for("article_categories", layout);
+    let artimg_files = csv_files_for("article_images", layout);
+    let artextlink_files = csv_files_for("article_external_links", layout);
+
+    // Build command arguments for neo4j-admin database import full
+    // Use 'docker compose run' to create a temporary container with same volumes
+    let mut import_args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        compose_file.to_string(),
+        "run".to_string(),
+        "--rm".to_string(),
+        "--no-deps".to_string(),
+        "neo4j".to_string(),
+        "neo4j-admin".to_string(),
+        "database".to_string(),
+        "import".to_string(),
+        "full".to_string(),
+        "--verbose".to_string(), // Show detailed errors
+        "--overwrite-destination".to_string(),
+        "neo4j".to_string(), // database name
+    ];
+
+    // Add nodes (Pages)
+    for file in &node_files {
+        import_args.push("--nodes".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add nodes (Categories)
+    for file in &cat_files {
+        import_args.push("--nodes".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add nodes (Images)
+    for file in &img_node_files {
+        import_args.push("--nodes".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add nodes (ExternalLinks)
+    for file in &extlink_node_files {
+        import_args.push("--nodes".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add relationships (Edges)
+    for file in &edge_files {
+        import_args.push("--relationships".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add relationships (Article-Categories)
+    for file in &artcat_files {
+        import_args.push("--relationships".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add relationships (Article-Images)
+    for file in &artimg_files {
+        import_args.push("--relationships".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    // Add relationships (Article-ExternalLinks)
+    for file in &artextlink_files {
+        import_args.push("--relationships".to_string());
+        import_args.push(format!("/import/{}", file));
+    }
+
+    let total_files = node_files.len()
+        + cat_files.len()
+        + img_node_files.len()
+        + extlink_node_files.len()
+        + edge_files.len()
+        + artcat_files.len()
+        + artimg_files.len()
+        + artextlink_files.len();
+    println!(
+        "    Command prepared ({} files for bulk import)",
+        total_files
+    );
+
+    // Run neo4j-admin import
+    println!();
+    println!("==> Running neo4j-admin database import ...");
+    println!("    This may take 5-15 minutes for full Wikipedia dump");
+    println!();
+
+    let import_output = Command::new("docker")
+        .args(&import_args)
+        .env("IMPORT_DIR", &config.output_dir)
+        .output()
+        .await
+        .context("Failed to run neo4j-admin import")?;
+
+    if !import_output.status.success() {
+        let stderr = String::from_utf8_lossy(&import_output.stderr);
+        bail!("neo4j-admin import failed:\n{}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&import_output.stdout);
+    println!("{}", stdout);
+
+    // Start Neo4j with imported data
+    println!("==> Starting Neo4j with imported data ...");
+    let start_output = Command::new("docker")
+        .args(["compose", "-f", compose_file, "up", "-d"])
+        .env("IMPORT_DIR", &config.output_dir)
+        .output()
+        .await
+        .context("Failed to start Neo4j via docker compose")?;
+
+    if !start_output.status.success() {
+        let stderr = String::from_utf8_lossy(&start_output.stderr);
+        bail!("Failed to start Neo4j after import:\n{}", stderr);
+    }
+    println!("    Neo4j started.");
+
+    // Wait for Neo4j to be ready
+    println!();
+    println!("==> Waiting for Neo4j to be ready ...");
+    let graph = connect_with_retry(config).await?;
+    println!("    Neo4j ready.");
+
+    // Create post-import indexes for query performance
+    println!();
+    println!("==> Creating indexes and constraints ...");
+    run_cypher(
+        &graph,
+        "CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);",
+    )
+    .await?;
+    run_cypher(
+        &graph,
+        "CREATE INDEX category_name IF NOT EXISTS FOR (c:Category) ON (c.name);",
+    )
+    .await?;
+    run_cypher(
+        &graph,
+        "CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);",
+    )
+    .await?;
+    run_cypher(
+        &graph,
+        "CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);",
+    )
+    .await?;
+    println!("    Indexes and constraints created.");
+
+    // Get final counts
+    let page_count = query_count(&graph, "MATCH (p:Page) RETURN count(p) AS cnt").await?;
+    let cat_count = query_count(&graph, "MATCH (c:Category) RETURN count(c) AS cnt").await?;
+    let edge_count =
+        query_count(&graph, "MATCH ()-[r:LINKS_TO]->() RETURN count(r) AS cnt").await?;
+    let artcat_count = query_count(
+        &graph,
+        "MATCH ()-[r:HAS_CATEGORY]->() RETURN count(r) AS cnt",
+    )
+    .await?;
+    let img_count =
+        query_count(&graph, "MATCH ()-[r:HAS_IMAGE]->() RETURN count(r) AS cnt").await?;
+    let extlink_count =
+        query_count(&graph, "MATCH ()-[r:HAS_LINK]->() RETURN count(r) AS cnt").await?;
+
+    let elapsed = start.elapsed();
+    println!();
+    println!("============================================");
+    println!("  SUCCESS: Bulk import complete!");
+    println!("============================================");
+    println!();
+    println!("Total time:         {:.2}s", elapsed.as_secs_f64());
+    println!("Pages:              {page_count}");
+    println!("Categories:         {cat_count}");
+    println!("Edges:              {edge_count}");
+    println!("Article-Categories: {artcat_count}");
+    println!("Images:             {img_count}");
+    println!("External Links:     {extlink_count}");
+    println!();
+
+    Ok(())
 }
 
 pub async fn run_import(mut config: ImportConfig) -> Result<()> {
@@ -96,7 +348,15 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
 
     if !config.no_docker {
         let compose_file = resolve_compose_file(&config)?;
+
+        // Branch: use neo4j-admin import or Bolt-based import
+        if config.use_admin_import {
+            return run_admin_import(&config, &compose_file, &layout, start).await;
+        }
+
         docker_start(&compose_file, &config).await?;
+    } else if config.use_admin_import {
+        bail!("--admin-import requires Docker (cannot use with --no-docker)");
     }
 
     println!();
@@ -106,28 +366,49 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
 
     let mp = MultiProgress::new();
 
-    let pb = mp.add(make_spinner("Creating indexes for import performance ..."));
+    let pb = mp.add(make_spinner(
+        "Creating constraints and indexes for import performance ...",
+    ));
+    // Use UNIQUE constraints instead of indexes for better MERGE performance
     run_cypher(
         &graph,
-        "CREATE INDEX page_id IF NOT EXISTS FOR (p:Page) ON (p.id);",
+        "CREATE CONSTRAINT page_id_unique IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE;",
     )
     .await?;
     run_cypher(
         &graph,
-        "CREATE INDEX category_id IF NOT EXISTS FOR (c:Category) ON (c.id);",
+        "CREATE CONSTRAINT category_id_unique IF NOT EXISTS FOR (c:Category) REQUIRE c.id IS UNIQUE;",
     )
     .await?;
-    pb.finish_with_message("Pre-import indexes created.");
+    // Pre-create constraints for Image and ExternalLink IDs
+    run_cypher(
+        &graph,
+        "CREATE CONSTRAINT image_id_unique IF NOT EXISTS FOR (i:Image) REQUIRE i.id IS UNIQUE;",
+    )
+    .await?;
+    run_cypher(
+        &graph,
+        "CREATE CONSTRAINT extlink_id_unique IF NOT EXISTS FOR (e:ExternalLink) REQUIRE e.id IS UNIQUE;",
+    )
+    .await?;
+    pb.finish_with_message("Pre-import constraints created.");
 
     println!();
     println!("==> Loading nodes ...");
     let node_files = csv_files_for("nodes", &layout);
     let cat_files = csv_files_for("categories", &layout);
+    let img_node_files = csv_files_for("image_nodes", &layout);
+    let extlink_node_files = csv_files_for("external_link_nodes", &layout);
 
     let pb_pages = mp.add(make_progress_bar(node_files.len() as u64, "Pages"));
     let pb_cats = mp.add(make_progress_bar(cat_files.len() as u64, "Categories"));
+    let pb_imgs = mp.add(make_progress_bar(img_node_files.len() as u64, "Images"));
+    let pb_extlinks = mp.add(make_progress_bar(
+        extlink_node_files.len() as u64,
+        "ExtLinks",
+    ));
 
-    let (_, _) = tokio::try_join!(
+    let (_, _, _, _) = tokio::try_join!(
         load_csv_files(
             &graph,
             &node_files,
@@ -146,11 +427,34 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
             cat_files.len(),
             &pb_cats,
         ),
+        load_csv_files(
+            &graph,
+            &img_node_files,
+            &config.import_prefix,
+            CYPHER_LOAD_IMAGE_NODES,
+            "image_nodes",
+            img_node_files.len(),
+            &pb_imgs,
+        ),
+        load_csv_files(
+            &graph,
+            &extlink_node_files,
+            &config.import_prefix,
+            CYPHER_LOAD_EXTERNAL_LINK_NODES,
+            "external_link_nodes",
+            extlink_node_files.len(),
+            &pb_extlinks,
+        ),
     )?;
 
     let page_count = query_count(&graph, "MATCH (p:Page) RETURN count(p) AS cnt").await?;
     let cat_count = query_count(&graph, "MATCH (c:Category) RETURN count(c) AS cnt").await?;
-    println!("    Loaded {page_count} pages and {cat_count} categories.");
+    let img_count = query_count(&graph, "MATCH (i:Image) RETURN count(i) AS cnt").await?;
+    let extlink_count =
+        query_count(&graph, "MATCH (e:ExternalLink) RETURN count(e) AS cnt").await?;
+    println!(
+        "    Loaded {page_count} pages, {cat_count} categories, {img_count} images, {extlink_count} external links."
+    );
 
     println!();
     println!("==> Loading edges ...");
@@ -192,51 +496,39 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
     println!("    Loaded {artcat_count} article-category relationships.");
 
     println!();
-    println!("==> Loading images and external links ...");
-    run_cypher(
+    println!("==> Loading article-image and article-external-link relationships ...");
+    let artimg_files = csv_files_for("article_images", &layout);
+    let pb_artimg = mp.add(make_progress_bar(artimg_files.len() as u64, "Art-Images"));
+    load_csv_files(
         &graph,
-        "CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);",
-    )
-    .await?;
-    run_cypher(
-        &graph,
-        "CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);",
+        &artimg_files,
+        &config.import_prefix,
+        CYPHER_LOAD_ARTICLE_IMAGES,
+        "article_images",
+        config.max_parallel_light,
+        &pb_artimg,
     )
     .await?;
 
-    let img_files = csv_files_for("images", &layout);
-    let pb_img = mp.add(make_progress_bar(img_files.len() as u64, "Images"));
+    let artextlink_files = csv_files_for("article_external_links", &layout);
+    let pb_artextlink = mp.add(make_progress_bar(
+        artextlink_files.len() as u64,
+        "Art-ExtLinks",
+    ));
     load_csv_files(
         &graph,
-        &img_files,
+        &artextlink_files,
         &config.import_prefix,
-        CYPHER_LOAD_IMAGES,
-        "images",
+        CYPHER_LOAD_ARTICLE_EXTERNAL_LINKS,
+        "article_external_links",
         config.max_parallel_light,
-        &pb_img,
-    )
-    .await?;
-
-    let ext_files = csv_files_for("external_links", &layout);
-    let pb_ext = mp.add(make_progress_bar(ext_files.len() as u64, "Ext Links"));
-    load_csv_files(
-        &graph,
-        &ext_files,
-        &config.import_prefix,
-        CYPHER_LOAD_EXTERNAL_LINKS,
-        "external_links",
-        config.max_parallel_light,
-        &pb_ext,
+        &pb_artextlink,
     )
     .await?;
 
     println!();
-    let pb = mp.add(make_spinner("Creating constraints and indexes ..."));
-    run_cypher(
-        &graph,
-        "CREATE CONSTRAINT page_id_unique IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE;",
-    )
-    .await?;
+    let pb = mp.add(make_spinner("Creating query indexes ..."));
+    // page_id, category_id, image_id, extlink_id constraints already created pre-import
     run_cypher(
         &graph,
         "CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);",
@@ -247,7 +539,22 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
         "CREATE CONSTRAINT category_name_unique IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE;",
     )
     .await?;
-    pb.finish_with_message("Constraints and indexes created.");
+    run_cypher(
+        &graph,
+        "CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);",
+    )
+    .await?;
+    run_cypher(
+        &graph,
+        "CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);",
+    )
+    .await?;
+    pb.finish_with_message("Query indexes created.");
+
+    let img_rel_count =
+        query_count(&graph, "MATCH ()-[r:HAS_IMAGE]->() RETURN count(r) AS cnt").await?;
+    let extlink_rel_count =
+        query_count(&graph, "MATCH ()-[r:HAS_LINK]->() RETURN count(r) AS cnt").await?;
 
     let elapsed = start.elapsed();
     println!();
@@ -258,8 +565,12 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
     println!("Total time:         {:.2}s", elapsed.as_secs_f64());
     println!("Pages:              {page_count}");
     println!("Categories:         {cat_count}");
+    println!("Images:             {img_count}");
+    println!("External Links:     {extlink_count}");
     println!("Edges:              {edge_count}");
     println!("Art-Categories:     {artcat_count}");
+    println!("Art-Images:         {img_rel_count}");
+    println!("Art-ExtLinks:       {extlink_rel_count}");
     println!();
     println!("Available at:");
     println!("  Bolt:   {}", config.bolt_uri);
@@ -391,10 +702,23 @@ async fn connect_with_retry(config: &ImportConfig) -> Result<Graph> {
     let max_retries = config::IMPORT_MAX_RETRIES;
     let delay = tokio::time::Duration::from_secs(config::IMPORT_RETRY_DELAY_SECS);
 
+    // Configure connection pool for parallel import operations
+    // Pool size: 8 connections allows up to 4 parallel light operations + overhead
+    let neo4j_config = neo4rs::ConfigBuilder::default()
+        .uri(&config.bolt_uri)
+        .user("")
+        .password("")
+        .max_connections(8) // Explicit pool sizing for parallel LOAD CSV
+        .fetch_size(500) // Rows fetched per batch from server
+        .build()?;
+
     for attempt in 1..=max_retries {
-        match Graph::new(&config.bolt_uri, "", "") {
+        match Graph::connect(neo4j_config.clone()) {
             Ok(graph) => match graph.run(query("RETURN 1;")).await {
-                Ok(_) => return Ok(graph),
+                Ok(_) => {
+                    info!("Connected to Neo4j with 8-connection pool");
+                    return Ok(graph);
+                }
                 Err(e) if attempt < max_retries => {
                     info!(attempt, "Connection test failed, retrying: {e}");
                     tokio::time::sleep(delay).await;
