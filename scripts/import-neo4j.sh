@@ -97,6 +97,13 @@ if [[ -f "$PROGRESS_FILE" ]]; then
     fi
 fi
 
+# Helper: run cypher-shell against a target database
+run_cypher() {
+    local db="$1"
+    shift
+    cypher-shell -d "$db" "$@"
+}
+
 # Verify output files exist
 for f in nodes.csv edges.csv categories.csv article_categories.csv images.csv external_links.csv; do
     if [[ ! -f "$OUTPUT_DIR/$f" ]]; then
@@ -188,8 +195,6 @@ if [[ -z "$RESUME_PHASE" ]]; then
 CREATE CONSTRAINT page_id IF NOT EXISTS FOR (p:Page) REQUIRE p.id IS UNIQUE;
 CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);
 CREATE CONSTRAINT category_name IF NOT EXISTS FOR (c:Category) REQUIRE c.name IS UNIQUE;
-CREATE INDEX image_filename IF NOT EXISTS FOR (i:Image) ON (i.filename);
-CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);
 CYPHER
 
     echo "    Constraints and indexes created."
@@ -389,6 +394,8 @@ rm -f "$PROGRESS_FILE"
 
 # Restore default signal handling
 trap - INT
+
+echo "    Indexes created."
 
 # --------------------------------------------------------------------------
 # Done
