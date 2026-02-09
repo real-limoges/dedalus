@@ -25,11 +25,11 @@ pub const IMPORT_MAX_RETRIES: u32 = 30;
 /// Delay between connection retry attempts in seconds.
 pub const IMPORT_RETRY_DELAY_SECS: u64 = 2;
 
-/// Default max parallel edge loads (serialized due to memory pressure).
-pub const IMPORT_MAX_PARALLEL_EDGES: usize = 1;
+/// Default max parallel edge loads (increased with explicit connection pool).
+pub const IMPORT_MAX_PARALLEL_EDGES: usize = 4;
 
-/// Default max parallel light relationship loads.
-pub const IMPORT_MAX_PARALLEL_LIGHT: usize = 4;
+/// Default max parallel light relationship loads (increased with 8-conn pool).
+pub const IMPORT_MAX_PARALLEL_LIGHT: usize = 8;
 
 /// Default import file URI prefix for Neo4j LOAD CSV.
 pub const DEFAULT_IMPORT_PREFIX: &str = "file://";

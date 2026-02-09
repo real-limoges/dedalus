@@ -35,12 +35,18 @@ pub fn extract_abstract(text: &str) -> String {
         .map(|m| m.start())
         .unwrap_or(stripped.len());
 
-    stripped[..end_pos]
-        .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    // Build result string directly instead of collect + join to reduce allocations
+    let mut result = String::with_capacity(end_pos);
+    for line in stripped[..end_pos].lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(trimmed);
+        }
+    }
+    result
 }
 
 pub fn extract_sections(text: &str) -> Vec<String> {
@@ -83,10 +89,25 @@ pub fn extract_categories(text: &str) -> Vec<String> {
 /// Collapses newlines into spaces so CSV fields stay on a single line.
 fn sanitize_field(s: &str) -> String {
     if s.contains('\n') || s.contains('\r') {
-        s.replace(['\n', '\r'], " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+        // Single-pass optimization: build string directly instead of replace→split→collect→join
+        let mut result = String::with_capacity(s.len());
+        let mut last_was_space = false;
+        for c in s.chars() {
+            if c == '\n' || c == '\r' || c.is_whitespace() {
+                if !last_was_space && !result.is_empty() {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            } else {
+                result.push(c);
+                last_was_space = false;
+            }
+        }
+        // Trim trailing space if present
+        if result.ends_with(' ') {
+            result.pop();
+        }
+        result
     } else {
         s.to_string()
     }

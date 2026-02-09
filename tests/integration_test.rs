@@ -1,3 +1,36 @@
+//! Comprehensive integration tests for the Dedalus Wikipedia extraction pipeline.
+//!
+//! This module tests the complete data flow from BZ2-compressed XML input through to
+//! CSV extraction and JSON blob generation. Tests are organized into logical sections:
+//!
+//! - **Parser Tests** -- XML parsing, BZ2 decompression, page type classification
+//! - **Index Tests** -- Title-to-ID mapping, redirect chain resolution
+//! - **Extraction Tests** -- CSV generation, edge creation, JSON blob output
+//! - **Feature Tests** -- Categories, images, external links, infoboxes, see-also sections
+//! - **Sharding Tests** -- CSV shard distribution for parallel import
+//!
+//! # Test Strategy
+//!
+//! All tests use a shared `sample_xml()` fixture representing a minimal Wikipedia dump
+//! with articles, redirects, and special pages. This approach ensures consistency and
+//! makes it easy to trace expected behavior across tests.
+//!
+//! ## Key Patterns
+//!
+//! - **Fixture creation**: Use `create_bz2_xml(sample_xml())` to get a temp BZ2 file
+//! - **Index building**: Always build index before extraction to resolve redirects
+//! - **Output validation**: Check both file existence and content correctness
+//! - **Statistics**: Verify counters match extracted data (articles, edges, categories)
+//! - **Isolation**: Each test uses its own TempDir to avoid cross-test pollution
+//!
+//! # Sample Data
+//!
+//! The test fixture includes:
+//! - 2 articles: "Rust (programming language)", "Python (programming language)"
+//! - 1 redirect: "Rust" → "Rust (programming language)"
+//! - 2 special pages: File:Rust logo.svg, Category:Programming languages
+//! - Article features: wikilinks, categories, infoboxes, see-also sections, images, external links
+
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
 use dedalus::extract::run_extraction;
@@ -8,6 +41,9 @@ use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
 /// Helper: create a BZ2-compressed XML file from a string and return the temp file handle.
+///
+/// This simulates real Wikipedia dump format by compressing XML with BZ2.
+/// The returned NamedTempFile keeps the file alive until it goes out of scope.
 fn create_bz2_xml(xml: &str) -> NamedTempFile {
     let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(xml.as_bytes()).unwrap();
@@ -510,12 +546,21 @@ fn extraction_produces_images_csv() {
     )
     .unwrap();
 
-    let images_path = output_dir.path().join("images.csv");
-    assert!(images_path.exists());
-    let mut rdr = csv::Reader::from_path(&images_path).unwrap();
+    // Check image nodes file
+    let image_nodes_path = output_dir.path().join("image_nodes.csv");
+    assert!(image_nodes_path.exists());
+    let mut rdr = csv::Reader::from_path(&image_nodes_path).unwrap();
     let headers = rdr.headers().unwrap();
-    assert_eq!(headers.get(0).unwrap(), "article_id");
+    assert_eq!(headers.get(0).unwrap(), "id:ID(Image)");
     assert_eq!(headers.get(1).unwrap(), "filename");
+
+    // Check article-images relationship file
+    let article_images_path = output_dir.path().join("article_images.csv");
+    assert!(article_images_path.exists());
+    let mut rdr = csv::Reader::from_path(&article_images_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), ":START_ID");
+    assert_eq!(headers.get(1).unwrap(), ":END_ID(Image)");
 
     assert!(stats.images() >= 1); // Rust logo.svg
 }
@@ -539,12 +584,21 @@ fn extraction_produces_external_links_csv() {
     )
     .unwrap();
 
-    let ext_links_path = output_dir.path().join("external_links.csv");
-    assert!(ext_links_path.exists());
-    let mut rdr = csv::Reader::from_path(&ext_links_path).unwrap();
+    // Check external link nodes file
+    let extlink_nodes_path = output_dir.path().join("external_link_nodes.csv");
+    assert!(extlink_nodes_path.exists());
+    let mut rdr = csv::Reader::from_path(&extlink_nodes_path).unwrap();
     let headers = rdr.headers().unwrap();
-    assert_eq!(headers.get(0).unwrap(), "article_id");
+    assert_eq!(headers.get(0).unwrap(), "id:ID(ExternalLink)");
     assert_eq!(headers.get(1).unwrap(), "url");
+
+    // Check article-external-links relationship file
+    let article_extlinks_path = output_dir.path().join("article_external_links.csv");
+    assert!(article_extlinks_path.exists());
+    let mut rdr = csv::Reader::from_path(&article_extlinks_path).unwrap();
+    let headers = rdr.headers().unwrap();
+    assert_eq!(headers.get(0).unwrap(), ":START_ID");
+    assert_eq!(headers.get(1).unwrap(), ":END_ID(ExternalLink)");
 
     assert!(stats.external_links() >= 1); // rust-lang.org
 }
@@ -698,8 +752,10 @@ fn sharded_csv_produces_numbered_files() {
         "edges",
         "categories",
         "article_categories",
-        "images",
-        "external_links",
+        "image_nodes",
+        "article_images",
+        "external_link_nodes",
+        "article_external_links",
     ] {
         for shard in 0..4u32 {
             let path = output_dir.path().join(format!("{}_{:03}.csv", base, shard));
@@ -749,8 +805,13 @@ fn single_csv_shard_produces_original_filenames() {
     assert!(output_dir.path().join("edges.csv").exists());
     assert!(output_dir.path().join("categories.csv").exists());
     assert!(output_dir.path().join("article_categories.csv").exists());
-    assert!(output_dir.path().join("images.csv").exists());
-    assert!(output_dir.path().join("external_links.csv").exists());
+    assert!(output_dir.path().join("image_nodes.csv").exists());
+    assert!(output_dir.path().join("article_images.csv").exists());
+    assert!(output_dir.path().join("external_link_nodes.csv").exists());
+    assert!(output_dir
+        .path()
+        .join("article_external_links.csv")
+        .exists());
 
     // Should NOT have numbered files
     assert!(!output_dir.path().join("nodes_000.csv").exists());

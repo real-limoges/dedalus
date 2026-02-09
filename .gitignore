@@ -30,3 +30,4 @@ output_data/**/*
 /docs/**/*
 !/input_data/
 !/output_data/
+output/

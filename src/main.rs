@@ -10,6 +10,9 @@ use std::time::Instant;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "dedalus")]
 #[command(about = "Extract Wikipedia dumps and import into graph databases")]
@@ -28,6 +31,8 @@ enum Commands {
     Extract(ExtractArgs),
     /// Import extracted CSV files into Neo4j
     Import(ImportArgs),
+    /// Merge sharded CSV files into single files for neo4j-admin import
+    MergeCsvs(MergeCsvsArgs),
 }
 
 #[derive(Args)]
@@ -45,7 +50,7 @@ struct ExtractArgs {
     shard_count: u32,
 
     /// Number of CSV output shards for parallel import (1 = single file)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 8)]
     csv_shards: u32,
 
     /// Limit number of pages to process (for testing)
@@ -106,6 +111,17 @@ struct ImportArgs {
     /// Clear existing Neo4j data before importing
     #[arg(long)]
     clean: bool,
+
+    /// Use neo4j-admin import (10-100x faster, requires empty DB)
+    #[arg(long)]
+    admin_import: bool,
+}
+
+#[derive(Args)]
+struct MergeCsvsArgs {
+    /// Output directory containing sharded CSVs (e.g., nodes_000.csv, nodes_001.csv)
+    #[arg(short, long)]
+    output: String,
 }
 
 fn run_extract(args: ExtractArgs) -> Result<()> {
@@ -256,9 +272,15 @@ fn run_import(args: ImportArgs) -> Result<()> {
         compose_file: args.compose_file,
         no_docker: args.no_docker,
         clean: args.clean,
+        use_admin_import: args.admin_import,
     };
 
-    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("dedalus-import-worker")
+        .enable_io()
+        .enable_time()
+        .build()?;
     rt.block_on(dedalus::import::run_import(config))
 }
 
@@ -282,6 +304,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Commands::Extract(args) => run_extract(args),
         Commands::Import(args) => run_import(args),
+        Commands::MergeCsvs(args) => dedalus::merge::merge_csv_shards(&args.output),
     };
 
     match result {

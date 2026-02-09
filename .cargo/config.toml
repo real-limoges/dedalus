@@ -1,0 +1,13 @@
+[build]
+# Enable M1-specific optimizations (NEON SIMD, branch prediction, etc.)
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# Maximum optimization level
+opt-level = 3
+
+# Single codegen unit for better optimization (slower compile, faster runtime)
+codegen-units = 1
+
+# Strip debug symbols for smaller binary
+strip = true
