@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running pre-push checks..."
+
+echo "1/4 Checking formatting..."
+cargo fmt -- --check
+echo "     Formatting OK"
+
+echo "2/4 Running clippy..."
+cargo clippy -- -D warnings
+echo "     Clippy OK"
+
+echo "3/4 Building..."
+cargo build --release
+echo "     Build OK"
+
+echo "4/4 Running tests..."
+cargo test --verbose
+echo "     Tests OK"
+
+echo "All checks passed. Pushing."
