@@ -6,7 +6,9 @@ use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use tracing::info;
 
-/// Merges sharded CSV files into single files suitable for neo4j-admin import
+/// Merges sharded CSV files into single files suitable for neo4j-admin import.
+///
+/// Performs cross-shard deduplication for categories, images, and external links.
 pub fn merge_csv_shards(output_dir: &str) -> Result<()> {
     info!("Detecting CSV shards in: {}", output_dir);
 
@@ -28,17 +30,15 @@ pub fn merge_csv_shards(output_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Detect shard count by counting nodes_*.csv files
+/// Detect shard count by counting nodes_*.csv files.
 fn detect_shard_count(output_dir: &str) -> Result<u32> {
-    let mut count = 0u32;
-    loop {
-        let path = Path::new(output_dir).join(format!("nodes_{:03}.csv", count));
-        if path.exists() {
-            count += 1;
-        } else {
-            break;
-        }
-    }
+    let count = (0u32..)
+        .take_while(|&i| {
+            Path::new(output_dir)
+                .join(format!("nodes_{i:03}.csv"))
+                .exists()
+        })
+        .count() as u32;
     if count == 0 {
         bail!("No sharded CSV files found (expected nodes_000.csv, etc.)");
     }
@@ -51,14 +51,14 @@ fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<(
 
     let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
     let mut writer = Writer::from_writer(BufWriter::with_capacity(
-        256 * 1024,
+        crate::config::MERGE_BUF_SIZE,
         File::create(&output_path)?,
     ));
 
     // Write header from first shard
     let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
     let mut first_reader = Reader::from_reader(BufReader::with_capacity(
-        256 * 1024,
+        crate::config::MERGE_BUF_SIZE,
         File::open(&first_shard)?,
     ));
     writer.write_record(first_reader.headers()?)?;
@@ -67,7 +67,7 @@ fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<(
     for shard in 0..shard_count {
         let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
         let mut reader = Reader::from_reader(BufReader::with_capacity(
-            256 * 1024,
+            crate::config::MERGE_BUF_SIZE,
             File::open(&shard_path)?,
         ));
 
@@ -87,7 +87,7 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
 
     let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
     let mut writer = Writer::from_writer(BufWriter::with_capacity(
-        256 * 1024,
+        crate::config::MERGE_BUF_SIZE,
         File::create(&output_path)?,
     ));
 
@@ -97,7 +97,7 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
     // Write header from first shard
     let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
     let mut first_reader = Reader::from_reader(BufReader::with_capacity(
-        256 * 1024,
+        crate::config::MERGE_BUF_SIZE,
         File::open(&first_shard)?,
     ));
     writer.write_record(first_reader.headers()?)?;
@@ -106,7 +106,7 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
     for shard in 0..shard_count {
         let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
         let mut reader = Reader::from_reader(BufReader::with_capacity(
-            256 * 1024,
+            crate::config::MERGE_BUF_SIZE,
             File::open(&shard_path)?,
         ));
 

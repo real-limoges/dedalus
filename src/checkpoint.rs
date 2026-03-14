@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// Serializable snapshot of extraction counters for checkpoint persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointStats {
     pub articles_processed: u64,
     pub edges_extracted: u64,
@@ -25,7 +26,8 @@ pub struct CheckpointStats {
     pub external_links_found: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+/// A saved extraction checkpoint for resume support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub version: u32,
     pub input_path: String,
@@ -37,6 +39,8 @@ pub struct Checkpoint {
     pub stats: CheckpointStats,
 }
 
+/// Returns the path to the checkpoint file for a given output directory.
+#[must_use]
 pub fn checkpoint_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("checkpoint.bin")
 }
@@ -68,7 +72,7 @@ pub fn load_if_valid(
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(&path).context("Failed to open checkpoint file")?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
+    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
@@ -154,6 +158,7 @@ pub fn clear(output_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Manages periodic checkpoint saves during extraction.
 pub struct CheckpointManager {
     checkpoint_path: PathBuf,
     input_path: String,
@@ -165,6 +170,16 @@ pub struct CheckpointManager {
     last_saved_id: AtomicU32,
     pages_since_save: AtomicU32,
     save_lock: Mutex<()>,
+}
+
+impl std::fmt::Debug for CheckpointManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointManager")
+            .field("checkpoint_path", &self.checkpoint_path)
+            .field("interval", &self.interval)
+            .field("last_saved_id", &self.last_saved_id.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl CheckpointManager {

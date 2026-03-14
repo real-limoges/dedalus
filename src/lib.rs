@@ -74,3 +74,12 @@ pub mod multistream;
 pub mod parser;
 pub mod stats;
 pub mod tui;
+
+// Re-export primary API types for convenient library use.
+pub use checkpoint::{Checkpoint, CheckpointManager};
+pub use extract::ExtractionConfig;
+pub use import::{CsvType, ImportConfig};
+pub use index::WikiIndex;
+pub use models::{ArticleBlob, EdgeType, PageType, WikiPage};
+pub use parser::WikiReader;
+pub use stats::ExtractionStats;

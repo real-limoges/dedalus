@@ -145,20 +145,23 @@ fn run_extract_inner(
 
     info!("Starting extraction pass");
     let start_extracting = Instant::now();
-    crate::extract::run_extraction_with_stats(
-        input,
+    let extraction_config = crate::extract::ExtractionConfig {
+        input_path: input,
         output_dir,
-        &index,
+        index: &index,
         shard_count,
         csv_shards,
         limit,
-        config.dry_run,
-        checkpoint.as_ref(),
-        checkpoint_mgr.as_ref(),
+        dry_run: config.dry_run,
+        resume_from: checkpoint.as_ref(),
+        checkpoint_mgr: checkpoint_mgr.as_ref(),
+        multistream_ranges: None,
+    };
+    crate::extract::run_extraction_with_stats(
+        &extraction_config,
         Arc::clone(stats),
         Arc::clone(cancel),
         true, // hide indicatif
-        None, // multistream_ranges
     )?;
     let extraction_secs = start_extracting.elapsed().as_secs_f64();
     info!(duration_secs = extraction_secs, "Extraction complete");

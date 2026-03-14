@@ -1,6 +1,7 @@
 use crate::checkpoint::CheckpointStats;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Thread-safe atomic counters for extraction metrics.
 #[derive(Default)]
 pub struct ExtractionStats {
     pub articles_processed: AtomicU64,
@@ -65,42 +66,52 @@ impl ExtractionStats {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    #[must_use]
     pub fn articles(&self) -> u64 {
         self.articles_processed.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn edges(&self) -> u64 {
         self.edges_extracted.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn blobs(&self) -> u64 {
         self.blobs_written.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn invalid(&self) -> u64 {
         self.invalid_links.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn categories(&self) -> u64 {
         self.categories_found.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn category_edges(&self) -> u64 {
         self.category_edges.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn see_also_edges(&self) -> u64 {
         self.see_also_edges.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn infoboxes(&self) -> u64 {
         self.infoboxes_extracted.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn images(&self) -> u64 {
         self.images_found.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn external_links(&self) -> u64 {
         self.external_links_found.load(Ordering::Relaxed)
     }

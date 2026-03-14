@@ -331,18 +331,19 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
 
     info!("Starting extraction pass");
     let start_extracting = Instant::now();
-    let stats = dedalus::extract::run_extraction(
-        &args.input,
-        &args.output,
-        &index,
-        args.shard_count,
-        args.csv_shards,
-        args.limit,
-        args.dry_run,
-        checkpoint.as_ref(),
-        checkpoint_mgr.as_ref(),
-        multistream_ranges.as_deref(),
-    )?;
+    let extraction_config = dedalus::extract::ExtractionConfig {
+        input_path: &args.input,
+        output_dir: &args.output,
+        index: &index,
+        shard_count: args.shard_count,
+        csv_shards: args.csv_shards,
+        limit: args.limit,
+        dry_run: args.dry_run,
+        resume_from: checkpoint.as_ref(),
+        checkpoint_mgr: checkpoint_mgr.as_ref(),
+        multistream_ranges: multistream_ranges.as_deref(),
+    };
+    let stats = dedalus::extract::run_extraction(&extraction_config)?;
     let extraction_duration = start_extracting.elapsed();
     info!(
         duration_secs = extraction_duration.as_secs_f64(),

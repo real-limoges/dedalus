@@ -47,7 +47,7 @@ impl<R: Read> PageParser<R> {
         xml_reader.trim_text(true);
         Self {
             reader: xml_reader,
-            buf: Vec::with_capacity(256 * 1024),
+            buf: Vec::with_capacity(crate::config::BUFREADER_CAPACITY),
             skip_text,
             skip_timestamp: false,
         }

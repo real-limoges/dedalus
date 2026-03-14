@@ -1,10 +1,10 @@
 use crate::checkpoint::{Checkpoint, CheckpointManager};
-use crate::config::PROGRESS_INTERVAL;
+use crate::config::{CSV_WRITER_BUF_SIZE, PROGRESS_INTERVAL};
 use crate::content;
 use crate::content::LINK_REGEX;
 use crate::index::WikiIndex;
 use crate::infobox;
-use crate::models::{ArticleBlob, PageType};
+use crate::models::{ArticleBlob, EdgeType, PageType};
 use crate::multistream::StreamRange;
 use crate::parser::WikiReader;
 use crate::stats::ExtractionStats;
@@ -63,13 +63,14 @@ fn create_csv_writer(
         csv::WriterBuilder::new()
             .has_headers(false)
             .from_writer(
-                Box::new(BufWriter::with_capacity(128 * 1024, file)) as Box<dyn Write + Send>
+                Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file))
+                    as Box<dyn Write + Send>,
             )
     } else {
         let file = File::create(format!("{}/{}", output_dir, filename))
             .with_context(|| format!("Failed to create {}", filename))?;
         csv::Writer::from_writer(
-            Box::new(BufWriter::with_capacity(128 * 1024, file)) as Box<dyn Write + Send>
+            Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file)) as Box<dyn Write + Send>,
         )
     })))
 }
@@ -77,7 +78,7 @@ fn create_csv_writer(
 fn write_header(writer: &CsvWriter, fields: &[&str]) -> Result<()> {
     writer
         .lock()
-        .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?
+        .map_err(|e| anyhow::anyhow!("CSV writer lock poisoned (a writer thread panicked): {}", e))?
         .write_record(fields)
         .context("Failed to write CSV header")
 }
@@ -123,92 +124,147 @@ impl ShardedCsvWriter {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_extraction(
-    path: &str,
-    output_dir: &str,
+/// Extracts edges from article text, classifying as LinksTo or SeeAlso.
+/// Returns (deduplicated edges, invalid link count).
+fn process_article_edges(
+    text: &str,
     index: &WikiIndex,
+    see_also_start: Option<usize>,
+) -> (Vec<(u32, EdgeType)>, u64) {
+    let mut local_edges: Vec<(u32, EdgeType)> = Vec::with_capacity(16);
+    let mut invalid_count = 0u64;
+
+    for caps in LINK_REGEX.captures_iter(text) {
+        let target_title = strip_section_anchor(&caps[1]);
+        if target_title.is_empty() || is_namespace_link(target_title) {
+            continue;
+        }
+        if let Some(target_id) = index.resolve_id(target_title) {
+            let edge_type = match see_also_start {
+                Some(sa_start) if caps.get(0).unwrap().start() >= sa_start => EdgeType::SeeAlso,
+                _ => EdgeType::LinksTo,
+            };
+            local_edges.push((target_id, edge_type));
+        } else {
+            invalid_count += 1;
+        }
+    }
+
+    local_edges.sort_unstable();
+    local_edges.dedup();
+    (local_edges, invalid_count)
+}
+
+/// Deduplicates entity items against a global set, writes new nodes and all relationships.
+/// Returns (new unique count, total relationship count).
+fn write_dedup_entities(
+    items: &[std::borrow::Cow<'_, str>],
+    dedup_set: &DashSet<String>,
+    node_writer: &ShardedCsvWriter,
+    rel_writer: &ShardedCsvWriter,
+    page_id: u32,
+    id_str: &str,
+    label: &str,
+    rel_type: &str,
+) -> (u64, u64) {
+    let mut new_items: Vec<&str> = Vec::new();
+    for item in items {
+        if !dedup_set.contains(item.as_ref()) && dedup_set.insert(item.as_ref().to_owned()) {
+            new_items.push(item.as_ref());
+        }
+    }
+
+    if !new_items.is_empty() {
+        if let Ok(mut writer) = node_writer.shard_for(page_id).lock() {
+            for name in &new_items {
+                if let Err(e) = writer.write_record([*name, *name, label]) {
+                    warn!(error = %e, "Failed to write {} node record", label);
+                }
+            }
+        }
+    }
+
+    if let Ok(mut writer) = rel_writer.shard_for(page_id).lock() {
+        for item in items {
+            if let Err(e) = writer.write_record([id_str, item.as_ref(), rel_type]) {
+                warn!(error = %e, "Failed to write {} relationship record", rel_type);
+            }
+        }
+    }
+
+    (new_items.len() as u64, items.len() as u64)
+}
+
+/// Writes an article's JSON blob to the appropriate shard directory.
+fn write_article_blob(
+    output_dir: &str,
     shard_count: u32,
-    csv_shards: u32,
-    limit: Option<u64>,
-    dry_run: bool,
-    resume_from: Option<&Checkpoint>,
-    checkpoint_mgr: Option<&CheckpointManager>,
-    multistream_ranges: Option<&[StreamRange]>,
-) -> Result<ExtractionStats> {
-    let stats = Arc::new(if let Some(cp) = resume_from {
+    page_id: u32,
+    blob: &ArticleBlob,
+    stats: &ExtractionStats,
+) {
+    let shard = page_id % shard_count;
+    let blob_path = format!("{}/blobs/{:03}/{}.json", output_dir, shard, page_id);
+    match File::create(&blob_path) {
+        Ok(f) => {
+            let mut w = BufWriter::new(f);
+            if let Err(e) = serde_json::to_writer(&mut w, blob) {
+                warn!(error = %e, path = %blob_path, "Failed to write blob");
+            } else {
+                stats.inc_blobs();
+                debug!(id = page_id, "Wrote blob");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, path = %blob_path, "Failed to create blob file");
+        }
+    }
+}
+
+/// Configuration for the Wikipedia extraction pass.
+#[derive(Debug, Clone)]
+pub struct ExtractionConfig<'a> {
+    pub input_path: &'a str,
+    pub output_dir: &'a str,
+    pub index: &'a WikiIndex,
+    pub shard_count: u32,
+    pub csv_shards: u32,
+    pub limit: Option<u64>,
+    pub dry_run: bool,
+    pub resume_from: Option<&'a Checkpoint>,
+    pub checkpoint_mgr: Option<&'a CheckpointManager>,
+    pub multistream_ranges: Option<&'a [StreamRange]>,
+}
+
+/// Runs extraction with default stats/cancel state. Returns final statistics.
+pub fn run_extraction(config: &ExtractionConfig) -> Result<ExtractionStats> {
+    let stats = Arc::new(if let Some(cp) = config.resume_from {
         ExtractionStats::from_checkpoint(&cp.stats)
     } else {
         ExtractionStats::new()
     });
     let cancel = Arc::new(AtomicBool::new(false));
 
-    run_extraction_inner(
-        path,
-        output_dir,
-        index,
-        shard_count,
-        csv_shards,
-        limit,
-        dry_run,
-        resume_from,
-        checkpoint_mgr,
-        stats,
-        cancel,
-        false,
-        multistream_ranges,
-    )
+    run_extraction_with_stats(config, stats, cancel, false)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Runs extraction with caller-provided stats, cancel flag, and progress visibility.
 pub fn run_extraction_with_stats(
-    path: &str,
-    output_dir: &str,
-    index: &WikiIndex,
-    shard_count: u32,
-    csv_shards: u32,
-    limit: Option<u64>,
-    dry_run: bool,
-    resume_from: Option<&Checkpoint>,
-    checkpoint_mgr: Option<&CheckpointManager>,
+    config: &ExtractionConfig,
     stats: Arc<ExtractionStats>,
     cancel: Arc<AtomicBool>,
     hide_progress: bool,
-    multistream_ranges: Option<&[StreamRange]>,
 ) -> Result<ExtractionStats> {
-    run_extraction_inner(
-        path,
-        output_dir,
-        index,
-        shard_count,
-        csv_shards,
-        limit,
-        dry_run,
-        resume_from,
-        checkpoint_mgr,
-        stats,
-        cancel,
-        hide_progress,
-        multistream_ranges,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_extraction_inner(
-    path: &str,
-    output_dir: &str,
-    index: &WikiIndex,
-    shard_count: u32,
-    csv_shards: u32,
-    limit: Option<u64>,
-    dry_run: bool,
-    resume_from: Option<&Checkpoint>,
-    checkpoint_mgr: Option<&CheckpointManager>,
-    stats: Arc<ExtractionStats>,
-    cancel: Arc<AtomicBool>,
-    hide_progress: bool,
-    multistream_ranges: Option<&[StreamRange]>,
-) -> Result<ExtractionStats> {
+    let path = config.input_path;
+    let output_dir = config.output_dir;
+    let index = config.index;
+    let shard_count = config.shard_count;
+    let csv_shards = config.csv_shards;
+    let limit = config.limit;
+    let dry_run = config.dry_run;
+    let resume_from = config.resume_from;
+    let checkpoint_mgr = config.checkpoint_mgr;
+    let multistream_ranges = config.multistream_ranges;
     let resuming = resume_from.is_some();
     let resume_after_id = resume_from.map(|cp| cp.last_processed_id).unwrap_or(0);
 
@@ -303,7 +359,7 @@ fn run_extraction_inner(
         pb.set_style(
             indicatif::ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
-                .unwrap(),
+                .expect("valid progress template"),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
         pb
@@ -335,41 +391,18 @@ fn run_extraction_inner(
             }
 
             if let Some(text) = &page.text {
+                // -- Edges --
                 let see_also_start = content::see_also_section_start(text);
-
-                let mut local_edges: Vec<(u32, &str)> = Vec::with_capacity(16);
-                let mut invalid_count = 0u64;
-
-                for caps in LINK_REGEX.captures_iter(text) {
-                    let raw_target = &caps[1];
-
-                    let target_title = strip_section_anchor(raw_target);
-
-                    if target_title.is_empty() || is_namespace_link(target_title) {
-                        continue;
-                    }
-
-                    if let Some(target_id) = index.resolve_id(target_title) {
-                        let edge_type = match see_also_start {
-                            Some(sa_start) if caps.get(0).unwrap().start() >= sa_start => {
-                                "SEE_ALSO"
-                            }
-                            _ => "LINKS_TO",
-                        };
-                        local_edges.push((target_id, edge_type));
-                    } else {
-                        invalid_count += 1;
-                    }
-                }
-
-                // Deduplicate edges per article
-                local_edges.sort_unstable();
-                local_edges.dedup();
-
-                let links_to_count =
-                    local_edges.iter().filter(|(_, t)| *t == "LINKS_TO").count() as u64;
-                let see_also_count =
-                    local_edges.iter().filter(|(_, t)| *t == "SEE_ALSO").count() as u64;
+                let (local_edges, invalid_count) =
+                    process_article_edges(text, index, see_also_start);
+                let links_to_count = local_edges
+                    .iter()
+                    .filter(|(_, t)| *t == EdgeType::LinksTo)
+                    .count() as u64;
+                let see_also_count = local_edges
+                    .iter()
+                    .filter(|(_, t)| *t == EdgeType::SeeAlso)
+                    .count() as u64;
                 stats_clone.add_edges(links_to_count);
                 stats_clone.add_see_also_edges(see_also_count);
                 stats_clone.add_invalid_links(invalid_count);
@@ -379,161 +412,84 @@ fn run_extraction_inner(
                     if let Ok(mut writer) = edges_writer.shard_for(page.id).lock() {
                         for (end_id, edge_type) in &local_edges {
                             let end_str = edge_itoa.format(*end_id);
-                            if let Err(e) = writer.write_record([id_str, end_str, edge_type]) {
+                            let type_str = match edge_type {
+                                EdgeType::LinksTo => "LINKS_TO",
+                                EdgeType::SeeAlso => "SEE_ALSO",
+                            };
+                            if let Err(e) = writer.write_record([id_str, end_str, type_str]) {
                                 warn!(error = %e, "Failed to write edge record");
                             }
                         }
                     }
                 }
 
+                // -- Categories --
                 let categories = content::extract_categories(text);
                 if !categories.is_empty() {
-                    // Collect newly-seen categories locally, then lock once.
-                    // contains() fast-path skips clone+insert for duplicates.
-                    let mut new_cats: Vec<&str> = Vec::new();
-                    for cat_name in &categories {
-                        if !seen_categories.contains(cat_name.as_ref())
-                            && seen_categories.insert(cat_name.as_ref().to_owned())
-                        {
-                            new_cats.push(cat_name.as_ref());
-                        }
-                    }
-                    if !new_cats.is_empty() {
-                        stats_clone.add_categories(new_cats.len() as u64);
-                        if let Ok(mut writer) = categories_writer.shard_for(page.id).lock() {
-                            for cat_name in &new_cats {
-                                if let Err(e) =
-                                    writer.write_record([*cat_name, *cat_name, "Category"])
-                                {
-                                    warn!(error = %e, "Failed to write category record");
-                                }
-                            }
-                        }
-                    }
-
-                    stats_clone.add_category_edges(categories.len() as u64);
-                    if let Ok(mut writer) = article_categories_writer.shard_for(page.id).lock() {
-                        for cat_name in &categories {
-                            if let Err(e) =
-                                writer.write_record([id_str, cat_name.as_ref(), "HAS_CATEGORY"])
-                            {
-                                warn!(error = %e, "Failed to write category edge record");
-                            }
-                        }
-                    }
+                    let (new_count, rel_count) = write_dedup_entities(
+                        &categories,
+                        &seen_categories,
+                        &categories_writer,
+                        &article_categories_writer,
+                        page.id,
+                        id_str,
+                        "Category",
+                        "HAS_CATEGORY",
+                    );
+                    stats_clone.add_categories(new_count);
+                    stats_clone.add_category_edges(rel_count);
                 }
 
+                // -- Images --
                 let images = content::extract_images(text);
                 if !images.is_empty() {
-                    // Collect newly-seen images locally, then lock once.
-                    // contains() fast-path skips clone+insert for duplicates.
-                    let mut new_images: Vec<&str> = Vec::new();
-                    for filename in &images {
-                        if !seen_images.contains(filename.as_ref())
-                            && seen_images.insert(filename.as_ref().to_owned())
-                        {
-                            new_images.push(filename.as_ref());
-                        }
-                    }
-                    if !new_images.is_empty() {
-                        stats_clone.add_images(new_images.len() as u64);
-                        if let Ok(mut writer) = image_nodes_writer.shard_for(page.id).lock() {
-                            for filename in &new_images {
-                                if let Err(e) = writer.write_record([*filename, *filename, "Image"])
-                                {
-                                    warn!(error = %e, "Failed to write image node record");
-                                }
-                            }
-                        }
-                    }
-
-                    // Write article-image relationships
-                    if let Ok(mut writer) = article_images_writer.shard_for(page.id).lock() {
-                        for filename in &images {
-                            if let Err(e) =
-                                writer.write_record([id_str, filename.as_ref(), "HAS_IMAGE"])
-                            {
-                                warn!(error = %e, "Failed to write article-image edge record");
-                            }
-                        }
-                    }
+                    let (new_count, _rel_count) = write_dedup_entities(
+                        &images,
+                        &seen_images,
+                        &image_nodes_writer,
+                        &article_images_writer,
+                        page.id,
+                        id_str,
+                        "Image",
+                        "HAS_IMAGE",
+                    );
+                    stats_clone.add_images(new_count);
                 }
 
+                // -- External links --
                 let ext_links = content::extract_external_links(text);
                 if !ext_links.is_empty() {
-                    // Collect newly-seen external links locally, then lock once.
-                    // contains() fast-path skips clone+insert for duplicates.
-                    let mut new_links: Vec<&str> = Vec::new();
-                    for url in &ext_links {
-                        if !seen_external_links.contains(url.as_ref())
-                            && seen_external_links.insert(url.as_ref().to_owned())
-                        {
-                            new_links.push(url.as_ref());
-                        }
-                    }
-                    if !new_links.is_empty() {
-                        stats_clone.add_external_links(new_links.len() as u64);
-                        if let Ok(mut writer) = external_link_nodes_writer.shard_for(page.id).lock()
-                        {
-                            for url in &new_links {
-                                if let Err(e) = writer.write_record([*url, *url, "ExternalLink"]) {
-                                    warn!(error = %e, "Failed to write external link node record");
-                                }
-                            }
-                        }
-                    }
-
-                    // Write article-external link relationships
-                    if let Ok(mut writer) = article_external_links_writer.shard_for(page.id).lock()
-                    {
-                        for url in &ext_links {
-                            if let Err(e) = writer.write_record([id_str, url.as_ref(), "HAS_LINK"])
-                            {
-                                warn!(error = %e, "Failed to write article-external link edge record");
-                            }
-                        }
-                    }
+                    let (new_count, _rel_count) = write_dedup_entities(
+                        &ext_links,
+                        &seen_external_links,
+                        &external_link_nodes_writer,
+                        &article_external_links_writer,
+                        page.id,
+                        id_str,
+                        "ExternalLink",
+                        "HAS_LINK",
+                    );
+                    stats_clone.add_external_links(new_count);
                 }
 
+                // -- Infoboxes & blob --
                 let infoboxes = infobox::extract_infoboxes(text);
                 if !infoboxes.is_empty() {
                     stats_clone.add_infoboxes(infoboxes.len() as u64);
                 }
 
-                let abstract_text = content::extract_abstract(text);
-                let sections = content::extract_sections(text);
-                let is_disambig = content::is_disambiguation(text);
-
                 if !dry_run {
-                    let shard = page.id % shard_count;
-                    let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
-
                     let blob = ArticleBlob {
                         id: page.id,
                         title: page.title,
-                        abstract_text,
+                        abstract_text: content::extract_abstract(text),
                         categories: categories.into_iter().map(|c| c.into_owned()).collect(),
                         infoboxes,
-                        sections,
+                        sections: content::extract_sections(text),
                         timestamp: page.timestamp,
-                        is_disambiguation: is_disambig,
+                        is_disambiguation: content::is_disambiguation(text),
                     };
-
-                    let blob_path = format!("{}/{}.json", dir_path, page.id);
-                    match File::create(&blob_path) {
-                        Ok(f) => {
-                            let mut w = BufWriter::new(f);
-                            if let Err(e) = serde_json::to_writer(&mut w, &blob) {
-                                warn!(error = %e, path = %blob_path, "Failed to write blob");
-                            } else {
-                                stats_clone.inc_blobs();
-                                debug!(id = page.id, "Wrote blob");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, path = %blob_path, "Failed to create blob file");
-                        }
-                    }
+                    write_article_blob(output_dir, shard_count, page.id, &blob, &stats_clone);
                 }
             }
 

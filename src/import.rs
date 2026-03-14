@@ -53,17 +53,49 @@ CALL { WITH row
     CREATE (p)-[:HAS_LINK]->(e)
 } IN TRANSACTIONS OF 50000 ROWS;"#;
 
-const CSV_TYPES: &[&str] = &[
-    "nodes",
-    "edges",
-    "categories",
-    "article_categories",
-    "image_nodes",
-    "article_images",
-    "external_link_nodes",
-    "article_external_links",
-];
+/// A type of CSV file produced by extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvType {
+    Nodes,
+    Edges,
+    Categories,
+    ArticleCategories,
+    ImageNodes,
+    ArticleImages,
+    ExternalLinkNodes,
+    ArticleExternalLinks,
+}
 
+impl CsvType {
+    /// All CSV types in import order.
+    pub const ALL: &[Self] = &[
+        Self::Nodes,
+        Self::Edges,
+        Self::Categories,
+        Self::ArticleCategories,
+        Self::ImageNodes,
+        Self::ArticleImages,
+        Self::ExternalLinkNodes,
+        Self::ArticleExternalLinks,
+    ];
+
+    /// The base filename (without shard suffix or `.csv` extension).
+    pub fn base_name(self) -> &'static str {
+        match self {
+            Self::Nodes => "nodes",
+            Self::Edges => "edges",
+            Self::Categories => "categories",
+            Self::ArticleCategories => "article_categories",
+            Self::ImageNodes => "image_nodes",
+            Self::ArticleImages => "article_images",
+            Self::ExternalLinkNodes => "external_link_nodes",
+            Self::ArticleExternalLinks => "article_external_links",
+        }
+    }
+}
+
+/// Configuration for the Neo4j import step.
+#[derive(Debug, Clone)]
 pub struct ImportConfig {
     pub output_dir: String,
     pub bolt_uri: String,
@@ -76,17 +108,34 @@ pub struct ImportConfig {
     pub use_admin_import: bool,
 }
 
-#[derive(Debug)]
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: String::new(),
+            bolt_uri: config::DEFAULT_BOLT_URI.to_string(),
+            import_prefix: config::DEFAULT_IMPORT_PREFIX.to_string(),
+            max_parallel_edges: config::IMPORT_MAX_PARALLEL_EDGES,
+            max_parallel_light: config::IMPORT_MAX_PARALLEL_LIGHT,
+            compose_file: None,
+            no_docker: false,
+            clean: false,
+            use_admin_import: false,
+        }
+    }
+}
+
+/// Whether CSV output is a single file per type or sharded across N files.
+#[derive(Debug, Clone)]
 enum CsvLayout {
     Single,
     Sharded { count: u32 },
 }
 
-impl CsvLayout {
-    fn description(&self) -> String {
+impl std::fmt::Display for CsvLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CsvLayout::Single => "single-file".to_string(),
-            CsvLayout::Sharded { count } => format!("sharded ({count} shards)"),
+            CsvLayout::Single => f.write_str("single-file"),
+            CsvLayout::Sharded { count } => write!(f, "sharded ({count} shards)"),
         }
     }
 }
@@ -332,6 +381,7 @@ async fn run_admin_import(
     Ok(())
 }
 
+/// Loads extracted CSV files into Neo4j using either admin bulk import or Bolt protocol.
 pub async fn run_import(mut config: ImportConfig) -> Result<()> {
     let start = Instant::now();
 
@@ -344,7 +394,7 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
     let layout = detect_csv_layout(&config.output_dir)?;
     validate_csv_files(&config.output_dir, &layout)?;
     println!();
-    println!("==> Detected {} CSV layout", layout.description());
+    println!("==> Detected {} CSV layout", layout);
 
     if !config.no_docker {
         let compose_file = resolve_compose_file(&config)?;
@@ -584,15 +634,13 @@ fn detect_csv_layout(output_dir: &str) -> Result<CsvLayout> {
     let single_path = Path::new(output_dir).join("nodes.csv");
 
     if sharded_path.exists() {
-        let mut count = 0u32;
-        loop {
-            let p = Path::new(output_dir).join(format!("nodes_{count:03}.csv"));
-            if p.exists() {
-                count += 1;
-            } else {
-                break;
-            }
-        }
+        let count = (0u32..)
+            .take_while(|&i| {
+                Path::new(output_dir)
+                    .join(format!("nodes_{i:03}.csv"))
+                    .exists()
+            })
+            .count() as u32;
         if count == 0 {
             bail!("Found nodes_000.csv but could not count shards");
         }
@@ -617,8 +665,8 @@ fn csv_files_for(base_name: &str, layout: &CsvLayout) -> Vec<String> {
 }
 
 fn validate_csv_files(output_dir: &str, layout: &CsvLayout) -> Result<()> {
-    for base in CSV_TYPES {
-        let files = csv_files_for(base, layout);
+    for csv_type in CsvType::ALL {
+        let files = csv_files_for(csv_type.base_name(), layout);
         for file in &files {
             let path = Path::new(output_dir).join(file);
             if !path.exists() {
@@ -848,7 +896,7 @@ fn make_spinner(msg: &str) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.cyan} {msg}")
-            .unwrap(),
+            .expect("valid progress template"),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message(msg.to_string());
@@ -862,7 +910,7 @@ fn make_progress_bar(total: u64, label: &str) -> ProgressBar {
             .template(&format!(
                 "    {{spinner:.cyan}} {label:<14} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} shards"
             ))
-            .unwrap()
+            .expect("valid progress template")
             .progress_chars("=> "),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -877,8 +925,9 @@ mod tests {
     #[test]
     fn detect_layout_single() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
-            std::fs::write(dir.path().join(format!("{base}.csv")), "header\n").unwrap();
+        for csv_type in CsvType::ALL {
+            let name = format!("{}.csv", csv_type.base_name());
+            std::fs::write(dir.path().join(name), "header\n").unwrap();
         }
         let layout = detect_csv_layout(dir.path().to_str().unwrap()).unwrap();
         assert!(matches!(layout, CsvLayout::Single));
@@ -887,13 +936,10 @@ mod tests {
     #[test]
     fn detect_layout_sharded() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
+        for csv_type in CsvType::ALL {
             for shard in 0..4u32 {
-                std::fs::write(
-                    dir.path().join(format!("{base}_{shard:03}.csv")),
-                    "header\n",
-                )
-                .unwrap();
+                let name = format!("{}_{shard:03}.csv", csv_type.base_name());
+                std::fs::write(dir.path().join(name), "header\n").unwrap();
             }
         }
         let layout = detect_csv_layout(dir.path().to_str().unwrap()).unwrap();
@@ -926,8 +972,9 @@ mod tests {
     #[test]
     fn validate_csv_files_ok() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
-            std::fs::write(dir.path().join(format!("{base}.csv")), "header\n").unwrap();
+        for csv_type in CsvType::ALL {
+            let name = format!("{}.csv", csv_type.base_name());
+            std::fs::write(dir.path().join(name), "header\n").unwrap();
         }
         let layout = CsvLayout::Single;
         assert!(validate_csv_files(dir.path().to_str().unwrap(), &layout).is_ok());

@@ -1,3 +1,5 @@
+// -- Extraction constants --
+
 /// Maximum depth for following redirect chains.
 pub const REDIRECT_MAX_DEPTH: u32 = 5;
 
@@ -15,6 +17,25 @@ pub const CHECKPOINT_VERSION: u32 = 3;
 
 /// Save a checkpoint every N articles.
 pub const CHECKPOINT_INTERVAL: u32 = 10_000;
+
+// -- Buffer / capacity constants --
+
+/// BufWriter capacity for CSV shard writers (128 KB).
+pub const CSV_WRITER_BUF_SIZE: usize = 128 * 1024;
+
+/// BufReader / BufWriter capacity for merge operations (256 KB).
+pub const MERGE_BUF_SIZE: usize = 256 * 1024;
+
+/// BufReader capacity for BZ2 decompression and cache/checkpoint I/O (256 KB).
+pub const BUFREADER_CAPACITY: usize = 256 * 1024;
+
+/// Pre-sized capacity for the title-to-ID hash map.
+pub const INDEX_INITIAL_ARTICLES: usize = 8_000_000;
+
+/// Pre-sized capacity for the redirect resolution hash map.
+pub const INDEX_INITIAL_REDIRECTS: usize = 10_000_000;
+
+// -- Import constants --
 
 /// Default Bolt URI for Neo4j connection.
 pub const DEFAULT_BOLT_URI: &str = "bolt://localhost:7687";
