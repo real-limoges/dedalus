@@ -82,6 +82,10 @@ struct ExtractArgs {
     /// Clear existing checkpoint and outputs before starting
     #[arg(long)]
     clean: bool,
+
+    /// Path to multistream index file (.txt.bz2) for parallel parsing
+    #[arg(long)]
+    multistream_index: Option<String>,
 }
 
 #[derive(Args)]
@@ -203,6 +207,10 @@ struct PipelineArgs {
     /// Don't archive sharded CSVs after merging
     #[arg(long)]
     no_archive: bool,
+
+    /// Path to multistream index file (.txt.bz2) for parallel parsing
+    #[arg(long)]
+    multistream_index: Option<String>,
 }
 
 #[derive(Args)]
@@ -225,12 +233,33 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     fs::create_dir_all(&args.output)
         .with_context(|| format!("Failed to create output directory: {}", args.output))?;
 
+    // Resolve multistream index: explicit flag > auto-detect from filename
+    let multistream_index_path = args
+        .multistream_index
+        .clone()
+        .or_else(|| dedalus::multistream::detect_index_path(&args.input));
+
+    let multistream_ranges = if let Some(ref idx_path) = multistream_index_path {
+        println!("==> Using multistream parallel parsing");
+        println!("    Index: {}", idx_path);
+        let ranges = dedalus::multistream::parse_multistream_index(idx_path, &args.input)?;
+        println!("    Streams: {}", ranges.len());
+        println!();
+        Some(ranges)
+    } else {
+        None
+    };
+
     let start_indexing = Instant::now();
     let cache_path = cache::cache_path(&args.output);
 
     let index = if args.no_cache {
         info!("Cache disabled, building fresh index");
-        let idx = dedalus::index::WikiIndex::build(&args.input)?;
+        let idx = if let Some(ref ranges) = multistream_ranges {
+            dedalus::index::WikiIndex::build_multistream(&args.input, ranges)?
+        } else {
+            dedalus::index::WikiIndex::build(&args.input)?
+        };
         if !args.dry_run {
             if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
                 warn!(error = %e, "Failed to save index cache");
@@ -242,7 +271,11 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         idx
     } else {
         info!("Building index (cache miss or invalid)");
-        let idx = dedalus::index::WikiIndex::build(&args.input)?;
+        let idx = if let Some(ref ranges) = multistream_ranges {
+            dedalus::index::WikiIndex::build_multistream(&args.input, ranges)?
+        } else {
+            dedalus::index::WikiIndex::build(&args.input)?
+        };
         if !args.dry_run {
             if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
                 warn!(error = %e, "Failed to save index cache");
@@ -308,6 +341,7 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         args.dry_run,
         checkpoint.as_ref(),
         checkpoint_mgr.as_ref(),
+        multistream_ranges.as_deref(),
     )?;
     let extraction_duration = start_extracting.elapsed();
     info!(
@@ -414,6 +448,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
         no_cache: args.no_cache,
         checkpoint_interval: args.checkpoint_interval,
         clean: args.clean,
+        multistream_index: args.multistream_index.clone(),
     })
     .context("Extraction step failed")?;
 

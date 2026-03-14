@@ -32,3 +32,4 @@ output_data/**/*
 !/output_data/
 output/
 *.bz2
+*.txt

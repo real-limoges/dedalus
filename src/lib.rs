@@ -70,6 +70,7 @@ pub mod index;
 pub mod infobox;
 pub mod merge;
 pub mod models;
+pub mod multistream;
 pub mod parser;
 pub mod stats;
 pub mod tui;

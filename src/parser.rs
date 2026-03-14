@@ -30,115 +30,36 @@ impl Read for DecompressSource {
     }
 }
 
-pub struct WikiReader {
-    reader: Reader<BufReader<DecompressSource>>,
+/// Generic XML page parser that works with any `Read` source.
+/// Extracts `WikiPage` items from a MediaWiki XML stream.
+pub struct PageParser<R: Read> {
+    reader: Reader<BufReader<R>>,
     buf: Vec<u8>,
     skip_text: bool,
-    skip_timestamp: bool,
-    _child: Option<Child>,
+    pub(crate) skip_timestamp: bool,
 }
 
-fn find_decompressor() -> Option<&'static str> {
-    ["lbzip2", "pbzip2"].into_iter().find(|cmd| {
-        Command::new(cmd)
-            .arg("--help")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok()
-    })
-}
-
-fn spawn_decompressor(cmd: &str, path: &str) -> Result<Child> {
-    Command::new(cmd)
-        .arg("-dc")
-        .arg(path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("Failed to spawn {}", cmd))
-}
-
-impl WikiReader {
-    pub fn new(path: &str, skip_text: bool) -> Result<Self> {
-        if !std::path::Path::new(path).exists() {
-            return Err(anyhow::anyhow!("Could not open file: {}", path));
-        }
-
-        let (source, child): (DecompressSource, Option<Child>) = if let Some(cmd) =
-            find_decompressor()
-        {
-            match spawn_decompressor(cmd, path) {
-                Ok(mut child) => {
-                    let stdout = child
-                        .stdout
-                        .take()
-                        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from {}", cmd))?;
-                    info!(decompressor = cmd, "Using external parallel decompressor");
-                    (DecompressSource::External(stdout), Some(child))
-                }
-                Err(e) => {
-                    warn!(error = %e, "External decompressor failed, falling back to in-process");
-                    let file = File::open(path)
-                        .with_context(|| format!("Could not open file: {}", path))?;
-                    (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
-                }
-            }
-        } else {
-            let file =
-                File::open(path).with_context(|| format!("Could not open file: {}", path))?;
-            (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
-        };
-
-        let reader = BufReader::with_capacity(256 * 1024, source);
-        let mut xml_reader = Reader::from_reader(reader);
+impl<R: Read> PageParser<R> {
+    pub fn new(source: R, skip_text: bool) -> Self {
+        let buf_reader = BufReader::with_capacity(256 * 1024, source);
+        let mut xml_reader = Reader::from_reader(buf_reader);
         xml_reader.check_end_names(false);
         xml_reader.trim_text(true);
-
-        Ok(Self {
+        Self {
             reader: xml_reader,
             buf: Vec::with_capacity(256 * 1024),
             skip_text,
             skip_timestamp: false,
-            _child: child,
-        })
+        }
     }
 
     pub fn skip_timestamp(mut self, val: bool) -> Self {
         self.skip_timestamp = val;
         self
     }
-
-    /// Constructor that forces in-process decompression, bypassing external tool detection.
-    #[cfg(test)]
-    fn new_inprocess(path: &str, skip_text: bool) -> Result<Self> {
-        let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;
-        let source = DecompressSource::InProcess(MultiBzDecoder::new(file));
-        let reader = BufReader::with_capacity(256 * 1024, source);
-        let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.check_end_names(false);
-        xml_reader.trim_text(true);
-
-        Ok(Self {
-            reader: xml_reader,
-            buf: Vec::with_capacity(256 * 1024),
-            skip_text,
-            skip_timestamp: false,
-            _child: None,
-        })
-    }
 }
 
-impl Drop for WikiReader {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self._child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Iterator for WikiReader {
+impl<R: Read> Iterator for PageParser<R> {
     type Item = WikiPage;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -263,6 +184,107 @@ impl Iterator for WikiReader {
             }
             self.buf.clear();
         }
+    }
+}
+
+pub struct WikiReader {
+    parser: PageParser<DecompressSource>,
+    _child: Option<Child>,
+}
+
+fn find_decompressor() -> Option<&'static str> {
+    ["lbzip2", "pbzip2"].into_iter().find(|cmd| {
+        Command::new(cmd)
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+fn spawn_decompressor(cmd: &str, path: &str) -> Result<Child> {
+    Command::new(cmd)
+        .arg("-dc")
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Failed to spawn {}", cmd))
+}
+
+impl WikiReader {
+    pub fn new(path: &str, skip_text: bool) -> Result<Self> {
+        if !std::path::Path::new(path).exists() {
+            return Err(anyhow::anyhow!("Could not open file: {}", path));
+        }
+
+        let (source, child): (DecompressSource, Option<Child>) = if let Some(cmd) =
+            find_decompressor()
+        {
+            match spawn_decompressor(cmd, path) {
+                Ok(mut child) => {
+                    let stdout = child
+                        .stdout
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from {}", cmd))?;
+                    info!(decompressor = cmd, "Using external parallel decompressor");
+                    (DecompressSource::External(stdout), Some(child))
+                }
+                Err(e) => {
+                    warn!(error = %e, "External decompressor failed, falling back to in-process");
+                    let file = File::open(path)
+                        .with_context(|| format!("Could not open file: {}", path))?;
+                    (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
+                }
+            }
+        } else {
+            let file =
+                File::open(path).with_context(|| format!("Could not open file: {}", path))?;
+            (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
+        };
+
+        let parser = PageParser::new(source, skip_text);
+
+        Ok(Self {
+            parser,
+            _child: child,
+        })
+    }
+
+    pub fn skip_timestamp(mut self, val: bool) -> Self {
+        self.parser.skip_timestamp = val;
+        self
+    }
+
+    /// Constructor that forces in-process decompression, bypassing external tool detection.
+    #[cfg(test)]
+    fn new_inprocess(path: &str, skip_text: bool) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;
+        let source = DecompressSource::InProcess(MultiBzDecoder::new(file));
+        let parser = PageParser::new(source, skip_text);
+
+        Ok(Self {
+            parser,
+            _child: None,
+        })
+    }
+}
+
+impl Drop for WikiReader {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self._child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Iterator for WikiReader {
+    type Item = WikiPage;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.parser.next()
     }
 }
 
@@ -545,5 +567,24 @@ mod tests {
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].title, "Test");
         assert_eq!(pages[0].text.as_deref(), Some("Content here."));
+    }
+
+    #[test]
+    fn page_parser_from_raw_xml() {
+        let xml = b"<mediawiki>
+            <page>
+                <title>Direct</title>
+                <id>99</id>
+                <revision><id>1</id><text>Hello</text></revision>
+            </page>
+        </mediawiki>";
+
+        let parser = PageParser::new(&xml[..], false);
+        let pages: Vec<_> = parser.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].id, 99);
+        assert_eq!(pages[0].title, "Direct");
+        assert_eq!(pages[0].text.as_deref(), Some("Hello"));
     }
 }

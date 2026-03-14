@@ -1,9 +1,12 @@
 use crate::config::{PROGRESS_INTERVAL, REDIRECT_MAX_DEPTH};
 use crate::models::PageType;
+use crate::multistream::StreamRange;
 use crate::parser::WikiReader;
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
 pub struct WikiIndex {
@@ -58,6 +61,84 @@ impl WikiIndex {
             articles = title_to_id.len(),
             redirects = redirects.len(),
             "Index built successfully"
+        );
+
+        Ok(Self {
+            title_to_id,
+            redirects,
+        })
+    }
+
+    /// Build index using multistream parallel parsing.
+    /// Each rayon worker decompresses and parses streams independently.
+    pub fn build_multistream(dump_path: &str, ranges: &[StreamRange]) -> Result<Self> {
+        info!(
+            streams = ranges.len(),
+            "Building index from multistream dump: {}", dump_path
+        );
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let page_count = AtomicU64::new(0);
+
+        // Parallel fold: each thread collects into local vecs, then reduce merges
+        let (articles_vec, redirects_vec) = ranges
+            .par_iter()
+            .fold(
+                || (Vec::new(), Vec::new()),
+                |(mut articles, mut redirects), range| {
+                    let pages = crate::multistream::parse_stream_for_index(dump_path, range);
+                    for page in pages {
+                        let count = page_count.fetch_add(1, Ordering::Relaxed);
+                        if (count + 1).is_multiple_of(PROGRESS_INTERVAL as u64) {
+                            pb.set_message(format!("Indexing: {} pages", count + 1));
+                        }
+                        match page.page_type {
+                            PageType::Article => {
+                                articles.push((page.title, page.id));
+                            }
+                            PageType::Redirect(target) => {
+                                redirects.push((page.title, target));
+                            }
+                            _ => {}
+                        }
+                    }
+                    (articles, redirects)
+                },
+            )
+            .reduce(
+                || (Vec::new(), Vec::new()),
+                |(mut a1, mut r1), (a2, r2)| {
+                    a1.extend(a2);
+                    r1.extend(r2);
+                    (a1, r1)
+                },
+            );
+
+        pb.finish_and_clear();
+
+        let mut title_to_id: FxHashMap<String, u32> =
+            FxHashMap::with_capacity_and_hasher(articles_vec.len(), Default::default());
+        for (title, id) in articles_vec {
+            title_to_id.insert(title, id);
+        }
+
+        let mut redirects: FxHashMap<String, String> =
+            FxHashMap::with_capacity_and_hasher(redirects_vec.len(), Default::default());
+        for (title, target) in redirects_vec {
+            redirects.insert(title, target);
+        }
+
+        info!(
+            articles = title_to_id.len(),
+            redirects = redirects.len(),
+            "Index built successfully (multistream)"
         );
 
         Ok(Self {
