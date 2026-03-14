@@ -1,3 +1,9 @@
+//! CSV shard merger for neo4j-admin compatibility.
+//!
+//! Concatenates sharded CSV files into single merged files with cross-shard
+//! deduplication of categories, images, and external links using `FxHashSet`.
+//! Uses streaming I/O with 256KB buffers.
+
 use anyhow::{bail, Context, Result};
 use csv::{Reader, Writer};
 use rustc_hash::FxHashSet;

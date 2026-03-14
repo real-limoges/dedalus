@@ -1,3 +1,9 @@
+//! Regex-based text extraction from Wikipedia article wikitext.
+//!
+//! Provides functions for extracting abstracts, section headings, see-also links,
+//! categories, images, external links, and disambiguation detection. Uses
+//! SIMD-accelerated `memchr` for fast template stripping.
+
 use memchr::memchr2;
 use once_cell::sync::Lazy;
 use regex::Regex;

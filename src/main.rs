@@ -1,3 +1,9 @@
+//! CLI entry point for the Dedalus pipeline.
+//!
+//! Uses `clap` subcommands to orchestrate extract, import, merge-csvs, pipeline,
+//! stats, and tui operations. Initializes `tracing` logging with configurable
+//! verbosity and uses `mimalloc` as the global allocator.
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use dedalus::cache;

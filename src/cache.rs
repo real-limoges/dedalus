@@ -1,3 +1,9 @@
+//! Index persistence using `bincode` serialization.
+//!
+//! Saves and loads `WikiIndex` as `index.cache`, validating against input file
+//! mtime and size. Uses zero-copy serialization via `IndexCacheSer` to avoid
+//! cloning ~17M strings during writes.
+
 use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
 use anyhow::{bail, Context, Result};
@@ -163,6 +169,7 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     Ok(())
 }
 
+/// Returns `true` if the cache exists and matches the current input file.
 pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
     Ok(try_load_index(cache_path, input_path)?.is_some())
 }

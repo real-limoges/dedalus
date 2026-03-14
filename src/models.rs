@@ -1,3 +1,9 @@
+//! Core data types for the extraction pipeline.
+//!
+//! Defines `WikiPage` (parsed from XML), `PageType` (Article/Redirect/Special),
+//! `EdgeType` (LinksTo/SeeAlso), and `ArticleBlob` (enriched JSON output with
+//! conditional serialization for compact storage).
+
 use crate::infobox::Infobox;
 use serde::{Deserialize, Serialize};
 use std::fmt;

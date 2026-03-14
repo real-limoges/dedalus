@@ -1,3 +1,8 @@
+//! Extraction checkpoint management for resumable processing.
+//!
+//! `CheckpointManager` uses double-checked locking for periodic saves with
+//! atomic write-via-rename for crash safety. Cleared on successful completion.
+
 use crate::config::CHECKPOINT_VERSION;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
@@ -57,6 +62,7 @@ fn get_input_mtime(input_path: &str) -> Result<u64> {
     Ok(mtime)
 }
 
+/// Loads a checkpoint if it exists and matches the current extraction parameters.
 pub fn load_if_valid(
     input_path: &str,
     output_dir: &str,
@@ -148,6 +154,7 @@ pub fn load_if_valid(
     Ok(Some(checkpoint))
 }
 
+/// Removes the checkpoint file for the given output directory.
 pub fn clear(output_dir: &str) -> Result<()> {
     let path = checkpoint_path(output_dir);
     if path.exists() {
@@ -205,6 +212,7 @@ impl CheckpointManager {
         })
     }
 
+    /// Sets the last saved page ID (used when resuming from an existing checkpoint).
     pub fn set_last_id(&self, id: u32) {
         self.last_saved_id.store(id, Ordering::Relaxed);
     }
@@ -235,6 +243,7 @@ impl CheckpointManager {
         Ok(false)
     }
 
+    /// Writes the current extraction state to disk atomically via `.tmp` + rename.
     pub fn save(&self, page_id: u32, stats: &ExtractionStats) -> Result<()> {
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
@@ -279,6 +288,7 @@ impl CheckpointManager {
         Ok(())
     }
 
+    /// Removes the checkpoint file (called after successful extraction).
     pub fn clear(&self) -> Result<()> {
         clear(&self.output_dir)
     }

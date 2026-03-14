@@ -1,3 +1,9 @@
+//! Multistream dump support for parallel decompression and parsing.
+//!
+//! Parses the bz2-compressed index file to extract `StreamRange` byte offsets,
+//! then provides `par_iter_pages()` where each rayon worker independently seeks,
+//! decompresses, and parses its own bz2 stream.
+
 use crate::models::WikiPage;
 use crate::parser::PageParser;
 use anyhow::{Context, Result};

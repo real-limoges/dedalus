@@ -1,3 +1,10 @@
+//! Parallel extraction pass producing CSV and JSON output.
+//!
+//! Uses `rayon::par_bridge()` (or multistream parallel iteration) to process
+//! articles concurrently. `ShardedCsvWriter` distributes rows across N files
+//! by `page_id % csv_shards`. `DashSet` deduplicates categories, images, and
+//! external links across threads.
+
 use crate::checkpoint::{Checkpoint, CheckpointManager};
 use crate::config::{CSV_WRITER_BUF_SIZE, PROGRESS_INTERVAL};
 use crate::content;

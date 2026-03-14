@@ -1,3 +1,8 @@
+//! Brace-matching `{{Infobox ...}}` parser for structured key-value extraction.
+//!
+//! Correctly handles nested `{{...}}` templates using depth tracking with
+//! SIMD-accelerated `memchr` to skip over plain text between brace pairs.
+
 use memchr::{memchr, memchr2, memchr3};
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +12,7 @@ pub struct Infobox {
     pub fields: Vec<(String, String)>,
 }
 
+/// Extracts all `{{Infobox ...}}` templates from article wikitext.
 pub fn extract_infoboxes(text: &str) -> Vec<Infobox> {
     let mut results = Vec::new();
     let bytes = text.as_bytes();

@@ -1,3 +1,8 @@
+//! Compile-time constants for extraction and import configuration.
+//!
+//! Includes buffer sizes, retry parameters, hash map capacities, and default
+//! values for CLI flags.
+
 // -- Extraction constants --
 
 /// Maximum depth for following redirect chains.

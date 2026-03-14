@@ -1,3 +1,9 @@
+//! In-memory title-to-ID index with redirect chain resolution.
+//!
+//! `WikiIndex` wraps pre-sized `FxHashMap`s (8M articles, 10M redirects) for
+//! fast lookup of page IDs by title. Follows redirect chains up to 5 hops.
+//! Supports both sequential and multistream parallel index building.
+
 use crate::config::{PROGRESS_INTERVAL, REDIRECT_MAX_DEPTH};
 use crate::models::PageType;
 use crate::multistream::StreamRange;

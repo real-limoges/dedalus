@@ -1,3 +1,9 @@
+//! Neo4j import pipeline with two modes.
+//!
+//! `--admin-import` uses `neo4j-admin database import` for 10-100x faster bulk
+//! loading. The default Bolt mode uses `neo4rs` with `LOAD CSV` and throttled
+//! `FuturesUnordered` parallelism. Both modes manage Docker lifecycle automatically.
+
 use crate::config;
 use anyhow::{bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
