@@ -127,7 +127,6 @@ Dedalus uses subcommands: `pipeline`, `extract`, `import`, `merge-csvs`, `stats`
 ### `dedalus pipeline`
 
 Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → import. Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based import, use the individual `import` subcommand.
-          ```~~
 ```bash
 dedalus pipeline -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 ```
@@ -247,7 +246,6 @@ dedalus tui
 | `r` | Done | Return to config screen |
 | `q` | Config/Done | Quit |
 | `Ctrl+C` | Any | Force quit |
-**Note**: When using `dedalus pipeline`, sharded CSV files are automatically archived to a `shards/` subdirectory after merging to prevent import confusion. Use `--no-archive` to skip this. This preserves the original sharded files while keeping only merged files in the main output directory.
 
 ### Global flags
 

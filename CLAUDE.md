@@ -8,7 +8,7 @@ Dedalus is a Rust pipeline that extracts Wikipedia dumps into structured graph d
 
 ## Build & Optimization
 
-The project targets M1 CPU with native SIMD optimizations via `.cargo/config.toml`:
+The project targets Apple Silicon (M1–M5) with native SIMD optimizations via `.cargo/config.toml`:
 
 ```toml
 # .cargo/config.toml
@@ -37,7 +37,7 @@ This yields ~1.6x faster extraction on ARM64 due to NEON SIMD and single-pass co
 ### Build Commands
 
 ```bash
-cargo build --release          # Build optimized binary with M1 CPU targeting
+cargo build --release          # Build optimized binary with Apple Silicon targeting
 cargo test --verbose           # Run all tests (161 unit + integration tests)
 cargo fmt -- --check           # Check formatting
 cargo clippy -- -D warnings    # Lint with strict warnings
@@ -81,7 +81,7 @@ Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based impo
 
 ### Extract
 
-Processes a Wikipedia dump into CSV/JSON output files. Supports optional CSV sharding for parallel extraction (1.62x speedup with 8 shards).
+Processes a Wikipedia dump into CSV/JSON output files. Supports optional CSV sharding for parallel extraction (1.62x speedup with 14 shards).
 
 ```bash
 dedalus extract -i <path-to-wiki-dump.xml.bz2> -o <output-directory>
@@ -153,7 +153,7 @@ dedalus stats -o <output-directory>
 ### Typical Workflows
 
 ```bash
-# Recommended: Full pipeline (extract 8 shards → merge → admin import)
+# Recommended: Full pipeline (extract 14 shards → merge → admin import)
 dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ -v
 
 ---
@@ -184,7 +184,7 @@ dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --resume -v
 ---
 
 # Bolt-based import (slower, for incremental updates)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 8 -v
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 14 -v
 dedalus import -o out/  # omit --admin-import to use Bolt
 
 ---
@@ -283,7 +283,7 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 - **Throttled parallel import**: `FuturesUnordered` with bounded concurrency; edges at 4 concurrent, lighter operations at 8 concurrent
 - **Neo4j transactional batching**: `CALL { ... } IN TRANSACTIONS OF N ROWS` for memory-bounded bulk loading
 - **Tokio runtime isolation**: manually created only for import path; extraction uses sync rayon
-- **M1 CPU targeting**: `target-cpu=native` for NEON SIMD, `codegen-units=1` for better optimization
+- **Apple Silicon targeting**: `target-cpu=native` for NEON SIMD, `codegen-units=1` for better optimization
 - **String allocations**: single-pass building in `sanitize_field()` and `extract_abstract()` (vs replace→split→collect→join chains)
 - **BufWriter**: 128KB buffers (increased from 64KB) for CSV writers, 256KB for merge operations
 - **JSON output**: `to_writer()` not `to_writer_pretty()`, with `BufWriter` for efficiency
@@ -291,13 +291,13 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 ### CSV Sharding & Merge Trade-off
 
 The hybrid workflow solves a performance trade-off:
-- **Pure extraction with `--csv-shards 8`**: 1.62x speedup but produces 8 files per CSV type
+- **Pure extraction with `--csv-shards 14`**: 1.62x speedup but produces 14 files per CSV type
 - **neo4j-admin import**: Requires single files (10-100x faster than Bolt but needs merged CSVs)
 - **Solution**: `dedalus merge-csvs` merges shards with cross-shard deduplication in <5 minutes
 
 Recommended for full Wikipedia dumps:
 ```
-Extract (8 shards, 1.62x faster) → Merge (<5 min, dedup) → Admin Import (10-100x faster)
+Extract (14 shards, 1.62x faster) → Merge (<5 min, dedup) → Admin Import (10-100x faster)
 ```
 
 ## Dependencies
@@ -338,7 +338,7 @@ Test suites:
 
 ## Recent Optimizations (2026-02-09)
 
-- M1 CPU targeting via `.cargo/config.toml` (`target-cpu=native`, `codegen-units=1`, `opt-level=3`)
+- Apple Silicon targeting via `.cargo/config.toml` (`target-cpu=native`, `codegen-units=1`, `opt-level=3`)
 - String allocation optimizations in `sanitize_field()` (single-pass build vs replace→split→collect→join)
 - Direct string building in `extract_abstract()` (vs collect+join)
 - Increased CSV writer buffer size to 128KB (was 64KB)
@@ -387,7 +387,7 @@ Stats are updated at high frequency (per-article). Atomic operations avoid locki
 ## Troubleshooting
 
 - **OOM during import**: Reduce `--max-parallel-edges` or `--max-parallel-light`. Use `--admin-import` for fastest memory-efficient loading.
-- **Slow extraction**: Ensure `cargo build --release` with M1 targeting. Set `--csv-shards 8` for 1.62x speedup. Use multistream dumps (`*-multistream.xml.bz2` + index) for parallel decompression.
+- **Slow extraction**: Ensure `cargo build --release` with Apple Silicon targeting. Set `--csv-shards 14` for 1.62x speedup. Use multistream dumps (`*-multistream.xml.bz2` + index) for parallel decompression.
 - **Index cache invalid**: Use `--no-cache` to rebuild. Cache validates against input file mtime and size.
 - **Checkpoint conflicts**: Use `--clean` to start fresh or `--resume` to continue.
 - **Neo4j connection timeout**: Increase `IMPORT_MAX_RETRIES` or check Docker logs with `docker compose -f neo4j-platform/docker-compose.yml logs neo4j`.
