@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A Rust pipeline that extracts Wikipedia dumps into structured graph data and imports into Neo4j"
 repository = "https://github.com/real-limoges/dedalus"
-license = "BSD-3-Clause"
+license = "MIT"
 
 [dependencies]
 bzip2 = { version = "0.6.1" }
@@ -28,6 +28,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "proce
 futures = "0.3"
 mimalloc = "0.1"
 itoa = "1"
+memchr = "2"
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tempfile = "3"

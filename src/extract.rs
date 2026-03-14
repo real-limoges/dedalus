@@ -139,7 +139,70 @@ pub fn run_extraction(
     } else {
         ExtractionStats::new()
     });
+    let cancel = Arc::new(AtomicBool::new(false));
 
+    run_extraction_inner(
+        path,
+        output_dir,
+        index,
+        shard_count,
+        csv_shards,
+        limit,
+        dry_run,
+        resume_from,
+        checkpoint_mgr,
+        stats,
+        cancel,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_extraction_with_stats(
+    path: &str,
+    output_dir: &str,
+    index: &WikiIndex,
+    shard_count: u32,
+    csv_shards: u32,
+    limit: Option<u64>,
+    dry_run: bool,
+    resume_from: Option<&Checkpoint>,
+    checkpoint_mgr: Option<&CheckpointManager>,
+    stats: Arc<ExtractionStats>,
+    cancel: Arc<AtomicBool>,
+    hide_progress: bool,
+) -> Result<ExtractionStats> {
+    run_extraction_inner(
+        path,
+        output_dir,
+        index,
+        shard_count,
+        csv_shards,
+        limit,
+        dry_run,
+        resume_from,
+        checkpoint_mgr,
+        stats,
+        cancel,
+        hide_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_extraction_inner(
+    path: &str,
+    output_dir: &str,
+    index: &WikiIndex,
+    shard_count: u32,
+    csv_shards: u32,
+    limit: Option<u64>,
+    dry_run: bool,
+    resume_from: Option<&Checkpoint>,
+    checkpoint_mgr: Option<&CheckpointManager>,
+    stats: Arc<ExtractionStats>,
+    cancel: Arc<AtomicBool>,
+    hide_progress: bool,
+) -> Result<ExtractionStats> {
     let resuming = resume_from.is_some();
     let resume_after_id = resume_from.map(|cp| cp.last_processed_id).unwrap_or(0);
 
@@ -228,14 +291,20 @@ pub fn run_extraction(
     let seen_categories: Arc<DashSet<String>> = Arc::new(DashSet::new());
     let seen_images: Arc<DashSet<String>> = Arc::new(DashSet::new());
     let seen_external_links: Arc<DashSet<String>> = Arc::new(DashSet::new());
+    let cancel_clone = Arc::clone(&cancel);
 
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        indicatif::ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    let pb = if hide_progress {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            indicatif::ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        pb
+    };
     let pb = Arc::new(pb);
     let pb_clone = Arc::clone(&pb);
 
@@ -243,7 +312,9 @@ pub fn run_extraction(
         .filter(|page| page.id > resume_after_id)
         .par_bridge()
         .for_each(|page| {
-            if limit_reached.load(Ordering::Relaxed) {
+            if limit_reached.load(Ordering::Relaxed)
+                || cancel_clone.load(Ordering::Relaxed)
+            {
                 return;
             }
             if let Some(max) = limit {

@@ -6,7 +6,7 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 
 ## Features
 
-- **Two-pass streaming pipeline** -- indexing pass builds a title-to-ID map, extraction pass produces output in parallel (1.62x faster with 8 shards)
+- **Two-pass streaming pipeline** -- indexing pass builds a title-to-ID map, extraction pass produces output in parallel (1.62x faster with 14 shards)
 - **Memory-efficient** -- event-based XML parsing with `quick-xml`; never loads the full dump into memory
 - **Parallel extraction** -- uses `rayon` for multi-core article processing
 - **Parallel decompression** -- automatically uses `lbzip2` or `pbzip2` when available on PATH; falls back to in-process `MultiBzDecoder`
@@ -19,7 +19,7 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 - **Resumable processing** -- index caching and checkpoint-based resume to skip redundant work
 - **Dry-run mode** -- validate pipeline without writing files
 - **Progress reporting and structured logging** via `indicatif` and `tracing`
-- **M1/Apple Silicon optimizations** -- Native SIMD targeting for ~1.6x faster extraction on ARM64
+- **Apple Silicon optimizations** -- Native SIMD targeting for ~1.6x faster extraction on ARM64
 
 ## Building
 
@@ -29,7 +29,7 @@ Requires Rust 1.70+ (stable).
 cargo build --release
 ```
 
-**Performance Note**: The project uses `.cargo/config.toml` to enable native CPU targeting (`target-cpu=native`) for SIMD optimizations. On Apple Silicon (M1/M2/M3), this provides ~1.6x faster extraction via NEON SIMD instructions. Always use `--release` for production workloads.
+**Performance Note**: The project uses `.cargo/config.toml` to enable native CPU targeting (`target-cpu=native`) for SIMD optimizations. On Apple Silicon (M1–M5), this provides ~1.6x faster extraction via NEON SIMD instructions. Always use `--release` for production workloads.
 
 ## Performance
 
@@ -38,15 +38,15 @@ cargo build --release
 | Stage | Configuration | Time | Speedup |
 |-------|--------------|------|---------|
 | Extraction | Single shard (`--csv-shards 1`) | ~4.5 hours | 1x baseline |
-| Extraction | 8 shards (`--csv-shards 8`) | ~2.8 hours | **1.62x faster** |
-| Merge | After 8-shard extraction | <5 minutes | minimal overhead |
+| Extraction | 14 shards (`--csv-shards 14`) | ~2.8 hours | **1.62x faster** |
+| Merge | After 14-shard extraction | <5 minutes | minimal overhead |
 | Import (neo4j-admin) | Bulk import (merged CSVs) | ~15-20 minutes | **10-100x vs Bolt** |
 | Import (Bolt) | LOAD CSV via Bolt protocol | 4-6 hours | 1x baseline |
 
-**Recommended workflow**: Extract with 8 shards → Merge → neo4j-admin import for best overall performance.
+**Recommended workflow**: Extract with 14 shards → Merge → neo4j-admin import for best overall performance.
 
 **Hardware recommendations**:
-- **CPU**: 8+ cores for parallel extraction (rayon scales well)
+- **CPU**: 8+ cores for parallel extraction (rayon scales well; 14+ cores on M5 Max)
 - **RAM**: 16GB minimum (32GB+ recommended for full Wikipedia)
 - **Storage**: SSD strongly recommended (CSV writes are I/O intensive)
 - **Platform**: Apple Silicon benefits from NEON SIMD optimizations
@@ -58,7 +58,7 @@ cargo build --release
 The easiest way to run the full pipeline:
 
 ```bash
-# Full hybrid pipeline (extract 8 shards → merge → admin import)
+# Full hybrid pipeline (extract 14 shards → merge → admin import)
 make pipeline WIKI_DUMP=enwiki-latest-pages-articles.xml.bz2
 
 # Test with limited pages
@@ -74,7 +74,7 @@ make help
 **Makefile Configuration Variables**:
 - `WIKI_DUMP` -- Path to Wikipedia dump (default: `enwiki-latest-pages-articles.xml.bz2`)
 - `OUTPUT_DIR` -- Output directory (default: `output`)
-- `CSV_SHARDS` -- Number of CSV shards for parallel extraction (default: `8`)
+- `CSV_SHARDS` -- Number of CSV shards for parallel extraction (default: `14`)
 - `SHARD_COUNT` -- Number of JSON blob shards (default: `1000`)
 - `LIMIT` -- Cap pages processed for testing (default: none)
 - `VERBOSE` -- Verbosity level (default: `-v` for INFO)
@@ -97,8 +97,8 @@ dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 
 dedalus import -o output/ --admin-import
 
 # Hybrid workflow for optimal performance (fast extraction + fast import)
-# Step 1: Fast extraction with 8 shards (1.62x speedup)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 8 -v
+# Step 1: Fast extraction with 14 shards (1.62x speedup)
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 14 -v
 
 # Step 2: Merge CSVs (deduplicates categories/images/external links, <5 min overhead)
 dedalus merge-csvs -o output/
@@ -128,7 +128,7 @@ dedalus extract -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 | `-i, --input <PATH>` | Path to Wikipedia dump file (`.xml.bz2`) | required |
 | `-o, --output <DIR>` | Output directory for generated files | required |
 | `--shard-count <N>` | Number of shards for blob storage | `1000` |
-| `--csv-shards <N>` | Number of CSV output shards for parallel extraction (8 recommended for performance) | `8` |
+| `--csv-shards <N>` | Number of CSV output shards for parallel extraction (match to core count) | `8` |
 | `--limit <N>` | Limit pages processed (useful for testing) | none |
 | `--dry-run` | Run pipeline without writing output files | `false` |
 | `--resume` | Resume from last checkpoint if available | `false` |
@@ -190,7 +190,7 @@ dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ -v
 dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
 
 # Extract with CSV sharding for parallel extraction
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 8 -v
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 14 -v
 
 # Merge sharded CSVs for neo4j-admin import
 dedalus merge-csvs -o output/
@@ -331,7 +331,7 @@ cargo clippy -- -D warnings    # Lint with strict warnings
 
 **Slow extraction performance**:
 - Ensure you're using `cargo build --release` (debug builds are 10-50x slower)
-- Use `--csv-shards 8` for 1.62x speedup on multi-core systems
+- Use `--csv-shards 14` for 1.62x speedup on multi-core systems
 - Check if `lbzip2` or `pbzip2` is available for parallel decompression (`which lbzip2`)
 - On Apple Silicon, verify `.cargo/config.toml` has `target-cpu=native` for SIMD optimizations
 
@@ -401,7 +401,7 @@ RETURN a.title;
 
 ### Performance Tips
 
-1. **Fastest workflow**: `--csv-shards 8` → `merge-csvs` → `--admin-import`
+1. **Fastest workflow**: `--csv-shards 14` → `merge-csvs` → `--admin-import`
 2. **Use SSD storage**: CSV writes are I/O intensive
 3. **Parallel decompression**: Install `lbzip2` for faster XML parsing
 4. **Apple Silicon**: Automatic NEON SIMD optimization (1.6x faster)
@@ -410,4 +410,4 @@ RETURN a.title;
 
 ## License
 
-BSD 3-Clause License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
