@@ -33,7 +33,7 @@
 
 use bzip2::write::BzEncoder;
 use bzip2::Compression;
-use dedalus::extract::run_extraction;
+use dedalus::extract::{run_extraction, ExtractionConfig};
 use dedalus::index::WikiIndex;
 use dedalus::models::{ArticleBlob, PageType};
 use dedalus::parser::WikiReader;
@@ -135,6 +135,29 @@ Some refs.
             </revision>
         </page>
     </mediawiki>"#
+}
+
+/// Helper to build an ExtractionConfig with common defaults.
+fn make_config<'a>(
+    input_path: &'a str,
+    output_dir: &'a str,
+    index: &'a WikiIndex,
+    csv_shards: u32,
+    limit: Option<u64>,
+    dry_run: bool,
+) -> ExtractionConfig<'a> {
+    ExtractionConfig {
+        input_path,
+        output_dir,
+        index,
+        shard_count: 1000,
+        csv_shards,
+        limit,
+        dry_run,
+        resume_from: None,
+        checkpoint_mgr: None,
+        multistream_ranges: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,19 +271,15 @@ fn extraction_produces_csv_files() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Should have processed the 2 articles (not redirects/special)
     assert_eq!(stats.articles(), 2);
@@ -291,19 +310,15 @@ fn extraction_creates_edges() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Rust -> Python is a valid edge (both exist in index)
     // Python -> Rust is a valid edge
@@ -319,19 +334,15 @@ fn extraction_writes_json_blobs() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     assert!(stats.blobs() >= 1);
 
@@ -358,19 +369,15 @@ fn extraction_dry_run_writes_no_files() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
-        true, // dry_run
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+        true,
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Stats should still be collected
     assert_eq!(stats.articles(), 2);
@@ -387,19 +394,15 @@ fn extraction_respects_limit() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
-        Some(1), // limit to 1 page
+        Some(1),
         true,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // With limit=1, at most 1 article should be processed
     // (the limit applies to all page types seen, not just articles)
@@ -412,19 +415,15 @@ fn nodes_csv_format_is_neo4j_compatible() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    run_extraction(&config).unwrap();
 
     let nodes_path = output_dir.path().join("nodes.csv");
     let mut rdr = csv::Reader::from_path(&nodes_path).unwrap();
@@ -451,19 +450,15 @@ fn edges_csv_format_is_neo4j_compatible() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    run_extraction(&config).unwrap();
 
     let edges_path = output_dir.path().join("edges.csv");
     let mut rdr = csv::Reader::from_path(&edges_path).unwrap();
@@ -498,19 +493,15 @@ fn extraction_produces_category_files() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // categories.csv should exist with correct headers
     let cats_path = output_dir.path().join("categories.csv");
@@ -541,19 +532,15 @@ fn extraction_produces_images_csv() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Check image nodes file
     let image_nodes_path = output_dir.path().join("image_nodes.csv");
@@ -580,19 +567,15 @@ fn extraction_produces_external_links_csv() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Check external link nodes file
     let extlink_nodes_path = output_dir.path().join("external_link_nodes.csv");
@@ -619,19 +602,15 @@ fn blob_contains_enriched_data() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    run_extraction(&config).unwrap();
 
     let shard = 1 % 1000;
     let blob_path = output_dir.path().join(format!("blobs/{:03}/1.json", shard));
@@ -668,19 +647,15 @@ fn extraction_finds_see_also_edges() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     // Rust has a "See also" section with Python
     assert!(stats.see_also_edges() >= 1);
@@ -697,27 +672,19 @@ fn edges_exclude_namespace_links() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
         1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    run_extraction(&config).unwrap();
 
     // edges.csv should not contain Category: or File: links
     let edges_path = output_dir.path().join("edges.csv");
     let content = std::fs::read_to_string(&edges_path).unwrap();
-    // Category links would show up as numeric IDs if resolved, but they can't
-    // resolve since Category: pages are Special. More importantly, they should
-    // be skipped by the namespace filter, not counted as invalid links.
-    // Just verify the file is parseable and only has valid edge types.
     let mut rdr = csv::Reader::from_reader(content.as_bytes());
     for record in rdr.records() {
         let record = record.unwrap();
@@ -740,19 +707,15 @@ fn sharded_csv_produces_numbered_files() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    let stats = run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
-        4, // csv_shards
+        4,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    let stats = run_extraction(&config).unwrap();
 
     assert_eq!(stats.articles(), 2);
 
@@ -801,19 +764,15 @@ fn single_csv_shard_produces_original_filenames() {
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
 
-    run_extraction(
+    let config = make_config(
         tmp.path().to_str().unwrap(),
         output_dir.path().to_str().unwrap(),
         &index,
-        1000,
-        1, // csv_shards = 1 (default)
+        1,
         None,
         false,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    );
+    run_extraction(&config).unwrap();
 
     // With csv_shards=1, should produce original filenames
     assert!(output_dir.path().join("nodes.csv").exists());

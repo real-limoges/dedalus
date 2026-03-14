@@ -1,3 +1,8 @@
+//! Extraction checkpoint management for resumable processing.
+//!
+//! `CheckpointManager` uses double-checked locking for periodic saves with
+//! atomic write-via-rename for crash safety. Cleared on successful completion.
+
 use crate::config::CHECKPOINT_VERSION;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
@@ -11,7 +16,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// Serializable snapshot of extraction counters for checkpoint persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointStats {
     pub articles_processed: u64,
     pub edges_extracted: u64,
@@ -25,7 +31,8 @@ pub struct CheckpointStats {
     pub external_links_found: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+/// A saved extraction checkpoint for resume support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub version: u32,
     pub input_path: String,
@@ -37,6 +44,8 @@ pub struct Checkpoint {
     pub stats: CheckpointStats,
 }
 
+/// Returns the path to the checkpoint file for a given output directory.
+#[must_use]
 pub fn checkpoint_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("checkpoint.bin")
 }
@@ -53,6 +62,7 @@ fn get_input_mtime(input_path: &str) -> Result<u64> {
     Ok(mtime)
 }
 
+/// Loads a checkpoint if it exists and matches the current extraction parameters.
 pub fn load_if_valid(
     input_path: &str,
     output_dir: &str,
@@ -68,7 +78,7 @@ pub fn load_if_valid(
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(&path).context("Failed to open checkpoint file")?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
+    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
@@ -144,6 +154,7 @@ pub fn load_if_valid(
     Ok(Some(checkpoint))
 }
 
+/// Removes the checkpoint file for the given output directory.
 pub fn clear(output_dir: &str) -> Result<()> {
     let path = checkpoint_path(output_dir);
     if path.exists() {
@@ -154,6 +165,7 @@ pub fn clear(output_dir: &str) -> Result<()> {
     Ok(())
 }
 
+/// Manages periodic checkpoint saves during extraction.
 pub struct CheckpointManager {
     checkpoint_path: PathBuf,
     input_path: String,
@@ -165,6 +177,16 @@ pub struct CheckpointManager {
     last_saved_id: AtomicU32,
     pages_since_save: AtomicU32,
     save_lock: Mutex<()>,
+}
+
+impl std::fmt::Debug for CheckpointManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckpointManager")
+            .field("checkpoint_path", &self.checkpoint_path)
+            .field("interval", &self.interval)
+            .field("last_saved_id", &self.last_saved_id.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl CheckpointManager {
@@ -190,6 +212,7 @@ impl CheckpointManager {
         })
     }
 
+    /// Sets the last saved page ID (used when resuming from an existing checkpoint).
     pub fn set_last_id(&self, id: u32) {
         self.last_saved_id.store(id, Ordering::Relaxed);
     }
@@ -220,6 +243,7 @@ impl CheckpointManager {
         Ok(false)
     }
 
+    /// Writes the current extraction state to disk atomically via `.tmp` + rename.
     pub fn save(&self, page_id: u32, stats: &ExtractionStats) -> Result<()> {
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
@@ -264,6 +288,7 @@ impl CheckpointManager {
         Ok(())
     }
 
+    /// Removes the checkpoint file (called after successful extraction).
     pub fn clear(&self) -> Result<()> {
         clear(&self.output_dir)
     }

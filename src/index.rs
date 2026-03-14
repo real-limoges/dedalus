@@ -1,3 +1,9 @@
+//! In-memory title-to-ID index with redirect chain resolution.
+//!
+//! `WikiIndex` wraps pre-sized `FxHashMap`s (8M articles, 10M redirects) for
+//! fast lookup of page IDs by title. Follows redirect chains up to 5 hops.
+//! Supports both sequential and multistream parallel index building.
+
 use crate::config::{PROGRESS_INTERVAL, REDIRECT_MAX_DEPTH};
 use crate::models::PageType;
 use crate::multistream::StreamRange;
@@ -9,17 +15,32 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info};
 
+/// In-memory title-to-ID index with redirect resolution.
 pub struct WikiIndex {
     title_to_id: FxHashMap<String, u32>,
     redirects: FxHashMap<String, String>,
 }
 
+impl std::fmt::Debug for WikiIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WikiIndex")
+            .field("articles", &self.title_to_id.len())
+            .field("redirects", &self.redirects.len())
+            .finish()
+    }
+}
+
 impl WikiIndex {
+    /// Builds the index by streaming through the dump in skip-text mode.
     pub fn build(path: &str) -> Result<Self> {
-        let mut title_to_id: FxHashMap<String, u32> =
-            FxHashMap::with_capacity_and_hasher(8_000_000, Default::default());
-        let mut redirects: FxHashMap<String, String> =
-            FxHashMap::with_capacity_and_hasher(10_000_000, Default::default());
+        let mut title_to_id: FxHashMap<String, u32> = FxHashMap::with_capacity_and_hasher(
+            crate::config::INDEX_INITIAL_ARTICLES,
+            Default::default(),
+        );
+        let mut redirects: FxHashMap<String, String> = FxHashMap::with_capacity_and_hasher(
+            crate::config::INDEX_INITIAL_REDIRECTS,
+            Default::default(),
+        );
         let reader = WikiReader::new(path, true)
             .with_context(|| format!("Failed to open wiki dump at: {}", path))?
             .skip_timestamp(true);
@@ -27,7 +48,7 @@ impl WikiIndex {
         pb.set_style(
             indicatif::ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
-                .unwrap(),
+                .expect("valid progress template"),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -147,10 +168,13 @@ impl WikiIndex {
         })
     }
 
+    /// Returns references to the underlying title-to-ID and redirect maps.
+    #[must_use]
     pub fn maps(&self) -> (&FxHashMap<String, u32>, &FxHashMap<String, String>) {
         (&self.title_to_id, &self.redirects)
     }
 
+    /// Constructs an index from pre-built maps (e.g. deserialized from cache).
     pub fn from_maps(
         title_to_id: FxHashMap<String, u32>,
         redirects: FxHashMap<String, String>,
@@ -188,10 +212,14 @@ impl WikiIndex {
         }
     }
 
+    /// Returns (article_count, redirect_count).
+    #[must_use]
     pub fn stats(&self) -> (usize, usize) {
         (self.title_to_id.len(), self.redirects.len())
     }
 
+    /// Resolves a page title to its numeric ID, following redirect chains.
+    #[must_use]
     pub fn resolve_id(&self, title: &str) -> Option<u32> {
         let mut current = title;
         let mut depth = 0;

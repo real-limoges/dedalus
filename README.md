@@ -24,7 +24,7 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 
 ## Building
 
-Requires Rust 1.70+ (stable).
+Requires Rust 1.87+ (stable).
 
 ```bash
 cargo build --release
@@ -55,44 +55,6 @@ cargo build --release
 - **Platform**: Apple Silicon benefits from NEON SIMD optimizations
 
 ## Quick Start
-
-### Using Makefile (Recommended)
-
-The easiest way to run the full pipeline:
-
-```bash
-# Full hybrid pipeline (extract 14 shards → merge → admin import)
-make pipeline WIKI_DUMP=enwiki-latest-pages-articles.xml.bz2
-
-# Test with limited pages
-make test-pipeline WIKI_DUMP=small-dump.xml.bz2 LIMIT=10000
-
-# Standard pipeline (single shard, no merge step)
-make standard-pipeline WIKI_DUMP=enwiki-latest-pages-articles.xml.bz2
-
-# See all options
-make help
-```
-
-**Makefile Configuration Variables**:
-- `WIKI_DUMP` -- Path to Wikipedia dump (default: `enwiki-latest-pages-articles.xml.bz2`)
-- `OUTPUT_DIR` -- Output directory (default: `output`)
-- `CSV_SHARDS` -- Number of CSV shards for parallel extraction (default: `14`)
-- `SHARD_COUNT` -- Number of JSON blob shards (default: `1000`)
-- `LIMIT` -- Cap pages processed for testing (default: none)
-- `VERBOSE` -- Verbosity level (default: `-v` for INFO)
-
-**Common Makefile Targets**:
-- `make extract` -- Run extraction only
-- `make merge` -- Merge sharded CSVs (auto-skips if single shard)
-- `make import` -- Run import only (uses --admin-import)
-- `make resume` -- Resume interrupted extraction
-- `make clean-extract` -- Clear extraction output and start fresh
-- `make clean-import` -- Import with clean Neo4j slate
-- `make bolt-import` -- Import via Bolt instead of admin tool
-- `make stats` -- Show output directory statistics
-
-### Manual Commands
 
 ```bash
 # Standard workflow (single shard)
@@ -176,7 +138,7 @@ dedalus merge-csvs -o <output-dir>
 |------|-------------|---------|
 | `-o, --output <DIR>` | Directory containing sharded CSVs (e.g., `nodes_000.csv`) | required |
 
-**Note**: When using the Makefile (`make merge` or `make pipeline`), sharded CSV files are automatically archived to a `shards/` subdirectory after merging to prevent import confusion. This preserves the original sharded files while keeping only merged files in the main output directory.
+**Note**: When using `dedalus pipeline`, sharded CSV files are automatically archived to a `shards/` subdirectory after merging to prevent import confusion. Use `--no-archive` to skip this. This preserves the original sharded files while keeping only merged files in the main output directory.
 
 ### Global flags
 
@@ -317,18 +279,6 @@ IMPORT_DIR=./output docker compose -f neo4j-platform/docker-compose.yml up -d
 The `IMPORT_DIR` environment variable controls which host directory is mounted at `/import` inside the container.
 
 ## Development
-
-### Using Makefile
-
-```bash
-make build                     # Build release binary
-make test                      # Run tests + clippy + format check
-make clean                     # Clean build artifacts
-make clean-output              # Clean output directory
-make clean-all                 # Clean everything
-```
-
-### Manual Commands
 
 ```bash
 cargo build --release          # Build optimized binary

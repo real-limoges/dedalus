@@ -1,6 +1,14 @@
+//! Core data types for the extraction pipeline.
+//!
+//! Defines `WikiPage` (parsed from XML), `PageType` (Article/Redirect/Special),
+//! `EdgeType` (LinksTo/SeeAlso), and `ArticleBlob` (enriched JSON output with
+//! conditional serialization for compact storage).
+
 use crate::infobox::Infobox;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
+/// The type of a Wikipedia page parsed from a dump.
 #[derive(Debug, Clone)]
 pub enum PageType {
     Article,
@@ -8,6 +16,17 @@ pub enum PageType {
     Special,
 }
 
+impl fmt::Display for PageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PageType::Article => f.write_str("Article"),
+            PageType::Redirect(target) => write!(f, "Redirect({})", target),
+            PageType::Special => f.write_str("Special"),
+        }
+    }
+}
+
+/// A single page extracted from a Wikipedia XML dump.
 #[derive(Debug, Clone)]
 pub struct WikiPage {
     pub id: u32,
@@ -21,11 +40,28 @@ pub struct WikiPage {
     pub timestamp: Option<String>,
 }
 
+/// Type of edge between two Wikipedia articles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EdgeType {
+    LinksTo,
+    SeeAlso,
+}
+
+impl fmt::Display for EdgeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EdgeType::LinksTo => f.write_str("LINKS_TO"),
+            EdgeType::SeeAlso => f.write_str("SEE_ALSO"),
+        }
+    }
+}
+
 fn is_false(v: &bool) -> bool {
     !*v
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+/// Enriched article content written as a JSON blob per article.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ArticleBlob {
     pub id: u32,
     pub title: String,

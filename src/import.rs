@@ -1,3 +1,9 @@
+//! Neo4j import pipeline with two modes.
+//!
+//! `--admin-import` uses `neo4j-admin database import` for 10-100x faster bulk
+//! loading. The default Bolt mode uses `neo4rs` with `LOAD CSV` and throttled
+//! `FuturesUnordered` parallelism. Both modes manage Docker lifecycle automatically.
+
 use crate::config;
 use anyhow::{bail, Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -53,17 +59,49 @@ CALL { WITH row
     CREATE (p)-[:HAS_LINK]->(e)
 } IN TRANSACTIONS OF 50000 ROWS;"#;
 
-const CSV_TYPES: &[&str] = &[
-    "nodes",
-    "edges",
-    "categories",
-    "article_categories",
-    "image_nodes",
-    "article_images",
-    "external_link_nodes",
-    "article_external_links",
-];
+/// A type of CSV file produced by extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvType {
+    Nodes,
+    Edges,
+    Categories,
+    ArticleCategories,
+    ImageNodes,
+    ArticleImages,
+    ExternalLinkNodes,
+    ArticleExternalLinks,
+}
 
+impl CsvType {
+    /// All CSV types in import order.
+    pub const ALL: &[Self] = &[
+        Self::Nodes,
+        Self::Edges,
+        Self::Categories,
+        Self::ArticleCategories,
+        Self::ImageNodes,
+        Self::ArticleImages,
+        Self::ExternalLinkNodes,
+        Self::ArticleExternalLinks,
+    ];
+
+    /// The base filename (without shard suffix or `.csv` extension).
+    pub fn base_name(self) -> &'static str {
+        match self {
+            Self::Nodes => "nodes",
+            Self::Edges => "edges",
+            Self::Categories => "categories",
+            Self::ArticleCategories => "article_categories",
+            Self::ImageNodes => "image_nodes",
+            Self::ArticleImages => "article_images",
+            Self::ExternalLinkNodes => "external_link_nodes",
+            Self::ArticleExternalLinks => "article_external_links",
+        }
+    }
+}
+
+/// Configuration for the Neo4j import step.
+#[derive(Debug, Clone)]
 pub struct ImportConfig {
     pub output_dir: String,
     pub bolt_uri: String,
@@ -76,17 +114,34 @@ pub struct ImportConfig {
     pub use_admin_import: bool,
 }
 
-#[derive(Debug)]
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: String::new(),
+            bolt_uri: config::DEFAULT_BOLT_URI.to_string(),
+            import_prefix: config::DEFAULT_IMPORT_PREFIX.to_string(),
+            max_parallel_edges: config::IMPORT_MAX_PARALLEL_EDGES,
+            max_parallel_light: config::IMPORT_MAX_PARALLEL_LIGHT,
+            compose_file: None,
+            no_docker: false,
+            clean: false,
+            use_admin_import: false,
+        }
+    }
+}
+
+/// Whether CSV output is a single file per type or sharded across N files.
+#[derive(Debug, Clone)]
 enum CsvLayout {
     Single,
     Sharded { count: u32 },
 }
 
-impl CsvLayout {
-    fn description(&self) -> String {
+impl std::fmt::Display for CsvLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CsvLayout::Single => "single-file".to_string(),
-            CsvLayout::Sharded { count } => format!("sharded ({count} shards)"),
+            CsvLayout::Single => f.write_str("single-file"),
+            CsvLayout::Sharded { count } => write!(f, "sharded ({count} shards)"),
         }
     }
 }
@@ -126,7 +181,7 @@ async fn run_admin_import(
     println!();
 
     // Ensure Neo4j is stopped and containers are down
-    println!("==> Stopping and removing Neo4j containers ...");
+    info!("Stopping and removing Neo4j containers");
     let down_output = Command::new("docker")
         .args(["compose", "-f", compose_file, "down"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -137,11 +192,10 @@ async fn run_admin_import(
     if !down_output.status.success() {
         warn!("docker compose down had non-zero exit");
     }
-    println!("    Containers stopped and removed.");
+    info!("Containers stopped and removed");
 
     // Build neo4j-admin import command
-    println!();
-    println!("==> Building import command ...");
+    info!("Building neo4j-admin import command");
 
     let node_files = csv_files_for("nodes", layout);
     let cat_files = csv_files_for("categories", layout);
@@ -227,16 +281,10 @@ async fn run_admin_import(
         + artcat_files.len()
         + artimg_files.len()
         + artextlink_files.len();
-    println!(
-        "    Command prepared ({} files for bulk import)",
-        total_files
-    );
+    info!(files = total_files, "Import command prepared");
 
     // Run neo4j-admin import
-    println!();
-    println!("==> Running neo4j-admin database import ...");
-    println!("    This may take 5-15 minutes for full Wikipedia dump");
-    println!();
+    info!("Running neo4j-admin database import (may take 5-15 minutes)");
 
     let import_output = Command::new("docker")
         .args(&import_args)
@@ -254,7 +302,7 @@ async fn run_admin_import(
     println!("{}", stdout);
 
     // Start Neo4j with imported data
-    println!("==> Starting Neo4j with imported data ...");
+    info!("Starting Neo4j with imported data");
     let start_output = Command::new("docker")
         .args(["compose", "-f", compose_file, "up", "-d"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -266,17 +314,15 @@ async fn run_admin_import(
         let stderr = String::from_utf8_lossy(&start_output.stderr);
         bail!("Failed to start Neo4j after import:\n{}", stderr);
     }
-    println!("    Neo4j started.");
+    info!("Neo4j started");
 
     // Wait for Neo4j to be ready
-    println!();
-    println!("==> Waiting for Neo4j to be ready ...");
+    info!("Waiting for Neo4j to be ready");
     let graph = connect_with_retry(config).await?;
-    println!("    Neo4j ready.");
+    info!("Neo4j ready");
 
     // Create post-import indexes for query performance
-    println!();
-    println!("==> Creating indexes and constraints ...");
+    info!("Creating indexes and constraints");
     run_cypher(
         &graph,
         "CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);",
@@ -297,7 +343,7 @@ async fn run_admin_import(
         "CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);",
     )
     .await?;
-    println!("    Indexes and constraints created.");
+    info!("Indexes and constraints created");
 
     // Get final counts
     let page_count = query_count(&graph, "MATCH (p:Page) RETURN count(p) AS cnt").await?;
@@ -332,6 +378,7 @@ async fn run_admin_import(
     Ok(())
 }
 
+/// Loads extracted CSV files into Neo4j using either admin bulk import or Bolt protocol.
 pub async fn run_import(mut config: ImportConfig) -> Result<()> {
     let start = Instant::now();
 
@@ -343,8 +390,7 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
 
     let layout = detect_csv_layout(&config.output_dir)?;
     validate_csv_files(&config.output_dir, &layout)?;
-    println!();
-    println!("==> Detected {} CSV layout", layout.description());
+    info!("Detected {} CSV layout", layout);
 
     if !config.no_docker {
         let compose_file = resolve_compose_file(&config)?;
@@ -359,10 +405,9 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
         bail!("--admin-import requires Docker (cannot use with --no-docker)");
     }
 
-    println!();
-    println!("==> Connecting to Neo4j at {} ...", config.bolt_uri);
+    info!("Connecting to Neo4j at {}", config.bolt_uri);
     let graph = connect_with_retry(&config).await?;
-    println!("    Connected.");
+    info!("Connected to Neo4j");
 
     let mp = MultiProgress::new();
 
@@ -584,15 +629,13 @@ fn detect_csv_layout(output_dir: &str) -> Result<CsvLayout> {
     let single_path = Path::new(output_dir).join("nodes.csv");
 
     if sharded_path.exists() {
-        let mut count = 0u32;
-        loop {
-            let p = Path::new(output_dir).join(format!("nodes_{count:03}.csv"));
-            if p.exists() {
-                count += 1;
-            } else {
-                break;
-            }
-        }
+        let count = (0u32..)
+            .take_while(|&i| {
+                Path::new(output_dir)
+                    .join(format!("nodes_{i:03}.csv"))
+                    .exists()
+            })
+            .count() as u32;
         if count == 0 {
             bail!("Found nodes_000.csv but could not count shards");
         }
@@ -617,8 +660,8 @@ fn csv_files_for(base_name: &str, layout: &CsvLayout) -> Vec<String> {
 }
 
 fn validate_csv_files(output_dir: &str, layout: &CsvLayout) -> Result<()> {
-    for base in CSV_TYPES {
-        let files = csv_files_for(base, layout);
+    for csv_type in CsvType::ALL {
+        let files = csv_files_for(csv_type.base_name(), layout);
         for file in &files {
             let path = Path::new(output_dir).join(file);
             if !path.exists() {
@@ -667,8 +710,7 @@ fn resolve_compose_file(config: &ImportConfig) -> Result<String> {
 
 async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
     if config.clean {
-        println!();
-        println!("==> Cleaning up previous Neo4j instance ...");
+        info!("Cleaning up previous Neo4j instance");
         let status = Command::new("docker")
             .args(["compose", "-f", compose_file, "down", "-v"])
             .env("IMPORT_DIR", &config.output_dir)
@@ -680,8 +722,7 @@ async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
         }
     }
 
-    println!();
-    println!("==> Starting Neo4j ...");
+    info!("Starting Neo4j");
     let output = Command::new("docker")
         .args(["compose", "-f", compose_file, "up", "-d"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -693,7 +734,7 @@ async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("docker compose up failed:\n{stderr}");
     }
-    println!("    Docker containers started.");
+    info!("Docker containers started");
 
     Ok(())
 }
@@ -818,7 +859,7 @@ async fn load_csv_files(
             Err(e) => {
                 failed += 1;
                 warn!(file = %file_name, error = %e, "LOAD CSV failed");
-                eprintln!("    FAILED: {file_name}: {e}");
+                // warn! already emitted above with structured fields
             }
         }
         pb.inc(1);
@@ -848,7 +889,7 @@ fn make_spinner(msg: &str) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.cyan} {msg}")
-            .unwrap(),
+            .expect("valid progress template"),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message(msg.to_string());
@@ -862,7 +903,7 @@ fn make_progress_bar(total: u64, label: &str) -> ProgressBar {
             .template(&format!(
                 "    {{spinner:.cyan}} {label:<14} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} shards"
             ))
-            .unwrap()
+            .expect("valid progress template")
             .progress_chars("=> "),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -877,8 +918,9 @@ mod tests {
     #[test]
     fn detect_layout_single() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
-            std::fs::write(dir.path().join(format!("{base}.csv")), "header\n").unwrap();
+        for csv_type in CsvType::ALL {
+            let name = format!("{}.csv", csv_type.base_name());
+            std::fs::write(dir.path().join(name), "header\n").unwrap();
         }
         let layout = detect_csv_layout(dir.path().to_str().unwrap()).unwrap();
         assert!(matches!(layout, CsvLayout::Single));
@@ -887,13 +929,10 @@ mod tests {
     #[test]
     fn detect_layout_sharded() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
+        for csv_type in CsvType::ALL {
             for shard in 0..4u32 {
-                std::fs::write(
-                    dir.path().join(format!("{base}_{shard:03}.csv")),
-                    "header\n",
-                )
-                .unwrap();
+                let name = format!("{}_{shard:03}.csv", csv_type.base_name());
+                std::fs::write(dir.path().join(name), "header\n").unwrap();
             }
         }
         let layout = detect_csv_layout(dir.path().to_str().unwrap()).unwrap();
@@ -926,8 +965,9 @@ mod tests {
     #[test]
     fn validate_csv_files_ok() {
         let dir = TempDir::new().unwrap();
-        for base in CSV_TYPES {
-            std::fs::write(dir.path().join(format!("{base}.csv")), "header\n").unwrap();
+        for csv_type in CsvType::ALL {
+            let name = format!("{}.csv", csv_type.base_name());
+            std::fs::write(dir.path().join(name), "header\n").unwrap();
         }
         let layout = CsvLayout::Single;
         assert!(validate_csv_files(dir.path().to_str().unwrap(), &layout).is_ok());

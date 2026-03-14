@@ -1,3 +1,9 @@
+//! Index persistence using `bincode` serialization.
+//!
+//! Saves and loads `WikiIndex` as `index.cache`, validating against input file
+//! mtime and size. Uses zero-copy serialization via `IndexCacheSer` to avoid
+//! cloning ~17M strings during writes.
+
 use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
 use anyhow::{bail, Context, Result};
@@ -10,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{info, warn};
 
+/// Metadata stored alongside the cached index for staleness validation.
 #[derive(Serialize, Deserialize)]
 pub struct CacheMetadata {
     pub version: u32,
@@ -35,6 +42,8 @@ struct IndexCacheSer<'a> {
     redirects: &'a FxHashMap<String, String>,
 }
 
+/// Returns the path to the index cache file for a given output directory.
+#[must_use]
 pub fn cache_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("index.cache")
 }
@@ -61,7 +70,7 @@ pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<Wiki
     let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
 
     let file = File::open(cache_path).context("Failed to open cache file")?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
+    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
@@ -160,6 +169,7 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     Ok(())
 }
 
+/// Returns `true` if the cache exists and matches the current input file.
 pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
     Ok(try_load_index(cache_path, input_path)?.is_some())
 }
@@ -174,7 +184,7 @@ pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
 
     let file = File::open(cache_path)
         .with_context(|| format!("Failed to open cache file: {:?}", cache_path))?;
-    let reader = BufReader::with_capacity(256 * 1024, file);
+    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
 
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 

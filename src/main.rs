@@ -1,3 +1,9 @@
+//! CLI entry point for the Dedalus pipeline.
+//!
+//! Uses `clap` subcommands to orchestrate extract, import, merge-csvs, pipeline,
+//! stats, and tui operations. Initializes `tracing` logging with configurable
+//! verbosity and uses `mimalloc` as the global allocator.
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use dedalus::cache;
@@ -240,11 +246,9 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         .or_else(|| dedalus::multistream::detect_index_path(&args.input));
 
     let multistream_ranges = if let Some(ref idx_path) = multistream_index_path {
-        println!("==> Using multistream parallel parsing");
-        println!("    Index: {}", idx_path);
+        info!(index = %idx_path, "Using multistream parallel parsing");
         let ranges = dedalus::multistream::parse_multistream_index(idx_path, &args.input)?;
-        println!("    Streams: {}", ranges.len());
-        println!();
+        info!(streams = ranges.len(), "Multistream index parsed");
         Some(ranges)
     } else {
         None
@@ -331,18 +335,19 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
 
     info!("Starting extraction pass");
     let start_extracting = Instant::now();
-    let stats = dedalus::extract::run_extraction(
-        &args.input,
-        &args.output,
-        &index,
-        args.shard_count,
-        args.csv_shards,
-        args.limit,
-        args.dry_run,
-        checkpoint.as_ref(),
-        checkpoint_mgr.as_ref(),
-        multistream_ranges.as_deref(),
-    )?;
+    let extraction_config = dedalus::extract::ExtractionConfig {
+        input_path: &args.input,
+        output_dir: &args.output,
+        index: &index,
+        shard_count: args.shard_count,
+        csv_shards: args.csv_shards,
+        limit: args.limit,
+        dry_run: args.dry_run,
+        resume_from: checkpoint.as_ref(),
+        checkpoint_mgr: checkpoint_mgr.as_ref(),
+        multistream_ranges: multistream_ranges.as_deref(),
+    };
+    let stats = dedalus::extract::run_extraction(&extraction_config)?;
     let extraction_duration = start_extracting.elapsed();
     info!(
         duration_secs = extraction_duration.as_secs_f64(),
@@ -691,7 +696,6 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             error!("Error: {:#}", e);
-            eprintln!("Error: {:#}", e);
             ExitCode::FAILURE
         }
     }

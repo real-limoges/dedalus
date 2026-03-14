@@ -1,3 +1,9 @@
+//! Streaming XML parser with BZ2 decompression.
+//!
+//! `PageParser<R>` implements `Iterator<Item = WikiPage>` over any `Read` source
+//! using a state machine over `quick-xml` events. `WikiReader` wraps it with BZ2
+//! decompression, probing PATH for `lbzip2`/`pbzip2` for parallel decompression.
+
 use crate::models::{PageType, WikiPage};
 use anyhow::{Context, Result};
 use bzip2::read::MultiBzDecoder;
@@ -47,7 +53,7 @@ impl<R: Read> PageParser<R> {
         xml_reader.trim_text(true);
         Self {
             reader: xml_reader,
-            buf: Vec::with_capacity(256 * 1024),
+            buf: Vec::with_capacity(crate::config::BUFREADER_CAPACITY),
             skip_text,
             skip_timestamp: false,
         }
@@ -173,10 +179,10 @@ impl<R: Read> Iterator for PageParser<R> {
                 },
                 Ok(Event::Eof) => return None,
                 Err(e) => {
-                    eprintln!(
-                        "XML Parse Error at position {}: {:?}",
-                        self.reader.buffer_position(),
-                        e
+                    warn!(
+                        position = self.reader.buffer_position(),
+                        error = ?e,
+                        "XML parse error"
                     );
                     return None;
                 }
@@ -187,6 +193,10 @@ impl<R: Read> Iterator for PageParser<R> {
     }
 }
 
+/// High-level Wikipedia dump reader with automatic BZ2 decompression.
+///
+/// Probes PATH for `lbzip2`/`pbzip2` for parallel decompression; falls back
+/// to in-process `MultiBzDecoder`. Implements `Iterator<Item = WikiPage>`.
 pub struct WikiReader {
     parser: PageParser<DecompressSource>,
     _child: Option<Child>,

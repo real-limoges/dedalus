@@ -1,3 +1,9 @@
+//! Regex-based text extraction from Wikipedia article wikitext.
+//!
+//! Provides functions for extracting abstracts, section headings, see-also links,
+//! categories, images, external links, and disambiguation detection. Uses
+//! SIMD-accelerated `memchr` for fast template stripping.
+
 use memchr::memchr2;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -28,6 +34,7 @@ pub static LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
 
 /// Returns the lead section (before the first `==` heading) with templates stripped.
+#[must_use]
 pub fn extract_abstract(text: &str) -> String {
     // Strip templates first so headings inside {{Infobox ...}} don't truncate the lead.
     let stripped = strip_templates(text);
@@ -51,6 +58,8 @@ pub fn extract_abstract(text: &str) -> String {
     result
 }
 
+/// Extracts section heading names from the article text.
+#[must_use]
 pub fn extract_sections(text: &str) -> Vec<String> {
     SECTION_REGEX
         .captures_iter(text)
@@ -58,6 +67,8 @@ pub fn extract_sections(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extracts wiki-link targets from the "See also" section.
+#[must_use]
 pub fn extract_see_also_links(text: &str) -> Vec<String> {
     let see_also_match = match SEE_ALSO_HEADER.find(text) {
         Some(m) => m,
@@ -80,6 +91,8 @@ pub fn extract_see_also_links(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extracts category names from `[[Category:...]]` links.
+#[must_use]
 pub fn extract_categories(text: &str) -> Vec<Cow<'_, str>> {
     CATEGORY_REGEX
         .captures_iter(text)
@@ -115,6 +128,8 @@ fn sanitize_field(s: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// Extracts image filenames from `[[File:...]]` and `[[Image:...]]` links.
+#[must_use]
 pub fn extract_images(text: &str) -> Vec<Cow<'_, str>> {
     IMAGE_REGEX
         .captures_iter(text)
@@ -123,6 +138,8 @@ pub fn extract_images(text: &str) -> Vec<Cow<'_, str>> {
         .collect()
 }
 
+/// Extracts URLs from `[http(s)://...]` external links.
+#[must_use]
 pub fn extract_external_links(text: &str) -> Vec<Cow<'_, str>> {
     EXTERNAL_LINK_REGEX
         .captures_iter(text)
@@ -132,10 +149,13 @@ pub fn extract_external_links(text: &str) -> Vec<Cow<'_, str>> {
 }
 
 /// Byte offset of the "See also" header, for position-based edge classification.
+#[must_use]
 pub fn see_also_section_start(text: &str) -> Option<usize> {
     SEE_ALSO_HEADER.find(text).map(|m| m.start())
 }
 
+/// Returns `true` if the article contains a disambiguation template.
+#[must_use]
 pub fn is_disambiguation(text: &str) -> bool {
     DISAMBIG_REGEX.is_match(text)
 }

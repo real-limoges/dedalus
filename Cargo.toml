@@ -5,6 +5,11 @@ edition = "2021"
 description = "A Rust pipeline that extracts Wikipedia dumps into structured graph data and imports into Neo4j"
 repository = "https://github.com/real-limoges/dedalus"
 license = "MIT"
+authors = ["Real Limoges"]
+keywords = ["wikipedia", "neo4j", "graph", "extraction"]
+categories = ["command-line-utilities", "database"]
+rust-version = "1.87"
+readme = "README.md"
 
 [dependencies]
 bzip2 = { version = "0.6.1" }
