@@ -246,11 +246,9 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         .or_else(|| dedalus::multistream::detect_index_path(&args.input));
 
     let multistream_ranges = if let Some(ref idx_path) = multistream_index_path {
-        println!("==> Using multistream parallel parsing");
-        println!("    Index: {}", idx_path);
+        info!(index = %idx_path, "Using multistream parallel parsing");
         let ranges = dedalus::multistream::parse_multistream_index(idx_path, &args.input)?;
-        println!("    Streams: {}", ranges.len());
-        println!();
+        info!(streams = ranges.len(), "Multistream index parsed");
         Some(ranges)
     } else {
         None
@@ -698,7 +696,6 @@ fn main() -> ExitCode {
         }
         Err(e) => {
             error!("Error: {:#}", e);
-            eprintln!("Error: {:#}", e);
             ExitCode::FAILURE
         }
     }

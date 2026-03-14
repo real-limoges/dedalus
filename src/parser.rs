@@ -179,10 +179,10 @@ impl<R: Read> Iterator for PageParser<R> {
                 },
                 Ok(Event::Eof) => return None,
                 Err(e) => {
-                    eprintln!(
-                        "XML Parse Error at position {}: {:?}",
-                        self.reader.buffer_position(),
-                        e
+                    warn!(
+                        position = self.reader.buffer_position(),
+                        error = ?e,
+                        "XML parse error"
                     );
                     return None;
                 }

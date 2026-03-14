@@ -181,7 +181,7 @@ async fn run_admin_import(
     println!();
 
     // Ensure Neo4j is stopped and containers are down
-    println!("==> Stopping and removing Neo4j containers ...");
+    info!("Stopping and removing Neo4j containers");
     let down_output = Command::new("docker")
         .args(["compose", "-f", compose_file, "down"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -192,11 +192,10 @@ async fn run_admin_import(
     if !down_output.status.success() {
         warn!("docker compose down had non-zero exit");
     }
-    println!("    Containers stopped and removed.");
+    info!("Containers stopped and removed");
 
     // Build neo4j-admin import command
-    println!();
-    println!("==> Building import command ...");
+    info!("Building neo4j-admin import command");
 
     let node_files = csv_files_for("nodes", layout);
     let cat_files = csv_files_for("categories", layout);
@@ -282,16 +281,10 @@ async fn run_admin_import(
         + artcat_files.len()
         + artimg_files.len()
         + artextlink_files.len();
-    println!(
-        "    Command prepared ({} files for bulk import)",
-        total_files
-    );
+    info!(files = total_files, "Import command prepared");
 
     // Run neo4j-admin import
-    println!();
-    println!("==> Running neo4j-admin database import ...");
-    println!("    This may take 5-15 minutes for full Wikipedia dump");
-    println!();
+    info!("Running neo4j-admin database import (may take 5-15 minutes)");
 
     let import_output = Command::new("docker")
         .args(&import_args)
@@ -309,7 +302,7 @@ async fn run_admin_import(
     println!("{}", stdout);
 
     // Start Neo4j with imported data
-    println!("==> Starting Neo4j with imported data ...");
+    info!("Starting Neo4j with imported data");
     let start_output = Command::new("docker")
         .args(["compose", "-f", compose_file, "up", "-d"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -321,17 +314,15 @@ async fn run_admin_import(
         let stderr = String::from_utf8_lossy(&start_output.stderr);
         bail!("Failed to start Neo4j after import:\n{}", stderr);
     }
-    println!("    Neo4j started.");
+    info!("Neo4j started");
 
     // Wait for Neo4j to be ready
-    println!();
-    println!("==> Waiting for Neo4j to be ready ...");
+    info!("Waiting for Neo4j to be ready");
     let graph = connect_with_retry(config).await?;
-    println!("    Neo4j ready.");
+    info!("Neo4j ready");
 
     // Create post-import indexes for query performance
-    println!();
-    println!("==> Creating indexes and constraints ...");
+    info!("Creating indexes and constraints");
     run_cypher(
         &graph,
         "CREATE INDEX page_title IF NOT EXISTS FOR (p:Page) ON (p.title);",
@@ -352,7 +343,7 @@ async fn run_admin_import(
         "CREATE INDEX extlink_url IF NOT EXISTS FOR (e:ExternalLink) ON (e.url);",
     )
     .await?;
-    println!("    Indexes and constraints created.");
+    info!("Indexes and constraints created");
 
     // Get final counts
     let page_count = query_count(&graph, "MATCH (p:Page) RETURN count(p) AS cnt").await?;
@@ -399,8 +390,7 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
 
     let layout = detect_csv_layout(&config.output_dir)?;
     validate_csv_files(&config.output_dir, &layout)?;
-    println!();
-    println!("==> Detected {} CSV layout", layout);
+    info!("Detected {} CSV layout", layout);
 
     if !config.no_docker {
         let compose_file = resolve_compose_file(&config)?;
@@ -415,10 +405,9 @@ pub async fn run_import(mut config: ImportConfig) -> Result<()> {
         bail!("--admin-import requires Docker (cannot use with --no-docker)");
     }
 
-    println!();
-    println!("==> Connecting to Neo4j at {} ...", config.bolt_uri);
+    info!("Connecting to Neo4j at {}", config.bolt_uri);
     let graph = connect_with_retry(&config).await?;
-    println!("    Connected.");
+    info!("Connected to Neo4j");
 
     let mp = MultiProgress::new();
 
@@ -721,8 +710,7 @@ fn resolve_compose_file(config: &ImportConfig) -> Result<String> {
 
 async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
     if config.clean {
-        println!();
-        println!("==> Cleaning up previous Neo4j instance ...");
+        info!("Cleaning up previous Neo4j instance");
         let status = Command::new("docker")
             .args(["compose", "-f", compose_file, "down", "-v"])
             .env("IMPORT_DIR", &config.output_dir)
@@ -734,8 +722,7 @@ async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
         }
     }
 
-    println!();
-    println!("==> Starting Neo4j ...");
+    info!("Starting Neo4j");
     let output = Command::new("docker")
         .args(["compose", "-f", compose_file, "up", "-d"])
         .env("IMPORT_DIR", &config.output_dir)
@@ -747,7 +734,7 @@ async fn docker_start(compose_file: &str, config: &ImportConfig) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("docker compose up failed:\n{stderr}");
     }
-    println!("    Docker containers started.");
+    info!("Docker containers started");
 
     Ok(())
 }
@@ -872,7 +859,7 @@ async fn load_csv_files(
             Err(e) => {
                 failed += 1;
                 warn!(file = %file_name, error = %e, "LOAD CSV failed");
-                eprintln!("    FAILED: {file_name}: {e}");
+                // warn! already emitted above with structured fields
             }
         }
         pb.inc(1);
