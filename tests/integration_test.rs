@@ -258,6 +258,7 @@ fn extraction_produces_csv_files() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -300,6 +301,7 @@ fn extraction_creates_edges() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -325,6 +327,7 @@ fn extraction_writes_json_blobs() {
         1,
         None,
         false,
+        None,
         None,
         None,
     )
@@ -365,6 +368,7 @@ fn extraction_dry_run_writes_no_files() {
         true, // dry_run
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -393,6 +397,7 @@ fn extraction_respects_limit() {
         true,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -415,6 +420,7 @@ fn nodes_csv_format_is_neo4j_compatible() {
         1,
         None,
         false,
+        None,
         None,
         None,
     )
@@ -453,6 +459,7 @@ fn edges_csv_format_is_neo4j_compatible() {
         1,
         None,
         false,
+        None,
         None,
         None,
     )
@@ -501,6 +508,7 @@ fn extraction_produces_category_files() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -543,6 +551,7 @@ fn extraction_produces_images_csv() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -581,6 +590,7 @@ fn extraction_produces_external_links_csv() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -617,6 +627,7 @@ fn blob_contains_enriched_data() {
         1,
         None,
         false,
+        None,
         None,
         None,
     )
@@ -667,6 +678,7 @@ fn extraction_finds_see_also_edges() {
         false,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -693,6 +705,7 @@ fn edges_exclude_namespace_links() {
         1,
         None,
         false,
+        None,
         None,
         None,
     )
@@ -735,6 +748,7 @@ fn sharded_csv_produces_numbered_files() {
         4, // csv_shards
         None,
         false,
+        None,
         None,
         None,
     )
@@ -795,6 +809,7 @@ fn single_csv_shard_produces_original_filenames() {
         1, // csv_shards = 1 (default)
         None,
         false,
+        None,
         None,
         None,
     )

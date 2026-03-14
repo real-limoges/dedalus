@@ -7,6 +7,7 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 ## Features
 
 - **Two-pass streaming pipeline** -- indexing pass builds a title-to-ID map, extraction pass produces output in parallel (1.62x faster with 14 shards)
+- **Multistream parallel parsing** -- with Wikipedia's multistream dump format, both indexing and extraction decompress and parse bz2 streams in parallel via `rayon`, eliminating the single-threaded decompression bottleneck
 - **Memory-efficient** -- event-based XML parsing with `quick-xml`; never loads the full dump into memory
 - **Parallel extraction** -- uses `rayon` for multi-core article processing
 - **Parallel decompression** -- automatically uses `lbzip2` or `pbzip2` when available on PATH; falls back to in-process `MultiBzDecoder`
@@ -43,7 +44,9 @@ cargo build --release
 | Import (neo4j-admin) | Bulk import (merged CSVs) | ~15-20 minutes | **10-100x vs Bolt** |
 | Import (Bolt) | LOAD CSV via Bolt protocol | 4-6 hours | 1x baseline |
 
-**Recommended workflow**: Extract with 14 shards → Merge → neo4j-admin import for best overall performance.
+**Recommended workflow**: Extract with multistream + 14 shards → Merge → neo4j-admin import for best overall performance.
+
+**Multistream parallel parsing**: When using Wikipedia's multistream dump format (`*-multistream.xml.bz2`) with the accompanying index file (`*-multistream-index.txt.bz2`), Dedalus can decompress and parse bz2 streams in parallel across all CPU cores. This parallelizes both the indexing and extraction passes, eliminating the single-threaded decompression bottleneck that limits throughput with standard dumps. Use `--multistream-index` or let Dedalus auto-detect the index file from the dump filename.
 
 **Hardware recommendations**:
 - **CPU**: 8+ cores for parallel extraction (rayon scales well; 14+ cores on M5 Max)
@@ -113,7 +116,7 @@ After import completes, Neo4j is available at:
 
 ## Usage
 
-Dedalus uses subcommands: `extract`, `import`, and `merge-csvs`.
+Dedalus uses subcommands: `extract`, `import`, `merge-csvs`, `pipeline`, and `stats`.
 
 ### `dedalus extract`
 
@@ -135,6 +138,7 @@ dedalus extract -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 | `--no-cache` | Force rebuild of index cache | `false` |
 | `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
 | `--clean` | Clear existing checkpoint and outputs before starting | `false` |
+| `--multistream-index <PATH>` | Path to multistream index file (`.txt.bz2`) for parallel parsing | auto-detected |
 
 ### `dedalus import`
 
@@ -209,6 +213,13 @@ dedalus import -o output/ --clean
 
 # Import into an already-running Neo4j instance
 dedalus import -o output/ --no-docker --bolt-uri bolt://my-neo4j:7687
+
+# Multistream parallel parsing (auto-detects index file from dump filename)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
+
+# Multistream with explicit index path
+dedalus extract -i dump-multistream.xml.bz2 -o output/ \
+  --multistream-index dump-multistream-index.txt.bz2 -v
 ```
 
 ## Output Format
@@ -264,9 +275,9 @@ Empty fields are omitted from the JSON for compactness.
 
 ### Two-Pass Pipeline
 
-1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects.
+1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects. With multistream dumps, uses `build_multistream()` to decompress and parse bz2 streams in parallel via `rayon`.
 
-2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. `DashSet` deduplicates categories, images, and external links concurrently. `ShardedCsvWriter` distributes rows across N files by `page_id % csv_shards`.
+2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. `DashSet` deduplicates categories, images, and external links concurrently. `ShardedCsvWriter` distributes rows across N files by `page_id % csv_shards`. With multistream dumps, decompression and XML parsing are also parallelized across bz2 streams via `multistream::par_iter_pages()`.
 
 3. **Merge pass** (`merge.rs`, optional) -- if using `--csv-shards > 1`, combines numbered CSV files into single merged files with cross-shard deduplication of categories, images, and external links. Uses streaming I/O (256KB buffers) and `FxHashSet` for deduplication. Overhead: <5 minutes for full Wikipedia.
 
@@ -277,9 +288,10 @@ Empty fields are omitted from the JSON for compactness.
 | Module | Purpose |
 |--------|---------|
 | `main.rs` | CLI subcommands (`clap`), orchestrates extract/import/merge-csvs |
-| `parser.rs` | `WikiReader` -- streaming XML parser implementing `Iterator<Item = WikiPage>`; auto-detects parallel decompressor |
-| `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution |
-| `extract.rs` | Parallel extraction with `ShardedCsvWriter` for split CSV output |
+| `parser.rs` | `PageParser<R>` -- generic streaming XML parser implementing `Iterator<Item = WikiPage>`; `WikiReader` wraps it with BZ2 decompression and auto-detects parallel decompressor |
+| `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution; `build_multistream()` for parallel index building |
+| `extract.rs` | Parallel extraction with `ShardedCsvWriter` for split CSV output; multistream-aware parallel decompression |
+| `multistream.rs` | Multistream dump support -- parses the bz2 index file into `StreamRange` offsets, provides `par_iter_pages()` for parallel decompression + parsing, auto-detects index files |
 | `import.rs` | Neo4j import -- Docker management, Bolt connection with retry, throttled LOAD CSV, neo4j-admin bulk import |
 | `merge.rs` | CSV shard merger -- streaming concatenation with deduplication of categories, images, and external links for neo4j-admin compatibility |
 | `models.rs` | Core types: `WikiPage`, `PageType`, `ArticleBlob` |
@@ -401,12 +413,13 @@ RETURN a.title;
 
 ### Performance Tips
 
-1. **Fastest workflow**: `--csv-shards 14` → `merge-csvs` → `--admin-import`
-2. **Use SSD storage**: CSV writes are I/O intensive
-3. **Parallel decompression**: Install `lbzip2` for faster XML parsing
-4. **Apple Silicon**: Automatic NEON SIMD optimization (1.6x faster)
-5. **Resume interrupted runs**: Use `--resume` instead of restarting from scratch
-6. **Test first**: Use `--limit 10000` to validate pipeline before processing full dump
+1. **Fastest workflow**: multistream dump + `--csv-shards 14` → `merge-csvs` → `--admin-import`
+2. **Use multistream dumps**: Download `*-multistream.xml.bz2` + index for parallel decompression across all cores
+3. **Use SSD storage**: CSV writes are I/O intensive
+4. **Parallel decompression**: Install `lbzip2` for faster XML parsing (standard dumps); multistream dumps don't need external tools
+5. **Apple Silicon**: Automatic NEON SIMD optimization (1.6x faster)
+6. **Resume interrupted runs**: Use `--resume` instead of restarting from scratch
+7. **Test first**: Use `--limit 10000` to validate pipeline before processing full dump
 
 ## License
 

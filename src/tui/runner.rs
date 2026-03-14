@@ -158,6 +158,7 @@ fn run_extract_inner(
         Arc::clone(stats),
         Arc::clone(cancel),
         true, // hide indicatif
+        None, // multistream_ranges
     )?;
     let extraction_secs = start_extracting.elapsed().as_secs_f64();
     info!(duration_secs = extraction_secs, "Extraction complete");
