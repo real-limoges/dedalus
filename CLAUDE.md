@@ -11,6 +11,7 @@ Dedalus is a Rust pipeline that extracts Wikipedia dumps into structured graph d
 The project targets M1 CPU with native SIMD optimizations via `.cargo/config.toml`:
 
 ```toml
+# .cargo/config.toml
 [build]
 rustflags = ["-C", "target-cpu=native"]
 
@@ -18,6 +19,17 @@ rustflags = ["-C", "target-cpu=native"]
 opt-level = 3
 codegen-units = 1
 strip = true
+```
+
+Additional release profile settings in `Cargo.toml`:
+
+```toml
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+panic = 'abort'
+overflow-checks = false
 ```
 
 This yields ~1.6x faster extraction on ARM64 due to NEON SIMD and single-pass codegen. Always build with `cargo build --release` for production.
@@ -101,7 +113,7 @@ dedalus import -o <output-directory>
 - `-o` / `--output` -- directory containing Dedalus CSV output files (required)
 - `--bolt-uri` -- Neo4j Bolt URI (default: `bolt://localhost:7687`)
 - `--import-prefix` -- import file URI prefix for Neo4j LOAD CSV (default: `file://`)
-- `--max-parallel-edges` -- max concurrent LOAD CSV jobs for edges (default: 1 for admin-import, 4 for Bolt)
+- `--max-parallel-edges` -- max concurrent LOAD CSV jobs for edges (default: 4)
 - `--max-parallel-light` -- max concurrent LOAD CSV jobs for lighter relationships (default: 8)
 - `--compose-file` -- Docker compose file path (auto-detected if not specified)
 - `--no-docker` -- skip Docker management, connect to an already-running Neo4j
@@ -223,7 +235,7 @@ dedalus import -o out/ --no-docker --bolt-uri bolt://my-neo4j:7687
 
 - **`config.rs`**: Constants for both extraction and import:
   - Extraction: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `PROGRESS_INTERVAL` (1000), `CACHE_VERSION` (2), `CHECKPOINT_VERSION` (3), `CHECKPOINT_INTERVAL` (10000)
-  - Import: `DEFAULT_BOLT_URI`, `IMPORT_MAX_RETRIES` (30), `IMPORT_RETRY_DELAY_SECS` (2), `IMPORT_MAX_PARALLEL_EDGES` (1), `IMPORT_MAX_PARALLEL_LIGHT` (8), `DEFAULT_IMPORT_PREFIX` (file://)
+  - Import: `DEFAULT_BOLT_URI`, `IMPORT_MAX_RETRIES` (30), `IMPORT_RETRY_DELAY_SECS` (2), `IMPORT_MAX_PARALLEL_EDGES` (4), `IMPORT_MAX_PARALLEL_LIGHT` (8), `DEFAULT_IMPORT_PREFIX` (file://)
 
 - **`cache.rs`**: Index persistence using `bincode`. Saves/loads `WikiIndex` as `index.cache`. Validates against input file mtime and size. Zero-copy serialization via `IndexCacheSer` (borrows FxHashMaps instead of cloning). Single-pass deserialization.
 
@@ -244,7 +256,7 @@ dedalus import -o out/ --no-docker --bolt-uri bolt://my-neo4j:7687
 - **Resume filtering**: `reader.filter(|p| p.id > last_processed_id)` skips already-processed pages
 - **Conditional serialization**: `#[serde(skip_serializing_if = "...", default)]` for compact JSON blobs
 - **Parallel decompression**: external `lbzip2`/`pbzip2` (with `pbzip2` fallback) and `Drop`-based cleanup
-- **Throttled parallel import**: `FuturesUnordered` with bounded concurrency; edges serialized (1 at a time) due to memory pressure, lighter operations at 4-8 concurrent
+- **Throttled parallel import**: `FuturesUnordered` with bounded concurrency; edges at 4 concurrent, lighter operations at 8 concurrent
 - **Neo4j transactional batching**: `CALL { ... } IN TRANSACTIONS OF N ROWS` for memory-bounded bulk loading
 - **Tokio runtime isolation**: manually created only for import path; extraction uses sync rayon
 - **M1 CPU targeting**: `target-cpu=native` for NEON SIMD, `codegen-units=1` for better optimization
@@ -336,9 +348,9 @@ CSV sharding provides 1.62x extraction speedup on multi-core systems, but `neo4j
 
 **Critical lesson**: Always create indexes BEFORE `LOAD CSV` with `MERGE`. Without indexes, `MERGE` performs a full label scan per row, resulting in O(n²) performance. `neo4j-admin import` doesn't need pre-existing indexes (builds its own), but Bolt-based `LOAD CSV` absolutely does. The `import.rs` creates indexes before any loading.
 
-### Why Bolt defaults to 1 parallel edge job?
+### Why throttle parallel edge jobs?
 
-Memory pressure: each concurrent edge job buffers all its rows in memory before committing. Edges are the largest CSV type. Conservative default (1) prevents OOM; lighter operations use 4-8 concurrent.
+Memory pressure: each concurrent edge job buffers all its rows in memory before committing. Edges are the largest CSV type. Default of 4 concurrent edge jobs balances throughput vs memory usage; lighter operations use 8 concurrent. Reduce `--max-parallel-edges` if OOM occurs.
 
 ### Why atomic counters for stats?
 

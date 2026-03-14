@@ -16,7 +16,7 @@ CALL { WITH row
 
 const CYPHER_LOAD_CATEGORIES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
-    CREATE (:Category {id: row.`id:ID(Category)`, name: row.name})
+    MERGE (:Category {id: row.`id:ID(Category)`, name: row.name})
 } IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_EDGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
@@ -33,7 +33,7 @@ CALL { WITH row
 
 const CYPHER_LOAD_IMAGE_NODES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
-    CREATE (:Image {id: row.`id:ID(Image)`, filename: row.filename})
+    MERGE (:Image {id: row.`id:ID(Image)`, filename: row.filename})
 } IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_ARTICLE_IMAGES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
@@ -44,7 +44,7 @@ CALL { WITH row
 
 const CYPHER_LOAD_EXTERNAL_LINK_NODES: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
 CALL { WITH row
-    CREATE (:ExternalLink {id: row.`id:ID(ExternalLink)`, url: row.url})
+    MERGE (:ExternalLink {id: row.`id:ID(ExternalLink)`, url: row.url})
 } IN TRANSACTIONS OF 50000 ROWS;"#;
 
 const CYPHER_LOAD_ARTICLE_EXTERNAL_LINKS: &str = r#"LOAD CSV WITH HEADERS FROM '{file}' AS row
@@ -731,7 +731,7 @@ async fn connect_with_retry(config: &ImportConfig) -> Result<Graph> {
                     ));
                 }
             },
-            Err(e) if attempt < max_retries => {
+            Err(_e) if attempt < max_retries => {
                 info!(
                     attempt,
                     "Cannot connect to Neo4j at {}, retrying...", config.bolt_uri
