@@ -47,39 +47,36 @@ The binary uses `mimalloc` as the global allocator for better multi-core perform
 
 ## Running
 
-The binary uses subcommands: `extract`, `import`, and `merge-csvs`.
+The binary uses subcommands: `extract`, `import`, `merge-csvs`, `pipeline`, `stats`, and `tui`.
 
-### Quick Start with Makefile
+### Pipeline (Recommended)
 
-The Makefile provides convenient targets for the full pipeline and individual steps:
+Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → import.
 
 ```bash
-make pipeline WIKI_DUMP=path/to/dump.xml.bz2    # Full hybrid pipeline (extract 8 shards → merge → admin import)
-make standard-pipeline WIKI_DUMP=path            # Standard pipeline (single shard → admin import)
-make test-pipeline WIKI_DUMP=path LIMIT=10000   # Test with limited pages
-make help                                        # Show all available targets
+dedalus pipeline -i <path-to-dump.xml.bz2> -o <output-directory>
 ```
 
-**Makefile Configuration Variables:**
-- `WIKI_DUMP` -- path to `.xml.bz2` Wikipedia dump (default: `enwiki-latest-pages-articles.xml.bz2`)
-- `OUTPUT_DIR` -- output directory (default: `output`)
-- `CSV_SHARDS` -- number of extraction shards for parallelism (default: `8`)
-- `SHARD_COUNT` -- number of JSON blob shards (default: `1000`)
-- `LIMIT` -- cap articles processed (default: none)
-- `VERBOSE` -- verbosity level (default: `-v`)
+**Pipeline flags:**
+- `-i` / `--input` -- path to `.xml.bz2` Wikipedia dump (required)
+- `-o` / `--output` -- output directory (required)
+- `--csv-shards` -- number of CSV output shards (default: 8)
+- `--shard-count` -- JSON blob shard count (default: 1000)
+- `--limit` -- cap pages processed (useful for testing)
+- `--resume` -- resume from last checkpoint
+- `--no-cache` -- force rebuild of index cache
+- `--checkpoint-interval` -- save checkpoint every N articles (default: 10000)
+- `--clean` -- clear existing outputs and Neo4j data before starting
+- `--bolt-uri` -- Neo4j Bolt URI (default: `bolt://localhost:7687`)
+- `--import-prefix` -- import file URI prefix (default: `file://`)
+- `--max-parallel-edges` -- max concurrent edge import jobs (default: 4)
+- `--max-parallel-light` -- max concurrent light import jobs (default: 8)
+- `--compose-file` -- Docker compose file path (auto-detected)
+- `--no-docker` -- connect to already-running Neo4j
+- `--no-import` -- skip import step (extract + merge only)
+- `--no-archive` -- don't archive sharded CSVs after merging
 
-**Makefile Targets:**
-- `make extract` -- Run extraction only
-- `make merge` -- Merge sharded CSVs (skips if `CSV_SHARDS=1`)
-- `make import` -- Run import only (admin-import mode)
-- `make clean` -- Clean build artifacts
-- `make clean-output` -- Clean output directory
-- `make clean-shards` -- Archive sharded CSVs to `output/shards/`
-- `make resume` -- Resume extraction from checkpoint
-- `make clean-extract` -- Clean extraction and start fresh
-- `make clean-import` -- Import with clean slate (removes existing Neo4j data)
-- `make bolt-import` -- Import via Bolt (slower, for existing data)
-- `make stats` -- Show output directory statistics
+Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based import, use the individual `import` subcommand.
 
 ### Extract
 
@@ -134,45 +131,48 @@ dedalus merge-csvs -o <output-directory>
 
 **Merge CSVs flags:**
 - `-o` / `--output` -- directory containing sharded CSVs (e.g., `nodes_000.csv`, `nodes_001.csv`)
-
-**Note:** When using the Makefile (`make pipeline` or `make merge`), sharded CSV files are automatically archived to `output/shards/` after merging. This preserves original shards while keeping only merged files in the main output directory.
+- `--archive` -- archive sharded CSVs to `output/shards/` after merging (preserves originals while keeping only merged files in the main output directory)
 
 ### Global flags
 
 - `-v` / `--verbose` -- increase verbosity (`-v` INFO, `-vv` DEBUG, `-vvv` TRACE; default WARN)
 
+### Stats
+
+Shows output directory statistics: CSV file sizes, blob counts, and total disk usage.
+
+```bash
+dedalus stats -o <output-directory>
+```
+
+**Stats flags:**
+- `-o` / `--output` -- output directory to inspect (default: `output`)
+
 ### Typical Workflows
 
 ```bash
-# Recommended: Hybrid workflow (fast extraction + fast import)
-# Step 1: Extract with 8 shards (1.62x speedup)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 8 -v
-
-# Step 2: Merge CSVs for admin-import (<5 min overhead, deduplicates cross-shard duplicates)
-dedalus merge-csvs -o out/
-
-# Step 3: Fast bulk import (10-100x faster than Bolt)
-dedalus import -o out/ --admin-import
-
-# OR use Makefile one-liner:
-make pipeline WIKI_DUMP=enwiki-latest-pages-articles.xml.bz2
+# Recommended: Full pipeline (extract 8 shards → merge → admin import)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ -v
 
 ---
 
-# Standard workflow (single shard, simpler but slower extraction)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 1 -v
-dedalus import -o out/ --admin-import
+# Test pipeline with limited pages
+dedalus pipeline -i small-dump.xml.bz2 -o out/ --limit 10000 -vv
 
 ---
 
-# Bolt-based import (slower, for incremental updates or when using sharded CSVs)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 8 -v
-dedalus import -o out/  # omit --admin-import to use Bolt
+# Extract + merge only (no Neo4j)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --no-import -v
 
 ---
 
-# Testing pipeline with limited pages
-make test-pipeline WIKI_DUMP=small-dump.xml.bz2 LIMIT=10000 VERBOSE=-vv
+# Single shard pipeline (simpler, slower extraction)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 1 -v
+
+---
+
+# Clean slate (clear outputs + Neo4j data)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --clean -v
 
 ---
 
@@ -181,13 +181,19 @@ dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --resume -v
 
 ---
 
-# Import with clean slate (removes existing Neo4j data)
-dedalus import -o out/ --admin-import --clean
+# Bolt-based import (slower, for incremental updates)
+dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 8 -v
+dedalus import -o out/  # omit --admin-import to use Bolt
 
 ---
 
 # Import into already-running Neo4j (no Docker)
 dedalus import -o out/ --no-docker --bolt-uri bolt://my-neo4j:7687
+
+---
+
+# Check output directory statistics
+dedalus stats -o out/
 ```
 
 ## Architecture
@@ -223,7 +229,7 @@ dedalus import -o out/ --no-docker --bolt-uri bolt://my-neo4j:7687
 
 - **`import.rs`**: Neo4j import pipeline with two modes. (1) `--admin-import` uses `neo4j-admin database import` for 10-100x faster bulk loading. (2) Default Bolt mode uses `neo4rs` driver with `LOAD CSV` and throttled parallelism via `FuturesUnordered`. Both modes load all CSV types. Detects CSV layout (single vs sharded). Manages Docker via `tokio::process::Command`. Connects with retry (30 attempts, 2s delay). **Critical**: Creates indexes BEFORE `LOAD CSV` with `MERGE` to prevent O(n²) full label scans.
 
-- **`merge.rs`**: CSV shard merger for neo4j-admin compatibility. Detects shard count from `nodes_*.csv` files. Concatenates all CSV types with streaming I/O (256KB buffers). Deduplicates categories, images, and external links using `FxHashSet` to handle cross-shard duplicates. Outputs single merged files ready for `--admin-import`.
+- **`merge.rs`**: CSV shard merger for neo4j-admin compatibility. Detects shard count from `nodes_*.csv` files. Concatenates all CSV types with streaming I/O (256KB buffers). Deduplicates categories, images, and external links using `FxHashSet` to handle cross-shard duplicates. Outputs single merged files ready for `--admin-import`. `archive_shards()` moves `*_NNN.csv` files to `output/shards/` after merging to keep the output directory clean.
 
 - **`models.rs`**: Core types -- `WikiPage`, `PageType` (Article/Redirect/Special), `ArticleBlob` with conditional serialization for compact JSON.
 

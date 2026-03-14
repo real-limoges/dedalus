@@ -1,5 +1,5 @@
 [build]
-# Enable M1-specific optimizations (NEON SIMD, branch prediction, etc.)
+# Enable native Apple Silicon optimizations (NEON SIMD, branch prediction, etc.)
 rustflags = ["-C", "target-cpu=native"]
 
 [profile.release]

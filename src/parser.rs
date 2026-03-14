@@ -5,7 +5,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::str;
 use tracing::{info, warn};
 
@@ -16,10 +16,25 @@ use bzip2::Compression;
 #[cfg(test)]
 use std::io::Write;
 
+enum DecompressSource {
+    External(ChildStdout),
+    InProcess(MultiBzDecoder<File>),
+}
+
+impl Read for DecompressSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::External(r) => r.read(buf),
+            Self::InProcess(r) => r.read(buf),
+        }
+    }
+}
+
 pub struct WikiReader {
-    reader: Reader<BufReader<Box<dyn Read + Send>>>,
+    reader: Reader<BufReader<DecompressSource>>,
     buf: Vec<u8>,
     skip_text: bool,
+    skip_timestamp: bool,
     _child: Option<Child>,
 }
 
@@ -50,7 +65,7 @@ impl WikiReader {
             return Err(anyhow::anyhow!("Could not open file: {}", path));
         }
 
-        let (source, child): (Box<dyn Read + Send>, Option<Child>) = if let Some(cmd) =
+        let (source, child): (DecompressSource, Option<Child>) = if let Some(cmd) =
             find_decompressor()
         {
             match spawn_decompressor(cmd, path) {
@@ -60,44 +75,55 @@ impl WikiReader {
                         .take()
                         .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from {}", cmd))?;
                     info!(decompressor = cmd, "Using external parallel decompressor");
-                    (Box::new(stdout), Some(child))
+                    (DecompressSource::External(stdout), Some(child))
                 }
                 Err(e) => {
                     warn!(error = %e, "External decompressor failed, falling back to in-process");
                     let file = File::open(path)
                         .with_context(|| format!("Could not open file: {}", path))?;
-                    (Box::new(MultiBzDecoder::new(file)), None)
+                    (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
                 }
             }
         } else {
             let file =
                 File::open(path).with_context(|| format!("Could not open file: {}", path))?;
-            (Box::new(MultiBzDecoder::new(file)), None)
+            (DecompressSource::InProcess(MultiBzDecoder::new(file)), None)
         };
 
         let reader = BufReader::with_capacity(256 * 1024, source);
-        let xml_reader = Reader::from_reader(reader);
+        let mut xml_reader = Reader::from_reader(reader);
+        xml_reader.check_end_names(false);
+        xml_reader.trim_text(true);
 
         Ok(Self {
             reader: xml_reader,
-            buf: Vec::with_capacity(1024),
+            buf: Vec::with_capacity(256 * 1024),
             skip_text,
+            skip_timestamp: false,
             _child: child,
         })
+    }
+
+    pub fn skip_timestamp(mut self, val: bool) -> Self {
+        self.skip_timestamp = val;
+        self
     }
 
     /// Constructor that forces in-process decompression, bypassing external tool detection.
     #[cfg(test)]
     fn new_inprocess(path: &str, skip_text: bool) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;
-        let source: Box<dyn Read + Send> = Box::new(MultiBzDecoder::new(file));
+        let source = DecompressSource::InProcess(MultiBzDecoder::new(file));
         let reader = BufReader::with_capacity(256 * 1024, source);
-        let xml_reader = Reader::from_reader(reader);
+        let mut xml_reader = Reader::from_reader(reader);
+        xml_reader.check_end_names(false);
+        xml_reader.trim_text(true);
 
         Ok(Self {
             reader: xml_reader,
-            buf: Vec::with_capacity(1024),
+            buf: Vec::with_capacity(256 * 1024),
             skip_text,
+            skip_timestamp: false,
             _child: None,
         })
     }
@@ -137,7 +163,11 @@ impl Iterator for WikiReader {
                     b"title" => in_title = true,
                     b"id" if current_id.is_none() => in_id = true,
                     b"ns" => in_ns = true,
-                    b"timestamp" => in_timestamp = true,
+                    b"timestamp" => {
+                        if !self.skip_timestamp {
+                            in_timestamp = true;
+                        }
+                    }
                     b"text" => {
                         if !self.skip_text {
                             in_text = true;
@@ -167,15 +197,15 @@ impl Iterator for WikiReader {
                             current_title = Some(s.into_owned());
                         }
                     } else if in_id {
-                        let s = String::from_utf8_lossy(&e);
-                        current_id = s.trim().parse::<u32>().ok();
+                        current_id = str::from_utf8(&e)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u32>().ok());
                     } else if in_ns {
-                        let s = String::from_utf8_lossy(&e);
-                        current_ns = s.trim().parse::<i32>().ok();
+                        current_ns = str::from_utf8(&e)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<i32>().ok());
                     } else if in_timestamp {
-                        if let Ok(s) = e.unescape() {
-                            current_timestamp = Some(s.into_owned());
-                        }
+                        current_timestamp = str::from_utf8(&e).ok().map(|s| s.to_string());
                     } else if in_text {
                         if let Ok(s) = e.unescape() {
                             current_text = Some(s.into_owned());

@@ -1,3 +1,4 @@
+use memchr::{memchr, memchr2, memchr3};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,37 +28,52 @@ pub fn extract_infoboxes(text: &str) -> Vec<Infobox> {
     results
 }
 
-/// Case-insensitive search on raw bytes to preserve byte offsets with non-ASCII text.
+/// Case-insensitive search for `{{Infobox` on raw bytes.
+/// Uses SIMD-accelerated memchr to jump to `{` candidates instead of scanning every byte.
 fn find_infobox_start(bytes: &[u8]) -> Option<usize> {
     let needle = b"{{infobox";
     if bytes.len() < needle.len() {
         return None;
     }
-    for i in 0..=bytes.len() - needle.len() {
-        if bytes[i..i + needle.len()]
-            .iter()
-            .zip(needle.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-        {
-            let next_idx = i + needle.len();
-            if next_idx >= bytes.len() {
-                return Some(i);
-            }
-            let next = bytes[next_idx];
-            if next == b' '
-                || next == b'_'
-                || next == b'\n'
-                || next == b'\r'
-                || next == b'|'
-                || next == b'}'
-            {
-                return Some(i);
+    let mut offset = 0;
+    while offset + needle.len() <= bytes.len() {
+        // SIMD jump to next '{' candidate
+        match memchr(b'{', &bytes[offset..]) {
+            None => return None,
+            Some(pos) => {
+                let i = offset + pos;
+                if i + needle.len() > bytes.len() {
+                    return None;
+                }
+                if bytes[i..i + needle.len()]
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+                {
+                    let next_idx = i + needle.len();
+                    if next_idx >= bytes.len() {
+                        return Some(i);
+                    }
+                    let next = bytes[next_idx];
+                    if next == b' '
+                        || next == b'_'
+                        || next == b'\n'
+                        || next == b'\r'
+                        || next == b'|'
+                        || next == b'}'
+                    {
+                        return Some(i);
+                    }
+                }
+                offset = i + 1;
             }
         }
     }
     None
 }
 
+/// Finds the matching `}}` for a `{{` starting at `start`.
+/// Uses SIMD-accelerated memchr2 to skip over plain text between braces.
 fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth: i32 = 0;
     let mut i = start;
@@ -72,7 +88,11 @@ fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
             }
             i += 2;
         } else {
-            i += 1;
+            // SIMD jump to next brace character
+            match memchr2(b'{', b'}', &bytes[i..]) {
+                Some(offset) if offset > 0 => i += offset,
+                _ => i += 1,
+            }
         }
     }
     None
@@ -111,6 +131,7 @@ fn parse_infobox_inner(inner: &str) -> Option<Infobox> {
 }
 
 /// Splits on `|` at brace depth 0, respecting nested `{{ }}`.
+/// Uses SIMD-accelerated memchr3 to skip to the next `{`, `}`, or `|` character.
 fn split_at_depth_zero(content: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let bytes = content.as_bytes();
@@ -130,7 +151,11 @@ fn split_at_depth_zero(content: &str) -> Vec<&str> {
             last_split = i + 1;
             i += 1;
         } else {
-            i += 1;
+            // SIMD jump to next interesting character
+            match memchr3(b'{', b'}', b'|', &bytes[i..]) {
+                Some(offset) if offset > 0 => i += offset,
+                _ => i += 1,
+            }
         }
     }
     segments.push(&content[last_split..]);

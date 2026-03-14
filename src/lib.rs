@@ -72,3 +72,4 @@ pub mod merge;
 pub mod models;
 pub mod parser;
 pub mod stats;
+pub mod tui;

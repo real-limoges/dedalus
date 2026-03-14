@@ -18,7 +18,8 @@ impl WikiIndex {
         let mut redirects: FxHashMap<String, String> =
             FxHashMap::with_capacity_and_hasher(10_000_000, Default::default());
         let reader = WikiReader::new(path, true)
-            .with_context(|| format!("Failed to open wiki dump at: {}", path))?;
+            .with_context(|| format!("Failed to open wiki dump at: {}", path))?
+            .skip_timestamp(true);
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             indicatif::ProgressStyle::default_spinner()

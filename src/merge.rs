@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use csv::{Reader, Writer};
 use rustc_hash::FxHashSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use tracing::info;
@@ -126,6 +126,45 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
     Ok(())
 }
 
+/// Check if a filename matches the shard pattern `*_NNN.csv`
+fn is_shard_file(name: &str) -> bool {
+    if !name.ends_with(".csv") {
+        return false;
+    }
+    let stem = &name[..name.len() - 4]; // strip .csv
+    if stem.len() < 5 {
+        // Need at least 1 char base name + _NNN
+        return false;
+    }
+    let suffix = &stem[stem.len() - 4..];
+    suffix.starts_with('_') && suffix[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Archive sharded CSV files (e.g. `nodes_000.csv`) to `output_dir/shards/`
+pub fn archive_shards(output_dir: &str) -> Result<()> {
+    let shards_dir = Path::new(output_dir).join("shards");
+    fs::create_dir_all(&shards_dir).context("Failed to create shards archive directory")?;
+
+    let mut archived = 0u32;
+    for entry in fs::read_dir(output_dir).context("Failed to read output directory")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if entry.file_type()?.is_file() && is_shard_file(&name_str) {
+            let dest = shards_dir.join(&*name_str);
+            fs::rename(entry.path(), &dest)
+                .with_context(|| format!("Failed to archive {}", name_str))?;
+            archived += 1;
+        }
+    }
+
+    info!(
+        "Archived {} shard files to {}/shards/",
+        archived, output_dir
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +240,57 @@ mod tests {
         assert!(lines[0].contains("id:ID,title,:LABEL"));
         assert!(lines.iter().any(|l| l.contains("Article1")));
         assert!(lines.iter().any(|l| l.contains("Article4")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_shard_file() {
+        assert!(is_shard_file("nodes_000.csv"));
+        assert!(is_shard_file("edges_001.csv"));
+        assert!(is_shard_file("categories_099.csv"));
+        assert!(is_shard_file("article_categories_123.csv"));
+        assert!(!is_shard_file("nodes.csv"));
+        assert!(!is_shard_file("edges.csv"));
+        assert!(!is_shard_file("something.txt"));
+        assert!(!is_shard_file("nodes_00.csv")); // only 2 digits
+        assert!(!is_shard_file("_000.csv")); // no base name
+    }
+
+    #[test]
+    fn test_archive_shards() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let dir = temp_dir.path().to_str().unwrap();
+
+        // Create shard files and a merged file
+        for i in 0..3 {
+            create_test_shard(
+                temp_dir.path(),
+                "nodes",
+                i,
+                "id:ID,title,:LABEL",
+                &["1,A,Page"],
+            )?;
+        }
+        // Create a merged (non-shard) file
+        let merged = temp_dir.path().join("nodes.csv");
+        fs::write(&merged, "id:ID,title,:LABEL\n1,A,Page\n")?;
+
+        archive_shards(dir)?;
+
+        // Shard files should be moved
+        assert!(!temp_dir.path().join("nodes_000.csv").exists());
+        assert!(!temp_dir.path().join("nodes_001.csv").exists());
+        assert!(!temp_dir.path().join("nodes_002.csv").exists());
+
+        // Merged file should remain
+        assert!(merged.exists());
+
+        // Shard files should be in shards/
+        let shards_dir = temp_dir.path().join("shards");
+        assert!(shards_dir.join("nodes_000.csv").exists());
+        assert!(shards_dir.join("nodes_001.csv").exists());
+        assert!(shards_dir.join("nodes_002.csv").exists());
+
         Ok(())
     }
 

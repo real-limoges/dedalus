@@ -1,3 +1,4 @@
+use memchr::memchr2;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::borrow::Cow;
@@ -90,11 +91,11 @@ pub fn extract_categories(text: &str) -> Vec<Cow<'_, str>> {
 /// Collapses newlines into spaces so CSV fields stay on a single line.
 /// Returns `Cow::Borrowed` when no transformation is needed (>99% of inputs),
 /// avoiding allocation for clean strings.
+/// Uses SIMD-accelerated memchr2 for the fast-path check.
 fn sanitize_field(s: &str) -> Cow<'_, str> {
-    if !s.bytes().any(|b| b == b'\n' || b == b'\r') {
+    if memchr2(b'\n', b'\r', s.as_bytes()).is_none() {
         return Cow::Borrowed(s);
     }
-    // Single-pass optimization: build string directly instead of replace→split→collect→join
     let mut result = String::with_capacity(s.len());
     let mut last_was_space = false;
     for c in s.chars() {
@@ -108,7 +109,6 @@ fn sanitize_field(s: &str) -> Cow<'_, str> {
             last_was_space = false;
         }
     }
-    // Trim trailing space if present
     if result.ends_with(' ') {
         result.pop();
     }
@@ -140,36 +140,54 @@ pub fn is_disambiguation(text: &str) -> bool {
     DISAMBIG_REGEX.is_match(text)
 }
 
+/// Strips `{{...}}` templates from text, handling nested braces.
+/// Uses SIMD-accelerated memchr2 to skip over plain text between brace pairs.
 fn strip_templates(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut run_start = 0;
 
+    // Outer loop: use SIMD to jump to the next '{' character
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            if run_start < i {
-                result.push_str(&text[run_start..i]);
-            }
-            let mut depth: i32 = 0;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'{' && bytes[i + 1] == b'{' {
-                    depth += 1;
-                    i += 2;
-                } else if bytes[i] == b'}' && bytes[i + 1] == b'}' {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 2;
-                        break;
+        match memchr2(b'{', b'}', &bytes[i..]) {
+            None => break, // No more braces — rest is plain text
+            Some(offset) => {
+                i += offset;
+                if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                    // Found '{{' — flush text before it
+                    if run_start < i {
+                        result.push_str(&text[run_start..i]);
                     }
-                    i += 2;
+                    // Inner loop: find matching '}}' using SIMD to skip between braces
+                    let mut depth: i32 = 0;
+                    while i + 1 < bytes.len() {
+                        if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                            depth += 1;
+                            i += 2;
+                        } else if bytes[i] == b'}' && bytes[i + 1] == b'}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 2;
+                                break;
+                            }
+                            i += 2;
+                        } else {
+                            // SIMD jump to next brace inside template
+                            match memchr2(b'{', b'}', &bytes[i..]) {
+                                Some(inner_offset) if inner_offset > 0 => i += inner_offset,
+                                _ => {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    run_start = i;
                 } else {
+                    // Lone '{' or '}' — not a template marker, skip past it
                     i += 1;
                 }
             }
-            run_start = i;
-        } else {
-            i += 1;
         }
     }
 
