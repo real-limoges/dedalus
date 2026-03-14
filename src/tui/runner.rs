@@ -1,3 +1,8 @@
+//! Background worker threads for TUI operations.
+//!
+//! Each operation (extract, import, merge) runs on a dedicated thread, communicating
+//! completion and errors back to the UI via shared `Arc<AtomicBool>` / `Arc<Mutex<_>>` state.
+
 use crate::cache;
 use crate::checkpoint::{self, CheckpointManager};
 use crate::import::ImportConfig;
@@ -12,11 +17,13 @@ use tracing::{info, warn};
 
 use super::app::{App, ExtractConfig, ImportConfigTui, MergeConfig};
 
+/// Timing results from an extraction run, split into indexing and extraction phases.
 pub struct ExtractTimings {
     pub indexing_secs: f64,
     pub extraction_secs: f64,
 }
 
+/// Spawns the extraction worker thread with shared stats, cancellation, and completion signals.
 pub fn spawn_extract(
     config: ExtractConfig,
     stats: Arc<ExtractionStats>,
@@ -178,6 +185,7 @@ fn run_extract_inner(
     })
 }
 
+/// Spawns the import worker thread (creates its own tokio runtime).
 pub fn spawn_import(
     config: ImportConfigTui,
     done: Arc<AtomicBool>,
@@ -234,6 +242,7 @@ pub fn spawn_import(
     });
 }
 
+/// Spawns the CSV merge worker thread.
 pub fn spawn_merge(config: MergeConfig, done: Arc<AtomicBool>, error: Arc<Mutex<Option<String>>>) {
     std::thread::spawn(move || {
         match crate::merge::merge_csv_shards(&config.output) {
@@ -248,6 +257,7 @@ pub fn spawn_merge(config: MergeConfig, done: Arc<AtomicBool>, error: Arc<Mutex<
     });
 }
 
+/// Resets progress state and spawns the appropriate worker thread for the current operation.
 pub fn start_operation(app: &mut App) {
     // Reset state
     app.cancel.store(false, Ordering::Release);

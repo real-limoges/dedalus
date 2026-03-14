@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- README: Prerequisites section with install commands for Rust, Docker, lbzip2
+- README: "Obtaining Wikipedia Dumps" section with multistream vs standard comparison
+- README: `dedalus pipeline` flag table (17 flags), restructured as first Usage subsection
+- README: `dedalus stats` and `dedalus tui` sections with flag tables and keyboard controls
+- README: `--archive` flag added to `merge-csvs` table
+- README: Quick Start restructured around `pipeline` as the recommended one-command approach
+- Inline `//!` module docs and `///` item docs for all 6 TUI source files
+- Doc comment on `Infobox` struct in `infobox.rs`
+- CLAUDE.md: `tui/` entry in Core Modules table
 - `EdgeType` enum replacing stringly-typed `"LINKS_TO"` / `"SEE_ALSO"` constants
 - `CsvType` enum with `ALL` constant and `base_name()` method replacing `CSV_TYPES: &[&str]`
 - `ExtractionConfig` struct eliminating all `#[allow(clippy::too_many_arguments)]` suppressions

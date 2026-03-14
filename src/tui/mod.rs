@@ -1,3 +1,9 @@
+//! Interactive terminal UI for configuring and monitoring Dedalus operations.
+//!
+//! Provides a form-based interface for extract, import, and merge-csvs operations
+//! with real-time progress monitoring, live extraction stats, and log streaming.
+//! Built on `ratatui` and `crossterm`.
+
 pub mod app;
 pub mod event;
 pub mod logging;
@@ -23,6 +29,11 @@ use app::{App, Operation, Screen};
 use event::{AppEvent, EventHandler};
 use logging::TuiLogLayer;
 
+/// Launches the interactive TUI, taking over the terminal until the user quits.
+///
+/// Sets up a `tracing` subscriber that captures log output into a shared buffer
+/// (displayed in the TUI's log panel), initializes the `ratatui` alternate screen,
+/// and runs the main event loop.
 pub fn run_tui() -> Result<()> {
     // Set up TUI log capture
     let logs: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));

@@ -21,16 +21,47 @@ Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extra
 - **Dry-run mode** -- validate pipeline without writing files
 - **Progress reporting and structured logging** via `indicatif` and `tracing`
 - **Apple Silicon optimizations** -- Native SIMD targeting for ~1.6x faster extraction on ARM64
+- **Interactive TUI** -- terminal UI for configuring and monitoring extract/import/merge operations
+
+## Prerequisites
+
+- **Rust 1.87+** (stable) -- [install via rustup](https://rustup.rs/)
+- **Docker** -- required for Neo4j import (manages container lifecycle automatically)
+- **lbzip2** (optional, recommended) -- parallel bzip2 decompression for standard (non-multistream) dumps
+  ```bash
+  # macOS
+  brew install lbzip2
+  # Debian/Ubuntu
+  apt install lbzip2
+  ```
+- **Wikipedia dump file** -- see [Obtaining Wikipedia Dumps](#obtaining-wikipedia-dumps) below
+
+## Obtaining Wikipedia Dumps
+
+Download dumps from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/). Two formats are available:
+
+| Format | Files | Decompression |
+|--------|-------|---------------|
+| **Multistream** (recommended) | `enwiki-latest-pages-articles-multistream.xml.bz2` + `enwiki-latest-pages-articles-multistream-index.txt.bz2` | Parallel -- each rayon worker decompresses its own bz2 stream |
+| Standard | `enwiki-latest-pages-articles.xml.bz2` | Sequential -- single bz2 stream (uses `lbzip2` if available) |
+
+**Recommendation**: Use the multistream format. It contains ~200K independent bz2 streams (~100 pages each), allowing Dedalus to parallelize both decompression and XML parsing across all CPU cores. The standard format is a single bz2 stream, limiting parallelism to extraction only.
+
+Download both files for multistream:
+```bash
+# ~22GB dump + ~250MB index
+wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
+wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream-index.txt.bz2
+```
 
 ## Building
-
 Requires Rust 1.87+ (stable).
 
 ```bash
 cargo build --release
 ```
 
-**Performance Note**: The project uses `.cargo/config.toml` to enable native CPU targeting (`target-cpu=native`) for SIMD optimizations. On Apple Silicon (M1–M5), this provides ~1.6x faster extraction via NEON SIMD instructions. Always use `--release` for production workloads.
+**Performance Note**: The project uses `.cargo/config.toml` to enable native CPU targeting (`target-cpu=native`) for SIMD optimizations. On Apple Silicon (M1--M5), this provides ~1.6x faster extraction via NEON SIMD instructions. Always use `--release` for production workloads.
 
 ## Performance
 
@@ -56,14 +87,29 @@ cargo build --release
 
 ## Quick Start
 
-```bash
-# Standard workflow (single shard)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 1 -v
-dedalus import -o output/ --admin-import
+The `pipeline` subcommand runs the full workflow in one command (extract → merge → import):
 
-# Hybrid workflow for optimal performance (fast extraction + fast import)
+```bash
+# Full pipeline with multistream dump (recommended)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
+
+# Test with a page limit first
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
+
+# Extract + merge only (no Neo4j)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --no-import -v
+```
+
+After import completes, Neo4j is available at:
+- **Bolt**: `bolt://localhost:7687`
+- **Browser**: `http://localhost:7474`
+
+<details>
+<summary>Manual workflow (extract → merge → import separately)</summary>
+
+```bash
 # Step 1: Fast extraction with 14 shards (1.62x speedup)
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 14 -v
+dedalus extract -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --csv-shards 14 -v
 
 # Step 2: Merge CSVs (deduplicates categories/images/external links, <5 min overhead)
 dedalus merge-csvs -o output/
@@ -72,13 +118,39 @@ dedalus merge-csvs -o output/
 dedalus import -o output/ --admin-import
 ```
 
-After import completes, Neo4j is available at:
-- **Bolt**: `bolt://localhost:7687`
-- **Browser**: `http://localhost:7474`
+</details>
 
 ## Usage
 
-Dedalus uses subcommands: `extract`, `import`, `merge-csvs`, `pipeline`, and `stats`.
+Dedalus uses subcommands: `pipeline`, `extract`, `import`, `merge-csvs`, `stats`, and `tui`.
+
+### `dedalus pipeline`
+
+Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → import. Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based import, use the individual `import` subcommand.
+```bash
+dedalus pipeline -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i, --input <PATH>` | Path to Wikipedia dump file (`.xml.bz2`) | required |
+| `-o, --output <DIR>` | Output directory for generated files | required |
+| `--shard-count <N>` | Number of shards for blob storage | `1000` |
+| `--csv-shards <N>` | Number of CSV output shards for parallel extraction | `8` |
+| `--limit <N>` | Limit pages processed (useful for testing) | none |
+| `--resume` | Resume from last checkpoint if available | `false` |
+| `--no-cache` | Force rebuild of index cache | `false` |
+| `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
+| `--clean` | Clear existing outputs and Neo4j data before starting | `false` |
+| `--bolt-uri <URI>` | Neo4j Bolt URI | `bolt://localhost:7687` |
+| `--import-prefix <PREFIX>` | Import file URI prefix for Neo4j LOAD CSV | `file://` |
+| `--max-parallel-edges <N>` | Max concurrent edge import jobs | `4` |
+| `--max-parallel-light <N>` | Max concurrent light import jobs | `8` |
+| `--compose-file <PATH>` | Docker compose file path (auto-detected if omitted) | auto |
+| `--no-docker` | Skip Docker management, connect to already-running Neo4j | `false` |
+| `--no-import` | Skip the import step (extract + merge only) | `false` |
+| `--no-archive` | Don't archive sharded CSVs after merging | `false` |
+| `--multistream-index <PATH>` | Path to multistream index file (`.txt.bz2`) for parallel parsing | auto-detected |
 
 ### `dedalus extract`
 
@@ -131,14 +203,49 @@ dedalus import -o <output-dir> [OPTIONS]
 Merges sharded CSV files into single files suitable for neo4j-admin import. Performs deduplication of categories, images, and external links.
 
 ```bash
-dedalus merge-csvs -o <output-dir>
+dedalus merge-csvs -o <output-dir> [OPTIONS]
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-o, --output <DIR>` | Directory containing sharded CSVs (e.g., `nodes_000.csv`) | required |
+| `--archive` | Archive sharded CSVs to `output/shards/` after merging | `false` |
 
 **Note**: When using `dedalus pipeline`, sharded CSV files are automatically archived to a `shards/` subdirectory after merging to prevent import confusion. Use `--no-archive` to skip this. This preserves the original sharded files while keeping only merged files in the main output directory.
+
+### `dedalus stats`
+
+Shows output directory statistics: CSV file sizes, blob counts, and total disk usage.
+
+```bash
+dedalus stats -o <output-dir>
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-o, --output <DIR>` | Output directory to inspect | `output` |
+
+### `dedalus tui`
+
+Launches an interactive terminal UI for configuring and running extract, import, and merge operations. The TUI provides a form-based interface for setting all CLI flags without memorizing them, plus real-time progress monitoring with live stats and log streaming.
+
+```bash
+dedalus tui
+```
+
+**Keyboard controls:**
+
+| Key | Screen | Action |
+|-----|--------|--------|
+| `Tab` / `Shift+Tab` | Config | Switch between Extract / Import / MergeCsvs tabs |
+| `Up` / `Down` | Config | Navigate form fields |
+| `Enter` | Config | Toggle checkbox or start operation |
+| `Space` | Config | Toggle checkbox or type space in text field |
+| `c` | Progress | Cancel running operation |
+| `Up` / `Down` | Progress | Scroll log output |
+| `r` | Done | Return to config screen |
+| `q` | Config/Done | Quit |
+| `Ctrl+C` | Any | Force quit |
 
 ### Global flags
 
@@ -149,39 +256,48 @@ dedalus merge-csvs -o <output-dir>
 ### Examples
 
 ```bash
-# Process the full English Wikipedia dump
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ -v
+# Full pipeline (recommended)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
+
+# Test pipeline with limited pages
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
+
+# Extract + merge only (no Neo4j)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --no-import -v
+
+# Single shard pipeline (simpler, slower extraction)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 1 -v
+
+# Clean slate (clear outputs + Neo4j data)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --clean -v
+
+# Resume interrupted extraction
+dedalus extract -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --resume -v
 
 # Quick test with 10,000 pages
 dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
 
-# Extract with CSV sharding for parallel extraction
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 14 -v
-
 # Merge sharded CSVs for neo4j-admin import
 dedalus merge-csvs -o output/
-
-# Resume interrupted extraction
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --resume -v
 
 # Import into Neo4j using neo4j-admin bulk import (fastest)
 dedalus import -o output/ --admin-import
 
-# Import into Neo4j via Bolt (works with sharded CSVs)
+# Bolt-based import (slower, for incremental updates)
 dedalus import -o output/
-
-# Clean import (tears down volumes, starts fresh)
-dedalus import -o output/ --clean
 
 # Import into an already-running Neo4j instance
 dedalus import -o output/ --no-docker --bolt-uri bolt://my-neo4j:7687
 
-# Multistream parallel parsing (auto-detects index file from dump filename)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
-
 # Multistream with explicit index path
 dedalus extract -i dump-multistream.xml.bz2 -o output/ \
   --multistream-index dump-multistream-index.txt.bz2 -v
+
+# Check output directory statistics
+dedalus stats -o output/
+
+# Launch interactive TUI
+dedalus tui
 ```
 
 ## Output Format
@@ -249,7 +365,7 @@ Empty fields are omitted from the JSON for compactness.
 
 | Module | Purpose |
 |--------|---------|
-| `main.rs` | CLI subcommands (`clap`), orchestrates extract/import/merge-csvs |
+| `main.rs` | CLI subcommands (`clap`), orchestrates extract/import/merge-csvs/pipeline/stats/tui |
 | `parser.rs` | `PageParser<R>` -- generic streaming XML parser implementing `Iterator<Item = WikiPage>`; `WikiReader` wraps it with BZ2 decompression and auto-detects parallel decompressor |
 | `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution; `build_multistream()` for parallel index building |
 | `extract.rs` | Parallel extraction with `ShardedCsvWriter` for split CSV output; multistream-aware parallel decompression |
@@ -263,6 +379,7 @@ Empty fields are omitted from the JSON for compactness.
 | `config.rs` | Constants for extraction and import |
 | `cache.rs` | Index persistence -- zero-copy serialization via `IndexCacheSer` |
 | `checkpoint.rs` | Extraction checkpointing with double-checked locking for resumable processing |
+| `tui/` | Interactive terminal UI (`ratatui` + `crossterm`) -- config forms, progress monitoring with live stats, log streaming |
 
 ## Docker / Neo4j Setup
 
