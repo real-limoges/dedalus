@@ -6,6 +6,7 @@
 use memchr::{memchr, memchr2, memchr3};
 use serde::{Deserialize, Serialize};
 
+/// A parsed `{{Infobox ...}}` template with its type name and key-value fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Infobox {
     pub infobox_type: String,

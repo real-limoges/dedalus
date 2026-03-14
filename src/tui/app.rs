@@ -1,3 +1,8 @@
+//! TUI application state and configuration types.
+//!
+//! Defines the data model for all three TUI screens (config, progress, done),
+//! per-operation form configurations, field enums for navigation, and validation logic.
+
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -5,6 +10,7 @@ use std::time::Instant;
 
 use crate::stats::ExtractionStats;
 
+/// Which screen the TUI is currently displaying.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Config,
@@ -12,6 +18,7 @@ pub enum Screen {
     Done,
 }
 
+/// Which Dedalus operation the user has selected in the config screen.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Extract,
@@ -20,6 +27,7 @@ pub enum Operation {
 }
 
 impl Operation {
+    /// Returns the display label for this operation (used in tab headers).
     pub fn label(&self) -> &str {
         match self {
             Operation::Extract => "Extract",
@@ -28,11 +36,13 @@ impl Operation {
         }
     }
 
+    /// Returns all available operations in tab order.
     pub fn all() -> &'static [Operation] {
         &[Operation::Extract, Operation::Import, Operation::MergeCsvs]
     }
 }
 
+/// Navigable fields in the Extract configuration form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ExtractField {
     Input,
@@ -47,6 +57,7 @@ pub enum ExtractField {
     Clean,
 }
 
+/// Navigable fields in the Import configuration form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImportField {
     Output,
@@ -60,11 +71,13 @@ pub enum ImportField {
     AdminImport,
 }
 
+/// Navigable fields in the MergeCsvs configuration form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MergeField {
     Output,
 }
 
+/// Ordered list of Extract form fields for UI navigation.
 pub static EXTRACT_FIELDS: &[ExtractField] = &[
     ExtractField::Input,
     ExtractField::Output,
@@ -78,6 +91,7 @@ pub static EXTRACT_FIELDS: &[ExtractField] = &[
     ExtractField::Clean,
 ];
 
+/// Ordered list of Import form fields for UI navigation.
 pub static IMPORT_FIELDS: &[ImportField] = &[
     ImportField::Output,
     ImportField::BoltUri,
@@ -90,8 +104,10 @@ pub static IMPORT_FIELDS: &[ImportField] = &[
     ImportField::AdminImport,
 ];
 
+/// Ordered list of MergeCsvs form fields for UI navigation.
 pub static MERGE_FIELDS: &[MergeField] = &[MergeField::Output];
 
+/// Form state for the Extract operation's configuration fields.
 pub struct ExtractConfig {
     pub input: String,
     pub output: String,
@@ -122,6 +138,7 @@ impl Default for ExtractConfig {
     }
 }
 
+/// Form state for the Import operation's configuration fields.
 pub struct ImportConfigTui {
     pub output: String,
     pub bolt_uri: String,
@@ -150,6 +167,7 @@ impl Default for ImportConfigTui {
     }
 }
 
+/// Form state for the MergeCsvs operation's configuration fields.
 pub struct MergeConfig {
     pub output: String,
 }
@@ -162,6 +180,7 @@ impl Default for MergeConfig {
     }
 }
 
+/// Root application state shared across all TUI screens and operations.
 pub struct App {
     pub screen: Screen,
     pub operation: Operation,
@@ -189,6 +208,7 @@ pub struct App {
 }
 
 impl App {
+    /// Creates a new `App` with default configuration and the given shared log buffer.
     pub fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         Self {
             screen: Screen::Config,
@@ -215,6 +235,7 @@ impl App {
         }
     }
 
+    /// Returns the number of navigable fields for the current operation.
     pub fn field_count(&self) -> usize {
         match self.operation {
             Operation::Extract => EXTRACT_FIELDS.len(),
@@ -223,6 +244,7 @@ impl App {
         }
     }
 
+    /// Returns `true` if the currently selected field is a boolean checkbox.
     pub fn current_field_is_checkbox(&self) -> bool {
         match self.operation {
             Operation::Extract => matches!(
@@ -240,6 +262,7 @@ impl App {
         }
     }
 
+    /// Toggles the boolean value of the currently selected checkbox field.
     pub fn toggle_checkbox(&mut self) {
         match self.operation {
             Operation::Extract => match EXTRACT_FIELDS[self.field_index] {
@@ -265,6 +288,7 @@ impl App {
         }
     }
 
+    /// Returns a mutable reference to the currently selected text field, or `None` for checkboxes.
     pub fn current_text_field(&mut self) -> Option<&mut String> {
         match self.operation {
             Operation::Extract => match EXTRACT_FIELDS[self.field_index] {
@@ -291,6 +315,7 @@ impl App {
         }
     }
 
+    /// Validates all fields for the current operation before starting it.
     pub fn validate(&self) -> Result<(), String> {
         match self.operation {
             Operation::Extract => {

@@ -262,6 +262,8 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 
 - **`checkpoint.rs`**: `CheckpointManager` with double-checked locking for periodic checkpoint saves. Atomic write via `.tmp` + rename for crash safety. Cleared on successful completion.
 
+- **`tui/`**: Interactive terminal UI (`ratatui` + `crossterm`). `mod.rs` sets up tracing capture and the alternate-screen event loop. `app.rs` defines `App` state, per-operation config structs, field enums, and validation. `event.rs` polls `crossterm` on a background thread via `mpsc`. `logging.rs` implements a `tracing::Layer` that pushes formatted lines into a shared `VecDeque`. `runner.rs` spawns worker threads for extract/import/merge with shared `Arc<AtomicBool>` completion signals. `ui.rs` renders config forms, real-time stats panels, scrollable logs, and done summaries.
+
 ### Key Performance Patterns
 
 - **Iterator trait** on `WikiReader` for lazy streaming (never loads full dump in memory)

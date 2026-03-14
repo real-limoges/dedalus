@@ -1,3 +1,9 @@
+//! Tracing layer that captures log events into a shared buffer for TUI display.
+//!
+//! [`TuiLogLayer`] implements `tracing_subscriber::Layer` and formats each event
+//! as `[LEVEL] message field=value ...`, pushing lines into a bounded `VecDeque`
+//! that the TUI's log panel reads on each tick.
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -8,11 +14,13 @@ use tracing_subscriber::Layer;
 
 const MAX_LOG_LINES: usize = 1000;
 
+/// A `tracing` layer that writes formatted log lines into a shared `VecDeque`.
 pub struct TuiLogLayer {
     logs: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl TuiLogLayer {
+    /// Creates a new layer backed by the given shared log buffer.
     pub fn new(logs: Arc<Mutex<VecDeque<String>>>) -> Self {
         Self { logs }
     }

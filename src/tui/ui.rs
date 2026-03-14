@@ -1,3 +1,8 @@
+//! TUI rendering functions for all three screens (config, progress, done).
+//!
+//! Uses `ratatui` widgets to draw tabbed configuration forms, real-time stats panels
+//! with optional progress bars, scrollable log output, and completion summaries.
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -6,6 +11,7 @@ use ratatui::Frame;
 
 use super::app::*;
 
+/// Top-level draw dispatcher -- delegates to the handler for the current screen.
 pub fn draw(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Config => draw_config(f, app),
