@@ -213,7 +213,7 @@ dedalus import -o output/ --no-docker --bolt-uri bolt://my-neo4j:7687
 
 ## Output Format
 
-With `--csv-shards 1` (default), extraction produces single files. With `--csv-shards N` (N > 1), each CSV is split into numbered shards (e.g. `edges_000.csv` through `edges_015.csv`).
+With `--csv-shards 1`, extraction produces single files. With `--csv-shards N` (N > 1), each CSV is split into numbered shards (e.g. `edges_000.csv` through `edges_015.csv`).
 
 ```
 output/

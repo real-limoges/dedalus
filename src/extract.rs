@@ -14,22 +14,24 @@ use rayon::prelude::*;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 fn is_namespace_link(target: &str) -> bool {
-    target.starts_with("Category:")
-        || target.starts_with("File:")
-        || target.starts_with("Image:")
-        || target.starts_with("Template:")
-        || target.starts_with("Wikipedia:")
-        || target.starts_with("Help:")
-        || target.starts_with("Portal:")
-        || target.starts_with("Draft:")
-        || target.starts_with("User:")
-        || target.starts_with("Module:")
-        || target.starts_with("MediaWiki:")
+    match target.as_bytes().first() {
+        Some(b'C') => target.starts_with("Category:"),
+        Some(b'F') => target.starts_with("File:"),
+        Some(b'I') => target.starts_with("Image:"),
+        Some(b'T') => target.starts_with("Template:"),
+        Some(b'W') => target.starts_with("Wikipedia:"),
+        Some(b'H') => target.starts_with("Help:"),
+        Some(b'P') => target.starts_with("Portal:"),
+        Some(b'D') => target.starts_with("Draft:"),
+        Some(b'U') => target.starts_with("User:"),
+        Some(b'M') => target.starts_with("Module:") || target.starts_with("MediaWiki:"),
+        _ => false,
+    }
 }
 
 fn strip_section_anchor(target: &str) -> &str {
@@ -132,20 +134,6 @@ pub fn run_extraction(
     resume_from: Option<&Checkpoint>,
     checkpoint_mgr: Option<&CheckpointManager>,
 ) -> Result<ExtractionStats> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        use rayon::ThreadPoolBuilder;
-        let _ = ThreadPoolBuilder::new()
-            .num_threads(8) // P-cores only
-            .spawn_handler(|thread| {
-                std::thread::Builder::new()
-                    .name(format!("dedalus-extract-{}", thread.index()))
-                    .spawn(move || thread.run())
-                    .map(|_| ())
-            })
-            .build_global();
-    }
-
     let stats = Arc::new(if let Some(cp) = resume_from {
         ExtractionStats::from_checkpoint(&cp.stats)
     } else {
@@ -236,11 +224,10 @@ pub fn run_extraction(
 
     let stats_clone = Arc::clone(&stats);
     let limit_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let limit_reached = Arc::new(AtomicBool::new(false));
     let seen_categories: Arc<DashSet<String>> = Arc::new(DashSet::new());
     let seen_images: Arc<DashSet<String>> = Arc::new(DashSet::new());
     let seen_external_links: Arc<DashSet<String>> = Arc::new(DashSet::new());
-
-    let max_completed_id = Arc::new(AtomicU32::new(resume_after_id));
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -256,19 +243,24 @@ pub fn run_extraction(
         .filter(|page| page.id > resume_after_id)
         .par_bridge()
         .for_each(|page| {
+            if limit_reached.load(Ordering::Relaxed) {
+                return;
+            }
             if let Some(max) = limit {
-                let current = limit_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let current = limit_counter.fetch_add(1, Ordering::Relaxed);
                 if current >= max {
+                    limit_reached.store(true, Ordering::Relaxed);
                     return;
                 }
             }
 
             if let PageType::Article = page.page_type {
-                let id_str = page.id.to_string();
+                let mut itoa_buf = itoa::Buffer::new();
+                let id_str = itoa_buf.format(page.id);
                 stats_clone.inc_articles();
 
                 if let Ok(mut writer) = nodes_writer.shard_for(page.id).lock() {
-                    if let Err(e) = writer.write_record([&id_str, &page.title, "Page"]) {
+                    if let Err(e) = writer.write_record([id_str, &page.title, "Page"]) {
                         warn!(error = %e, "Failed to write node record");
                     }
                 }
@@ -276,7 +268,7 @@ pub fn run_extraction(
                 if let Some(text) = &page.text {
                     let see_also_start = content::see_also_section_start(text);
 
-                    let mut local_edges: Vec<(String, &str)> = Vec::new();
+                    let mut local_edges: Vec<(u32, &str)> = Vec::with_capacity(16);
                     let mut invalid_count = 0u64;
 
                     for caps in LINK_REGEX.captures_iter(text) {
@@ -295,11 +287,15 @@ pub fn run_extraction(
                                 }
                                 _ => "LINKS_TO",
                             };
-                            local_edges.push((target_id.to_string(), edge_type));
+                            local_edges.push((target_id, edge_type));
                         } else {
                             invalid_count += 1;
                         }
                     }
+
+                    // Deduplicate edges per article
+                    local_edges.sort_unstable();
+                    local_edges.dedup();
 
                     let links_to_count =
                         local_edges.iter().filter(|(_, t)| *t == "LINKS_TO").count() as u64;
@@ -310,10 +306,12 @@ pub fn run_extraction(
                     stats_clone.add_invalid_links(invalid_count);
 
                     if !local_edges.is_empty() {
+                        let mut edge_itoa = itoa::Buffer::new();
                         if let Ok(mut writer) = edges_writer.shard_for(page.id).lock() {
-                            for (end, edge_type) in &local_edges {
+                            for (end_id, edge_type) in &local_edges {
+                                let end_str = edge_itoa.format(*end_id);
                                 if let Err(e) =
-                                    writer.write_record([id_str.as_str(), end.as_str(), edge_type])
+                                    writer.write_record([id_str, end_str, edge_type])
                                 {
                                     warn!(error = %e, "Failed to write edge record");
                                 }
@@ -324,12 +322,13 @@ pub fn run_extraction(
                     let categories = content::extract_categories(text);
                     if !categories.is_empty() {
                         // Collect newly-seen categories locally, then lock once.
+                        // contains() fast-path skips clone+insert for duplicates.
                         let mut new_cats: Vec<&str> = Vec::new();
                         for cat_name in &categories {
-                            if !seen_categories.contains(cat_name.as_str())
-                                && seen_categories.insert(cat_name.clone())
+                            if !seen_categories.contains(cat_name.as_ref())
+                                && seen_categories.insert(cat_name.as_ref().to_owned())
                             {
-                                new_cats.push(cat_name);
+                                new_cats.push(cat_name.as_ref());
                             }
                         }
                         if !new_cats.is_empty() {
@@ -350,7 +349,7 @@ pub fn run_extraction(
                         {
                             for cat_name in &categories {
                                 if let Err(e) =
-                                    writer.write_record([id_str.as_str(), cat_name, "HAS_CATEGORY"])
+                                    writer.write_record([id_str, cat_name.as_ref(), "HAS_CATEGORY"])
                                 {
                                     warn!(error = %e, "Failed to write category edge record");
                                 }
@@ -361,12 +360,13 @@ pub fn run_extraction(
                     let images = content::extract_images(text);
                     if !images.is_empty() {
                         // Collect newly-seen images locally, then lock once.
+                        // contains() fast-path skips clone+insert for duplicates.
                         let mut new_images: Vec<&str> = Vec::new();
                         for filename in &images {
-                            if !seen_images.contains(filename.as_str())
-                                && seen_images.insert(filename.clone())
+                            if !seen_images.contains(filename.as_ref())
+                                && seen_images.insert(filename.as_ref().to_owned())
                             {
-                                new_images.push(filename);
+                                new_images.push(filename.as_ref());
                             }
                         }
                         if !new_images.is_empty() {
@@ -386,7 +386,7 @@ pub fn run_extraction(
                         if let Ok(mut writer) = article_images_writer.shard_for(page.id).lock() {
                             for filename in &images {
                                 if let Err(e) = writer
-                                    .write_record([id_str.as_str(), filename.as_str(), "HAS_IMAGE"])
+                                    .write_record([id_str, filename.as_ref(), "HAS_IMAGE"])
                                 {
                                     warn!(error = %e, "Failed to write article-image edge record");
                                 }
@@ -397,12 +397,13 @@ pub fn run_extraction(
                     let ext_links = content::extract_external_links(text);
                     if !ext_links.is_empty() {
                         // Collect newly-seen external links locally, then lock once.
+                        // contains() fast-path skips clone+insert for duplicates.
                         let mut new_links: Vec<&str> = Vec::new();
                         for url in &ext_links {
-                            if !seen_external_links.contains(url.as_str())
-                                && seen_external_links.insert(url.clone())
+                            if !seen_external_links.contains(url.as_ref())
+                                && seen_external_links.insert(url.as_ref().to_owned())
                             {
-                                new_links.push(url);
+                                new_links.push(url.as_ref());
                             }
                         }
                         if !new_links.is_empty() {
@@ -426,7 +427,7 @@ pub fn run_extraction(
                         {
                             for url in &ext_links {
                                 if let Err(e) = writer
-                                    .write_record([id_str.as_str(), url.as_str(), "HAS_LINK"])
+                                    .write_record([id_str, url.as_ref(), "HAS_LINK"])
                                 {
                                     warn!(error = %e, "Failed to write article-external link edge record");
                                 }
@@ -451,7 +452,10 @@ pub fn run_extraction(
                             id: page.id,
                             title: page.title,
                             abstract_text,
-                            categories,
+                            categories: categories
+                                .into_iter()
+                                .map(|c| c.into_owned())
+                                .collect(),
                             infoboxes,
                             sections,
                             timestamp: page.timestamp,
@@ -461,7 +465,7 @@ pub fn run_extraction(
                         let blob_path = format!("{}/{}.json", dir_path, page.id);
                         match File::create(&blob_path) {
                             Ok(f) => {
-                                let mut w = BufWriter::with_capacity(256 * 1024, f);
+                                let mut w = BufWriter::new(f);
                                 if let Err(e) = serde_json::to_writer(&mut w, &blob) {
                                     warn!(error = %e, path = %blob_path, "Failed to write blob");
                                 } else {
@@ -476,11 +480,8 @@ pub fn run_extraction(
                     }
                 }
 
-                max_completed_id.fetch_max(page.id, Ordering::Relaxed);
-
                 if let Some(mgr) = checkpoint_mgr {
-                    let highest = max_completed_id.load(Ordering::Relaxed);
-                    if let Err(e) = mgr.maybe_save(highest, &stats_clone) {
+                    if let Err(e) = mgr.maybe_save(page.id, &stats_clone) {
                         warn!(error = %e, "Failed to save checkpoint");
                     }
                 }

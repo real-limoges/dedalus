@@ -1,5 +1,6 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::borrow::Cow;
 
 static CATEGORY_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[Category:([^|\]]+?)(?:\|[^\]]+)?\]\]").unwrap());
@@ -78,53 +79,54 @@ pub fn extract_see_also_links(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn extract_categories(text: &str) -> Vec<String> {
+pub fn extract_categories(text: &str) -> Vec<Cow<'_, str>> {
     CATEGORY_REGEX
         .captures_iter(text)
-        .map(|c| sanitize_field(c[1].trim()))
+        .filter_map(|c| c.get(1).map(|m| sanitize_field(m.as_str().trim())))
         .filter(|s| !s.is_empty())
         .collect()
 }
 
 /// Collapses newlines into spaces so CSV fields stay on a single line.
-fn sanitize_field(s: &str) -> String {
-    if s.contains('\n') || s.contains('\r') {
-        // Single-pass optimization: build string directly instead of replace→split→collect→join
-        let mut result = String::with_capacity(s.len());
-        let mut last_was_space = false;
-        for c in s.chars() {
-            if c == '\n' || c == '\r' || c.is_whitespace() {
-                if !last_was_space && !result.is_empty() {
-                    result.push(' ');
-                    last_was_space = true;
-                }
-            } else {
-                result.push(c);
-                last_was_space = false;
-            }
-        }
-        // Trim trailing space if present
-        if result.ends_with(' ') {
-            result.pop();
-        }
-        result
-    } else {
-        s.to_string()
+/// Returns `Cow::Borrowed` when no transformation is needed (>99% of inputs),
+/// avoiding allocation for clean strings.
+fn sanitize_field(s: &str) -> Cow<'_, str> {
+    if !s.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return Cow::Borrowed(s);
     }
+    // Single-pass optimization: build string directly instead of replace→split→collect→join
+    let mut result = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for c in s.chars() {
+        if c == '\n' || c == '\r' || c.is_whitespace() {
+            if !last_was_space && !result.is_empty() {
+                result.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            result.push(c);
+            last_was_space = false;
+        }
+    }
+    // Trim trailing space if present
+    if result.ends_with(' ') {
+        result.pop();
+    }
+    Cow::Owned(result)
 }
 
-pub fn extract_images(text: &str) -> Vec<String> {
+pub fn extract_images(text: &str) -> Vec<Cow<'_, str>> {
     IMAGE_REGEX
         .captures_iter(text)
-        .map(|c| sanitize_field(c[1].trim()))
+        .filter_map(|c| c.get(1).map(|m| sanitize_field(m.as_str().trim())))
         .filter(|s| !s.is_empty())
         .collect()
 }
 
-pub fn extract_external_links(text: &str) -> Vec<String> {
+pub fn extract_external_links(text: &str) -> Vec<Cow<'_, str>> {
     EXTERNAL_LINK_REGEX
         .captures_iter(text)
-        .map(|c| sanitize_field(c[1].trim()))
+        .filter_map(|c| c.get(1).map(|m| sanitize_field(m.as_str().trim())))
         .filter(|s| !s.is_empty())
         .collect()
 }

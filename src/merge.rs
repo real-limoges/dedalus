@@ -4,14 +4,15 @@ use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
+use tracing::info;
 
 /// Merges sharded CSV files into single files suitable for neo4j-admin import
 pub fn merge_csv_shards(output_dir: &str) -> Result<()> {
-    println!("Detecting CSV shards in: {}", output_dir);
+    info!("Detecting CSV shards in: {}", output_dir);
 
     // Detect shard count from nodes_*.csv
     let shard_count = detect_shard_count(output_dir)?;
-    println!("  Found {} shards", shard_count);
+    info!("  Found {} shards", shard_count);
 
     // Merge each CSV type
     merge_simple(output_dir, "nodes", shard_count)?;
@@ -23,7 +24,7 @@ pub fn merge_csv_shards(output_dir: &str) -> Result<()> {
     merge_with_dedup(output_dir, "external_link_nodes", shard_count)?; // Needs dedup
     merge_simple(output_dir, "article_external_links", shard_count)?;
 
-    println!("Merge complete. Single CSV files ready for --admin-import.");
+    info!("Merge complete. Single CSV files ready for --admin-import.");
     Ok(())
 }
 
@@ -46,7 +47,7 @@ fn detect_shard_count(output_dir: &str) -> Result<u32> {
 
 /// Simple concatenation for CSV types without deduplication needs
 fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<()> {
-    println!("  Merging {}...", base_name);
+    info!("  Merging {}...", base_name);
 
     let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
     let mut writer = Writer::from_writer(BufWriter::with_capacity(
@@ -56,13 +57,19 @@ fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<(
 
     // Write header from first shard
     let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
-    let mut first_reader = Reader::from_reader(BufReader::new(File::open(&first_shard)?));
+    let mut first_reader = Reader::from_reader(BufReader::with_capacity(
+        256 * 1024,
+        File::open(&first_shard)?,
+    ));
     writer.write_record(first_reader.headers()?)?;
 
     // Copy data rows from all shards
     for shard in 0..shard_count {
         let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
-        let mut reader = Reader::from_reader(BufReader::new(File::open(&shard_path)?));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(
+            256 * 1024,
+            File::open(&shard_path)?,
+        ));
 
         for result in reader.records() {
             let record = result?;
@@ -76,7 +83,7 @@ fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<(
 
 /// Merge with deduplication for node files (first column is ID)
 fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Result<()> {
-    println!("  Merging {} (with deduplication)...", base_name);
+    info!("  Merging {} (with deduplication)...", base_name);
 
     let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
     let mut writer = Writer::from_writer(BufWriter::with_capacity(
@@ -89,13 +96,19 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
 
     // Write header from first shard
     let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
-    let mut first_reader = Reader::from_reader(BufReader::new(File::open(&first_shard)?));
+    let mut first_reader = Reader::from_reader(BufReader::with_capacity(
+        256 * 1024,
+        File::open(&first_shard)?,
+    ));
     writer.write_record(first_reader.headers()?)?;
 
     // Read all shards, skip duplicates
     for shard in 0..shard_count {
         let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
-        let mut reader = Reader::from_reader(BufReader::new(File::open(&shard_path)?));
+        let mut reader = Reader::from_reader(BufReader::with_capacity(
+            256 * 1024,
+            File::open(&shard_path)?,
+        ));
 
         for result in reader.records() {
             let record = result?;
@@ -109,7 +122,7 @@ fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Resu
     }
 
     writer.flush()?;
-    println!("    Unique nodes: {}", seen_ids.len());
+    info!("    Unique nodes: {}", seen_ids.len());
     Ok(())
 }
 
