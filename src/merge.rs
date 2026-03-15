@@ -4,7 +4,7 @@
 //! deduplication of categories, images, and external links using `FxHashSet`.
 //! Uses streaming I/O with 256KB buffers.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use csv::{Reader, Writer};
 use rustc_hash::FxHashSet;
 use std::fs::{self, File};

@@ -10,11 +10,11 @@ use crate::csv_util::{self, CsvLayout};
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use surrealdb::engine::local::RocksDb;
 use surrealdb::Surreal;
+use surrealdb::engine::local::RocksDb;
 use tracing::info;
 
 /// Maximum number of concurrent batch insert tasks.
@@ -212,12 +212,13 @@ async fn load_articles(
     // Flush remaining batch
     if batch_count > 0 {
         if in_flight.len() >= MAX_CONCURRENT_BATCHES
-            && let Some(result) = in_flight.next().await {
-                match result {
-            Ok(inner) => inner?,
-            Err(e) => anyhow::bail!("Task join error: {e}"),
-        }
+            && let Some(result) = in_flight.next().await
+        {
+            match result {
+                Ok(inner) => inner?,
+                Err(e) => anyhow::bail!("Task join error: {e}"),
             }
+        }
         let query = batch;
         let db = db.clone();
         let counter = Arc::clone(&counter);
@@ -306,12 +307,13 @@ async fn load_edges(
     // Flush remaining batch
     if batch_count > 0 {
         if in_flight.len() >= MAX_CONCURRENT_BATCHES
-            && let Some(result) = in_flight.next().await {
-                match result {
-            Ok(inner) => inner?,
-            Err(e) => anyhow::bail!("Task join error: {e}"),
-        }
+            && let Some(result) = in_flight.next().await
+        {
+            match result {
+                Ok(inner) => inner?,
+                Err(e) => anyhow::bail!("Task join error: {e}"),
             }
+        }
         let query = batch;
         let db = db.clone();
         let counter = Arc::clone(&counter);

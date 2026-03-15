@@ -31,9 +31,9 @@
 //! - 2 special pages: File:Rust logo.svg, Category:Programming languages
 //! - Article features: wikilinks, categories, infoboxes, see-also sections, images, external links
 
-use bzip2::write::BzEncoder;
 use bzip2::Compression;
-use dedalus::extract::{run_extraction, ExtractionConfig};
+use bzip2::write::BzEncoder;
+use dedalus::extract::{ExtractionConfig, run_extraction};
 use dedalus::index::WikiIndex;
 use dedalus::models::{ArticleBlob, PageType};
 use dedalus::parser::WikiReader;
@@ -192,11 +192,13 @@ fn parser_reads_text_when_not_skipped() {
     let pages: Vec<_> = reader.collect();
 
     assert!(pages[0].text.is_some());
-    assert!(pages[0]
-        .text
-        .as_ref()
-        .unwrap()
-        .contains("systems programming language"));
+    assert!(
+        pages[0]
+            .text
+            .as_ref()
+            .unwrap()
+            .contains("systems programming language")
+    );
 }
 
 #[test]
@@ -619,15 +621,18 @@ fn blob_contains_enriched_data() {
 
     // Should have categories
     assert!(!blob.categories.is_empty());
-    assert!(blob
-        .categories
-        .contains(&"Programming languages".to_string()));
+    assert!(
+        blob.categories
+            .contains(&"Programming languages".to_string())
+    );
 
     // Should have infobox
     assert!(!blob.infoboxes.is_empty());
-    assert!(blob.infoboxes[0]
-        .infobox_type
-        .contains("Infobox programming language"));
+    assert!(
+        blob.infoboxes[0]
+            .infobox_type
+            .contains("Infobox programming language")
+    );
 
     // Should have sections
     assert!(!blob.sections.is_empty());
@@ -782,10 +787,12 @@ fn single_csv_shard_produces_original_filenames() {
     assert!(output_dir.path().join("image_nodes.csv").exists());
     assert!(output_dir.path().join("article_images.csv").exists());
     assert!(output_dir.path().join("external_link_nodes.csv").exists());
-    assert!(output_dir
-        .path()
-        .join("article_external_links.csv")
-        .exists());
+    assert!(
+        output_dir
+            .path()
+            .join("article_external_links.csv")
+            .exists()
+    );
 
     // Should NOT have numbered files
     assert!(!output_dir.path().join("nodes_000.csv").exists());

@@ -87,9 +87,10 @@ fn run_extract_inner(
         info!("Cache disabled, building fresh index");
         let idx = WikiIndex::build(input)?;
         if !config.dry_run
-            && let Err(e) = cache::save_index(&idx, input, output_dir) {
-                warn!(error = %e, "Failed to save index cache");
-            }
+            && let Err(e) = cache::save_index(&idx, input, output_dir)
+        {
+            warn!(error = %e, "Failed to save index cache");
+        }
         idx
     } else if let Some(idx) = cache::try_load_index(&cache_path, input)? {
         info!("Loaded index from cache");
@@ -98,9 +99,10 @@ fn run_extract_inner(
         info!("Building index (cache miss or invalid)");
         let idx = WikiIndex::build(input)?;
         if !config.dry_run
-            && let Err(e) = cache::save_index(&idx, input, output_dir) {
-                warn!(error = %e, "Failed to save index cache");
-            }
+            && let Err(e) = cache::save_index(&idx, input, output_dir)
+        {
+            warn!(error = %e, "Failed to save index cache");
+        }
         idx
     };
 
@@ -172,9 +174,10 @@ fn run_extract_inner(
     info!(duration_secs = extraction_secs, "Extraction complete");
 
     if let Some(ref mgr) = checkpoint_mgr
-        && let Err(e) = mgr.clear() {
-            warn!(error = %e, "Failed to clear checkpoint");
-        }
+        && let Err(e) = mgr.clear()
+    {
+        warn!(error = %e, "Failed to clear checkpoint");
+    }
 
     Ok(ExtractTimings {
         indexing_secs,
@@ -343,14 +346,15 @@ pub fn start_operation(app: &mut App) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 if let Ok(t) = timings.lock()
-                    && let Some(ref timing) = *t {
-                        if let Ok(mut lock) = ih_clone.lock() {
-                            *lock = Some(timing.indexing_secs);
-                        }
-                        if let Ok(mut lock) = eh_clone.lock() {
-                            *lock = Some(timing.extraction_secs);
-                        }
+                    && let Some(ref timing) = *t
+                {
+                    if let Ok(mut lock) = ih_clone.lock() {
+                        *lock = Some(timing.indexing_secs);
                     }
+                    if let Ok(mut lock) = eh_clone.lock() {
+                        *lock = Some(timing.extraction_secs);
+                    }
+                }
             });
         }
         super::app::Operation::Load => {

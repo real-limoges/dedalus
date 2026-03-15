@@ -16,9 +16,9 @@ use std::str;
 use tracing::{info, warn};
 
 #[cfg(test)]
-use bzip2::write::BzEncoder;
-#[cfg(test)]
 use bzip2::Compression;
+#[cfg(test)]
+use bzip2::write::BzEncoder;
 #[cfg(test)]
 use std::io::Write;
 
@@ -113,15 +113,12 @@ impl<R: Read> Iterator for PageParser<R> {
                     if e.name().as_ref() == b"redirect"
                         && let Ok(Some(attr)) = e.try_get_attribute("title")
                     {
-                        redirect_target =
-                            Some(String::from_utf8_lossy(&attr.value).to_string());
+                        redirect_target = Some(String::from_utf8_lossy(&attr.value).to_string());
                     }
                 }
 
                 Ok(Event::Text(e)) => {
-                    if in_title
-                        && let Ok(s) = e.unescape()
-                    {
+                    if in_title && let Ok(s) = e.unescape() {
                         current_title = Some(s.into_owned());
                     } else if in_id {
                         current_id = str::from_utf8(&e)
@@ -133,9 +130,7 @@ impl<R: Read> Iterator for PageParser<R> {
                             .and_then(|s| s.trim().parse::<i32>().ok());
                     } else if in_timestamp {
                         current_timestamp = str::from_utf8(&e).ok().map(|s| s.to_string());
-                    } else if in_text
-                        && let Ok(s) = e.unescape()
-                    {
+                    } else if in_text && let Ok(s) = e.unescape() {
                         current_text = Some(s.into_owned());
                     }
                 }

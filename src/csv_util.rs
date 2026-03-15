@@ -4,7 +4,7 @@
 //! detecting whether CSV output is single-file or sharded, generating file lists,
 //! and validating that all expected CSV files exist.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::Path;
 
 /// A type of CSV file produced by extraction.

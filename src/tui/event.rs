@@ -24,14 +24,17 @@ impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
         let event_tx = tx.clone();
-        std::thread::spawn(move || loop {
-            if event::poll(tick_rate).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read()
-                    && event_tx.send(AppEvent::Key(key)).is_err() {
+        std::thread::spawn(move || {
+            loop {
+                if event::poll(tick_rate).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read()
+                        && event_tx.send(AppEvent::Key(key)).is_err()
+                    {
                         break;
                     }
-            } else if event_tx.send(AppEvent::Tick).is_err() {
-                break;
+                } else if event_tx.send(AppEvent::Tick).is_err() {
+                    break;
+                }
             }
         });
         Self { rx, _tx: tx }

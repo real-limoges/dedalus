@@ -10,8 +10,8 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::path::Path;
 use std::time::Instant;
-use surrealdb::engine::local::RocksDb;
 use surrealdb::Surreal;
+use surrealdb::engine::local::RocksDb;
 use tracing::info;
 
 /// Configuration for the analytics computation step.

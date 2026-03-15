@@ -3,11 +3,11 @@
 //! Uses `ratatui` widgets to draw tabbed configuration forms, real-time stats panels
 //! with optional progress bars, scrollable log output, and completion summaries.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
-use ratatui::Frame;
 
 use super::app::*;
 
@@ -356,22 +356,23 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
     let mut all_lines = lines;
     if !app.extract_config.limit.is_empty()
         && let Ok(limit) = app.extract_config.limit.parse::<u64>()
-            && limit > 0 {
-                let pct = (s.articles() as f64 / limit as f64 * 100.0).min(100.0);
-                let bar_width = 30usize;
-                let filled = (pct / 100.0 * bar_width as f64) as usize;
-                let empty = bar_width.saturating_sub(filled);
-                all_lines.push(Line::from(""));
-                all_lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        "\u{2591}".repeat(empty),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(format!("  {:.0}%", pct)),
-                ]));
-            }
+        && limit > 0
+    {
+        let pct = (s.articles() as f64 / limit as f64 * 100.0).min(100.0);
+        let bar_width = 30usize;
+        let filled = (pct / 100.0 * bar_width as f64) as usize;
+        let empty = bar_width.saturating_sub(filled);
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "\u{2591}".repeat(empty),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!("  {:.0}%", pct)),
+        ]));
+    }
 
     let stats_widget =
         Paragraph::new(all_lines).block(Block::default().borders(Borders::ALL).title(" Stats "));
@@ -446,13 +447,14 @@ fn draw_done(f: &mut Frame, app: &App) {
     // Summary
     let mut lines = Vec::new();
     if let Ok(err) = app.worker_error.lock()
-        && let Some(ref e) = *err {
-            lines.push(Line::from(Span::styled(
-                format!("  Error: {}", e),
-                Style::default().fg(Color::Red),
-            )));
-            lines.push(Line::from(""));
-        }
+        && let Some(ref e) = *err
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {}", e),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+    }
 
     if app.operation == Operation::Extract {
         let s = &app.stats;

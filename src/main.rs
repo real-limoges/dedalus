@@ -4,7 +4,7 @@
 //! pipeline, stats, and tui operations. Initializes `tracing` logging with
 //! configurable verbosity and uses `mimalloc` as the global allocator.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use dedalus::cache;
 use dedalus::checkpoint::{self, CheckpointManager};
@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
-use tracing::{error, info, warn, Level};
+use tracing::{Level, error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 #[global_allocator]
@@ -250,9 +250,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
             dedalus::index::WikiIndex::build(&args.input)?
         };
         if !args.dry_run
-            && let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
-                warn!(error = %e, "Failed to save index cache");
-            }
+            && let Err(e) = cache::save_index(&idx, &args.input, &args.output)
+        {
+            warn!(error = %e, "Failed to save index cache");
+        }
         idx
     } else if let Some(idx) = cache::try_load_index(&cache_path, &args.input)? {
         info!("Loaded index from cache");
@@ -265,9 +266,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
             dedalus::index::WikiIndex::build(&args.input)?
         };
         if !args.dry_run
-            && let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
-                warn!(error = %e, "Failed to save index cache");
-            }
+            && let Err(e) = cache::save_index(&idx, &args.input, &args.output)
+        {
+            warn!(error = %e, "Failed to save index cache");
+        }
         idx
     };
 
@@ -338,9 +340,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     );
 
     if let Some(ref mgr) = checkpoint_mgr
-        && let Err(e) = mgr.clear() {
-            warn!(error = %e, "Failed to clear checkpoint");
-        }
+        && let Err(e) = mgr.clear()
+    {
+        warn!(error = %e, "Failed to clear checkpoint");
+    }
 
     println!();
     println!("=== Summary ===");
@@ -622,14 +625,15 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         if let Ok(shard_dirs) = fs::read_dir(&blobs_dir) {
             for shard_dir in shard_dirs.filter_map(|e| e.ok()) {
                 if shard_dir.file_type().map(|t| t.is_dir()).unwrap_or(false)
-                    && let Ok(files) = fs::read_dir(shard_dir.path()) {
-                        for file in files.filter_map(|e| e.ok()) {
-                            if file.file_name().to_string_lossy().ends_with(".json") {
-                                blob_count += 1;
-                                blob_size += file.metadata().map(|m| m.len()).unwrap_or(0);
-                            }
+                    && let Ok(files) = fs::read_dir(shard_dir.path())
+                {
+                    for file in files.filter_map(|e| e.ok()) {
+                        if file.file_name().to_string_lossy().ends_with(".json") {
+                            blob_count += 1;
+                            blob_size += file.metadata().map(|m| m.len()).unwrap_or(0);
                         }
                     }
+                }
             }
         }
         println!("  Total blobs: {}", blob_count);
