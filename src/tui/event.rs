@@ -26,11 +26,10 @@ impl EventHandler {
         let event_tx = tx.clone();
         std::thread::spawn(move || loop {
             if event::poll(tick_rate).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if event_tx.send(AppEvent::Key(key)).is_err() {
+                if let Ok(Event::Key(key)) = event::read()
+                    && event_tx.send(AppEvent::Key(key)).is_err() {
                         break;
                     }
-                }
             } else if event_tx.send(AppEvent::Tick).is_err() {
                 break;
             }

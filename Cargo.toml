@@ -1,41 +1,41 @@
 [package]
 name = "dedalus"
 version = "0.1.0"
-edition = "2021"
-description = "A Rust pipeline that extracts Wikipedia dumps into structured graph data and imports into Neo4j"
+edition = "2024"
+description = "A Rust pipeline that extracts Wikipedia dumps into structured graph data with SurrealDB embedded storage"
 repository = "https://github.com/real-limoges/dedalus"
 license = "MIT"
 authors = ["Real Limoges"]
-keywords = ["wikipedia", "neo4j", "graph", "extraction"]
+keywords = ["wikipedia", "surrealdb", "graph", "extraction"]
 categories = ["command-line-utilities", "database"]
-rust-version = "1.87"
+rust-version = "1.94.0"
 readme = "README.md"
 
 [dependencies]
-bzip2 = { version = "0.6.1" }
-serde = { version = "1.0.228", features = ["derive"] }
-anyhow = { version = "1.0.100" }
-indicatif = { version = "0.18.3" }
-clap = { version = "4.5.53", features = ["derive"] }
-regex = { version = "1.12.2" }
-csv = { version = "1.4.0" }
-serde_json = { version = "1.0.148" }
-quick-xml = { version = "0.31", features = ["serialize"] }
-rayon = { version = "1.11.0" }
-once_cell = { version = "1.19" }
-tracing = { version = "0.1" }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bincode = "1"
+anyhow = "1.0.102"
+bincode = "1.3.3"
+bzip2 = "0.6.1"
+clap = { version = "4.6.0", features = ["derive"] }
+crossterm = "0.29.0"
+csv = "1.4.0"
 dashmap = "6"
-rustc-hash = "2"
-neo4rs = "0.9.0-rc.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
 futures = "0.3"
-mimalloc = "0.1"
+indicatif = "0.18.4"
 itoa = "1"
 memchr = "2"
-ratatui = "0.29"
-crossterm = "0.28"
+mimalloc = "0.1"
+once_cell = "1.21.4"
+quick-xml = { version = "0.31", features = ["serialize"] }
+ratatui = "0.30.0"
+rayon = "1.11.0"
+regex = "1.12.3"
+rustc-hash = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+surrealdb = { version = "3.0.4", features = ["kv-rocksdb"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"

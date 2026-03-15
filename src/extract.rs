@@ -181,12 +181,12 @@ fn write_dedup_entities(
         }
     }
 
-    if !new_items.is_empty() {
-        if let Ok(mut writer) = node_writer.shard_for(page_id).lock() {
-            for name in &new_items {
-                if let Err(e) = writer.write_record([*name, *name, label]) {
-                    warn!(error = %e, "Failed to write {} node record", label);
-                }
+    if !new_items.is_empty()
+        && let Ok(mut writer) = node_writer.shard_for(page_id).lock()
+    {
+        for name in &new_items {
+            if let Err(e) = writer.write_record([*name, *name, label]) {
+                warn!(error = %e, "Failed to write {} node record", label);
             }
         }
     }
@@ -391,10 +391,10 @@ pub fn run_extraction_with_stats(
             let id_str = itoa_buf.format(page.id);
             stats_clone.inc_articles();
 
-            if let Ok(mut writer) = nodes_writer.shard_for(page.id).lock() {
-                if let Err(e) = writer.write_record([id_str, &page.title, "Page"]) {
-                    warn!(error = %e, "Failed to write node record");
-                }
+            if let Ok(mut writer) = nodes_writer.shard_for(page.id).lock()
+                && let Err(e) = writer.write_record([id_str, &page.title, "Page"])
+            {
+                warn!(error = %e, "Failed to write node record");
             }
 
             if let Some(text) = &page.text {
@@ -500,10 +500,10 @@ pub fn run_extraction_with_stats(
                 }
             }
 
-            if let Some(mgr) = checkpoint_mgr {
-                if let Err(e) = mgr.maybe_save(page.id, &stats_clone) {
-                    warn!(error = %e, "Failed to save checkpoint");
-                }
+            if let Some(mgr) = checkpoint_mgr
+                && let Err(e) = mgr.maybe_save(page.id, &stats_clone)
+            {
+                warn!(error = %e, "Failed to save checkpoint");
             }
 
             let articles = stats_clone.articles();

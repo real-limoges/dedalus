@@ -22,7 +22,8 @@ pub enum Screen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Extract,
-    Import,
+    Load,
+    Analytics,
     MergeCsvs,
 }
 
@@ -31,14 +32,20 @@ impl Operation {
     pub fn label(&self) -> &str {
         match self {
             Operation::Extract => "Extract",
-            Operation::Import => "Import",
+            Operation::Load => "Load",
+            Operation::Analytics => "Analytics",
             Operation::MergeCsvs => "MergeCsvs",
         }
     }
 
     /// Returns all available operations in tab order.
     pub fn all() -> &'static [Operation] {
-        &[Operation::Extract, Operation::Import, Operation::MergeCsvs]
+        &[
+            Operation::Extract,
+            Operation::Load,
+            Operation::Analytics,
+            Operation::MergeCsvs,
+        ]
     }
 }
 
@@ -57,18 +64,22 @@ pub enum ExtractField {
     Clean,
 }
 
-/// Navigable fields in the Import configuration form.
+/// Navigable fields in the Load configuration form.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ImportField {
+pub enum LoadField {
     Output,
-    BoltUri,
-    ImportPrefix,
-    MaxParallelEdges,
-    MaxParallelLight,
-    ComposeFile,
-    NoDocker,
-    CleanImport,
-    AdminImport,
+    DbPath,
+    BatchSize,
+    Clean,
+}
+
+/// Navigable fields in the Analytics configuration form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsField {
+    Output,
+    DbPath,
+    PageRankIterations,
+    Damping,
 }
 
 /// Navigable fields in the MergeCsvs configuration form.
@@ -91,17 +102,20 @@ pub static EXTRACT_FIELDS: &[ExtractField] = &[
     ExtractField::Clean,
 ];
 
-/// Ordered list of Import form fields for UI navigation.
-pub static IMPORT_FIELDS: &[ImportField] = &[
-    ImportField::Output,
-    ImportField::BoltUri,
-    ImportField::ImportPrefix,
-    ImportField::MaxParallelEdges,
-    ImportField::MaxParallelLight,
-    ImportField::ComposeFile,
-    ImportField::NoDocker,
-    ImportField::CleanImport,
-    ImportField::AdminImport,
+/// Ordered list of Load form fields for UI navigation.
+pub static LOAD_FIELDS: &[LoadField] = &[
+    LoadField::Output,
+    LoadField::DbPath,
+    LoadField::BatchSize,
+    LoadField::Clean,
+];
+
+/// Ordered list of Analytics form fields for UI navigation.
+pub static ANALYTICS_FIELDS: &[AnalyticsField] = &[
+    AnalyticsField::Output,
+    AnalyticsField::DbPath,
+    AnalyticsField::PageRankIterations,
+    AnalyticsField::Damping,
 ];
 
 /// Ordered list of MergeCsvs form fields for UI navigation.
@@ -138,31 +152,40 @@ impl Default for ExtractConfig {
     }
 }
 
-/// Form state for the Import operation's configuration fields.
-pub struct ImportConfigTui {
+/// Form state for the Load operation's configuration fields.
+pub struct LoadConfigTui {
     pub output: String,
-    pub bolt_uri: String,
-    pub import_prefix: String,
-    pub max_parallel_edges: String,
-    pub max_parallel_light: String,
-    pub compose_file: String,
-    pub no_docker: bool,
+    pub db_path: String,
+    pub batch_size: String,
     pub clean: bool,
-    pub admin_import: bool,
 }
 
-impl Default for ImportConfigTui {
+impl Default for LoadConfigTui {
     fn default() -> Self {
         Self {
             output: "output".to_string(),
-            bolt_uri: crate::config::DEFAULT_BOLT_URI.to_string(),
-            import_prefix: crate::config::DEFAULT_IMPORT_PREFIX.to_string(),
-            max_parallel_edges: crate::config::IMPORT_MAX_PARALLEL_EDGES.to_string(),
-            max_parallel_light: crate::config::IMPORT_MAX_PARALLEL_LIGHT.to_string(),
-            compose_file: String::new(),
-            no_docker: false,
+            db_path: crate::config::DEFAULT_DB_PATH.to_string(),
+            batch_size: crate::config::SURREAL_BATCH_SIZE.to_string(),
             clean: false,
-            admin_import: true,
+        }
+    }
+}
+
+/// Form state for the Analytics operation's configuration fields.
+pub struct AnalyticsConfigTui {
+    pub output: String,
+    pub db_path: String,
+    pub pagerank_iterations: String,
+    pub damping: String,
+}
+
+impl Default for AnalyticsConfigTui {
+    fn default() -> Self {
+        Self {
+            output: "output".to_string(),
+            db_path: crate::config::DEFAULT_DB_PATH.to_string(),
+            pagerank_iterations: crate::config::PAGERANK_ITERATIONS.to_string(),
+            damping: crate::config::PAGERANK_DAMPING.to_string(),
         }
     }
 }
@@ -186,7 +209,8 @@ pub struct App {
     pub operation: Operation,
     pub field_index: usize,
     pub extract_config: ExtractConfig,
-    pub import_config: ImportConfigTui,
+    pub load_config: LoadConfigTui,
+    pub analytics_config: AnalyticsConfigTui,
     pub merge_config: MergeConfig,
     pub status_message: String,
     pub error_message: Option<String>,
@@ -215,7 +239,8 @@ impl App {
             operation: Operation::Extract,
             field_index: 0,
             extract_config: ExtractConfig::default(),
-            import_config: ImportConfigTui::default(),
+            load_config: LoadConfigTui::default(),
+            analytics_config: AnalyticsConfigTui::default(),
             merge_config: MergeConfig::default(),
             status_message: "Ready".to_string(),
             error_message: None,
@@ -239,7 +264,8 @@ impl App {
     pub fn field_count(&self) -> usize {
         match self.operation {
             Operation::Extract => EXTRACT_FIELDS.len(),
-            Operation::Import => IMPORT_FIELDS.len(),
+            Operation::Load => LOAD_FIELDS.len(),
+            Operation::Analytics => ANALYTICS_FIELDS.len(),
             Operation::MergeCsvs => MERGE_FIELDS.len(),
         }
     }
@@ -254,10 +280,8 @@ impl App {
                     | ExtractField::NoCache
                     | ExtractField::Clean
             ),
-            Operation::Import => matches!(
-                IMPORT_FIELDS[self.field_index],
-                ImportField::NoDocker | ImportField::CleanImport | ImportField::AdminImport
-            ),
+            Operation::Load => matches!(LOAD_FIELDS[self.field_index], LoadField::Clean),
+            Operation::Analytics => false,
             Operation::MergeCsvs => false,
         }
     }
@@ -274,16 +298,12 @@ impl App {
                 ExtractField::Clean => self.extract_config.clean = !self.extract_config.clean,
                 _ => {}
             },
-            Operation::Import => match IMPORT_FIELDS[self.field_index] {
-                ImportField::NoDocker => {
-                    self.import_config.no_docker = !self.import_config.no_docker
+            Operation::Load => {
+                if LOAD_FIELDS[self.field_index] == LoadField::Clean {
+                    self.load_config.clean = !self.load_config.clean;
                 }
-                ImportField::CleanImport => self.import_config.clean = !self.import_config.clean,
-                ImportField::AdminImport => {
-                    self.import_config.admin_import = !self.import_config.admin_import
-                }
-                _ => {}
-            },
+            }
+            Operation::Analytics => {}
             Operation::MergeCsvs => {}
         }
     }
@@ -300,14 +320,19 @@ impl App {
                 ExtractField::Checkpoint => Some(&mut self.extract_config.checkpoint),
                 _ => None,
             },
-            Operation::Import => match IMPORT_FIELDS[self.field_index] {
-                ImportField::Output => Some(&mut self.import_config.output),
-                ImportField::BoltUri => Some(&mut self.import_config.bolt_uri),
-                ImportField::ImportPrefix => Some(&mut self.import_config.import_prefix),
-                ImportField::MaxParallelEdges => Some(&mut self.import_config.max_parallel_edges),
-                ImportField::MaxParallelLight => Some(&mut self.import_config.max_parallel_light),
-                ImportField::ComposeFile => Some(&mut self.import_config.compose_file),
-                _ => None,
+            Operation::Load => match LOAD_FIELDS[self.field_index] {
+                LoadField::Output => Some(&mut self.load_config.output),
+                LoadField::DbPath => Some(&mut self.load_config.db_path),
+                LoadField::BatchSize => Some(&mut self.load_config.batch_size),
+                LoadField::Clean => None,
+            },
+            Operation::Analytics => match ANALYTICS_FIELDS[self.field_index] {
+                AnalyticsField::Output => Some(&mut self.analytics_config.output),
+                AnalyticsField::DbPath => Some(&mut self.analytics_config.db_path),
+                AnalyticsField::PageRankIterations => {
+                    Some(&mut self.analytics_config.pagerank_iterations)
+                }
+                AnalyticsField::Damping => Some(&mut self.analytics_config.damping),
             },
             Operation::MergeCsvs => match MERGE_FIELDS[self.field_index] {
                 MergeField::Output => Some(&mut self.merge_config.output),
@@ -341,25 +366,29 @@ impl App {
                 }
                 Ok(())
             }
-            Operation::Import => {
-                if self.import_config.output.is_empty() {
+            Operation::Load => {
+                if self.load_config.output.is_empty() {
+                    return Err("Output directory is required".to_string());
+                }
+                if self.load_config.batch_size.parse::<usize>().is_err() {
+                    return Err("Batch size must be a number".to_string());
+                }
+                Ok(())
+            }
+            Operation::Analytics => {
+                if self.analytics_config.output.is_empty() {
                     return Err("Output directory is required".to_string());
                 }
                 if self
-                    .import_config
-                    .max_parallel_edges
-                    .parse::<usize>()
+                    .analytics_config
+                    .pagerank_iterations
+                    .parse::<u32>()
                     .is_err()
                 {
-                    return Err("Max parallel edges must be a number".to_string());
+                    return Err("PageRank iterations must be a number".to_string());
                 }
-                if self
-                    .import_config
-                    .max_parallel_light
-                    .parse::<usize>()
-                    .is_err()
-                {
-                    return Err("Max parallel light must be a number".to_string());
+                if self.analytics_config.damping.parse::<f64>().is_err() {
+                    return Err("Damping factor must be a number".to_string());
                 }
                 Ok(())
             }

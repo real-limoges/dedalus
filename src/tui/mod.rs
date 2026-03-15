@@ -1,8 +1,8 @@
 //! Interactive terminal UI for configuring and monitoring Dedalus operations.
 //!
-//! Provides a form-based interface for extract, import, and merge-csvs operations
-//! with real-time progress monitoring, live extraction stats, and log streaming.
-//! Built on `ratatui` and `crossterm`.
+//! Provides a form-based interface for extract, load, analytics, and merge-csvs
+//! operations with real-time progress monitoring, live extraction stats, and log
+//! streaming. Built on `ratatui` and `crossterm`.
 
 pub mod app;
 pub mod event;
@@ -214,7 +214,8 @@ fn handle_tick(app: &mut App) {
         {
             app.done_message = match app.operation {
                 Operation::Extract => "Extraction completed successfully".to_string(),
-                Operation::Import => "Import completed successfully".to_string(),
+                Operation::Load => "SurrealDB load completed successfully".to_string(),
+                Operation::Analytics => "Analytics completed successfully".to_string(),
                 Operation::MergeCsvs => "CSV merge completed successfully".to_string(),
             };
         }

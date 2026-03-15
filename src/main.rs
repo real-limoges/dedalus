@@ -1,14 +1,14 @@
 //! CLI entry point for the Dedalus pipeline.
 //!
-//! Uses `clap` subcommands to orchestrate extract, import, merge-csvs, pipeline,
-//! stats, and tui operations. Initializes `tracing` logging with configurable
-//! verbosity and uses `mimalloc` as the global allocator.
+//! Uses `clap` subcommands to orchestrate extract, load, analytics, merge-csvs,
+//! pipeline, stats, and tui operations. Initializes `tracing` logging with
+//! configurable verbosity and uses `mimalloc` as the global allocator.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use dedalus::cache;
 use dedalus::checkpoint::{self, CheckpointManager};
-use dedalus::import::ImportConfig;
+use dedalus::surrealdb_writer::SurrealWriterConfig;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -21,7 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "dedalus")]
-#[command(about = "Extract Wikipedia dumps and import into graph databases")]
+#[command(about = "Extract Wikipedia dumps into structured graph data with SurrealDB storage")]
 struct Cli {
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -35,11 +35,13 @@ struct Cli {
 enum Commands {
     /// Extract Wikipedia dumps into CSV/JSON format
     Extract(ExtractArgs),
-    /// Import extracted CSV files into Neo4j
-    Import(ImportArgs),
-    /// Merge sharded CSV files into single files for neo4j-admin import
+    /// Load extracted CSV files into SurrealDB
+    Load(LoadArgs),
+    /// Compute graph analytics (PageRank, communities, degree)
+    Analytics(AnalyticsArgs),
+    /// Merge sharded CSV files into single files
     MergeCsvs(MergeCsvsArgs),
-    /// Run the full pipeline: extract -> merge -> import
+    /// Run the full pipeline: extract -> merge -> load -> analytics
     Pipeline(PipelineArgs),
     /// Show output directory statistics
     Stats(StatsArgs),
@@ -95,42 +97,41 @@ struct ExtractArgs {
 }
 
 #[derive(Args)]
-struct ImportArgs {
+struct LoadArgs {
     /// Directory containing Dedalus CSV output files
     #[arg(short, long)]
     output: String,
 
-    /// Neo4j Bolt URI
-    #[arg(long, default_value = dedalus::config::DEFAULT_BOLT_URI)]
-    bolt_uri: String,
+    /// Path for the SurrealDB database directory
+    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
+    db_path: String,
 
-    /// Import file URI prefix for Neo4j LOAD CSV
-    #[arg(long, default_value = dedalus::config::DEFAULT_IMPORT_PREFIX)]
-    import_prefix: String,
+    /// Batch size for SurrealDB inserts
+    #[arg(long, default_value_t = dedalus::config::SURREAL_BATCH_SIZE)]
+    batch_size: usize,
 
-    /// Max parallel LOAD CSV jobs for edge operations
-    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_EDGES)]
-    max_parallel_edges: usize,
-
-    /// Max parallel LOAD CSV jobs for lighter relationship operations
-    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_LIGHT)]
-    max_parallel_light: usize,
-
-    /// Docker compose file path (auto-detected if not specified)
-    #[arg(long)]
-    compose_file: Option<String>,
-
-    /// Skip Docker management, just connect to an already-running Neo4j
-    #[arg(long)]
-    no_docker: bool,
-
-    /// Clear existing Neo4j data before importing
+    /// Clear existing database before loading
     #[arg(long)]
     clean: bool,
+}
 
-    /// Use neo4j-admin import (10-100x faster, requires empty DB)
-    #[arg(long)]
-    admin_import: bool,
+#[derive(Args)]
+struct AnalyticsArgs {
+    /// Directory containing Dedalus CSV output files
+    #[arg(short, long)]
+    output: String,
+
+    /// Path for the SurrealDB database directory
+    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
+    db_path: String,
+
+    /// Number of PageRank iterations
+    #[arg(long, default_value_t = dedalus::config::PAGERANK_ITERATIONS)]
+    pagerank_iterations: u32,
+
+    /// PageRank damping factor
+    #[arg(long, default_value_t = dedalus::config::PAGERANK_DAMPING)]
+    damping: f64,
 }
 
 #[derive(Args)]
@@ -178,37 +179,21 @@ struct PipelineArgs {
     #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL)]
     checkpoint_interval: u32,
 
-    /// Clear existing outputs and Neo4j data before starting
+    /// Clear existing outputs before starting
     #[arg(long)]
     clean: bool,
 
-    /// Neo4j Bolt URI
-    #[arg(long, default_value = dedalus::config::DEFAULT_BOLT_URI)]
-    bolt_uri: String,
+    /// Path for the SurrealDB database directory
+    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
+    db_path: String,
 
-    /// Import file URI prefix for Neo4j LOAD CSV
-    #[arg(long, default_value = dedalus::config::DEFAULT_IMPORT_PREFIX)]
-    import_prefix: String,
-
-    /// Max parallel LOAD CSV jobs for edge operations
-    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_EDGES)]
-    max_parallel_edges: usize,
-
-    /// Max parallel LOAD CSV jobs for lighter relationship operations
-    #[arg(long, default_value_t = dedalus::config::IMPORT_MAX_PARALLEL_LIGHT)]
-    max_parallel_light: usize,
-
-    /// Docker compose file path (auto-detected if not specified)
+    /// Skip the load + analytics steps (extract + merge only)
     #[arg(long)]
-    compose_file: Option<String>,
+    no_load: bool,
 
-    /// Skip Docker management, just connect to an already-running Neo4j
+    /// Skip analytics computation
     #[arg(long)]
-    no_docker: bool,
-
-    /// Skip the import step (extract + merge only)
-    #[arg(long)]
-    no_import: bool,
+    no_analytics: bool,
 
     /// Don't archive sharded CSVs after merging
     #[arg(long)]
@@ -264,11 +249,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         } else {
             dedalus::index::WikiIndex::build(&args.input)?
         };
-        if !args.dry_run {
-            if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
+        if !args.dry_run
+            && let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
                 warn!(error = %e, "Failed to save index cache");
             }
-        }
         idx
     } else if let Some(idx) = cache::try_load_index(&cache_path, &args.input)? {
         info!("Loaded index from cache");
@@ -280,11 +264,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         } else {
             dedalus::index::WikiIndex::build(&args.input)?
         };
-        if !args.dry_run {
-            if let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
+        if !args.dry_run
+            && let Err(e) = cache::save_index(&idx, &args.input, &args.output) {
                 warn!(error = %e, "Failed to save index cache");
             }
-        }
         idx
     };
 
@@ -354,11 +337,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         "Extraction complete"
     );
 
-    if let Some(ref mgr) = checkpoint_mgr {
-        if let Err(e) = mgr.clear() {
+    if let Some(ref mgr) = checkpoint_mgr
+        && let Err(e) = mgr.clear() {
             warn!(error = %e, "Failed to clear checkpoint");
         }
-    }
 
     println!();
     println!("=== Summary ===");
@@ -389,25 +371,57 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_import(args: ImportArgs) -> Result<()> {
-    let config = ImportConfig {
+fn run_load(args: LoadArgs) -> Result<()> {
+    let config = SurrealWriterConfig {
         output_dir: args.output,
-        bolt_uri: args.bolt_uri,
-        import_prefix: args.import_prefix,
-        max_parallel_edges: args.max_parallel_edges,
-        max_parallel_light: args.max_parallel_light,
-        compose_file: args.compose_file,
-        no_docker: args.no_docker,
+        db_path: args.db_path,
+        batch_size: args.batch_size,
         clean: args.clean,
-        use_admin_import: args.admin_import,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("dedalus-import-worker")
+        .thread_name("dedalus-load-worker")
         .enable_io()
         .enable_time()
         .build()?;
-    rt.block_on(dedalus::import::run_import(config))
+
+    let stats = rt.block_on(dedalus::surrealdb_writer::run_surreal_load(config))?;
+
+    println!();
+    println!("=== Load Summary ===");
+    println!("Articles loaded:  {}", stats.articles_loaded);
+    println!("Edges loaded:     {}", stats.edges_loaded);
+    println!("Elapsed:          {:.2}s", stats.elapsed_secs);
+
+    Ok(())
+}
+
+fn run_analytics(args: AnalyticsArgs) -> Result<()> {
+    let config = dedalus::analytics::AnalyticsConfig {
+        db_path: args.db_path,
+        output_dir: args.output,
+        pagerank_iterations: args.pagerank_iterations,
+        pagerank_damping: args.damping,
+        ..Default::default()
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("dedalus-analytics-worker")
+        .enable_io()
+        .enable_time()
+        .build()?;
+
+    let stats = rt.block_on(dedalus::analytics::run_analytics(config))?;
+
+    println!();
+    println!("=== Analytics Summary ===");
+    println!("Nodes:            {}", stats.node_count);
+    println!("Edges:            {}", stats.edge_count);
+    println!("PageRank iters:   {}", stats.pagerank_iterations_run);
+    println!("Communities:      {}", stats.communities_found);
+    println!("Elapsed:          {:.2}s", stats.elapsed_secs);
+
+    Ok(())
 }
 
 fn run_pipeline(args: PipelineArgs) -> Result<()> {
@@ -430,9 +444,18 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
     println!("    Size: {}", format_size(dump_size));
     println!();
 
+    // Count steps
+    let mut step_count = 2; // extract + merge
+    if !args.no_load {
+        step_count += 1; // load
+        if !args.no_analytics {
+            step_count += 1; // analytics
+        }
+    }
+
     // Step 1: Extract
-    let step_count = if args.no_import { 2 } else { 3 };
-    println!("==> Step 1/{}: Extracting Wikipedia dump...", step_count);
+    let mut step = 1;
+    println!("==> Step {step}/{step_count}: Extracting Wikipedia dump...");
     println!("    Input:       {}", args.input);
     println!("    Output:      {}", args.output);
     println!("    CSV shards:  {}", args.csv_shards);
@@ -458,11 +481,12 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
     .context("Extraction step failed")?;
 
     // Step 2: Merge (conditional)
+    step += 1;
     if args.csv_shards > 1 {
         println!();
         println!(
-            "==> Step 2/{}: Merging {} CSV shards...",
-            step_count, args.csv_shards
+            "==> Step {step}/{step_count}: Merging {} CSV shards...",
+            args.csv_shards
         );
         dedalus::merge::merge_csv_shards(&args.output).context("Merge step failed")?;
 
@@ -472,42 +496,62 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
         }
     } else {
         println!();
-        println!("==> Step 2/{}: Skipping merge (csv-shards=1)", step_count);
+        println!("==> Step {step}/{step_count}: Skipping merge (csv-shards=1)");
     }
 
-    // Step 3: Import
-    if !args.no_import {
+    // Step 3: Load into SurrealDB
+    if !args.no_load {
+        step += 1;
         println!();
-        println!(
-            "==> Step 3/{}: Importing into Neo4j (admin bulk import)...",
-            step_count
-        );
+        println!("==> Step {step}/{step_count}: Loading into SurrealDB...");
 
-        let import_config = ImportConfig {
+        let load_config = SurrealWriterConfig {
             output_dir: args.output.clone(),
-            bolt_uri: args.bolt_uri.clone(),
-            import_prefix: args.import_prefix,
-            max_parallel_edges: args.max_parallel_edges,
-            max_parallel_light: args.max_parallel_light,
-            compose_file: args.compose_file,
-            no_docker: args.no_docker,
+            db_path: args.db_path.clone(),
+            batch_size: dedalus::config::SURREAL_BATCH_SIZE,
             clean: args.clean,
-            use_admin_import: true,
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("dedalus-import-worker")
+            .thread_name("dedalus-load-worker")
             .enable_io()
             .enable_time()
             .build()?;
-        rt.block_on(dedalus::import::run_import(import_config))
-            .context("Import step failed")?;
+        let load_stats = rt
+            .block_on(dedalus::surrealdb_writer::run_surreal_load(load_config))
+            .context("Load step failed")?;
+
+        println!(
+            "    Loaded {} articles, {} edges in {:.1}s",
+            load_stats.articles_loaded, load_stats.edges_loaded, load_stats.elapsed_secs
+        );
+
+        // Step 4: Analytics
+        if !args.no_analytics {
+            step += 1;
+            println!();
+            println!("==> Step {step}/{step_count}: Computing graph analytics...");
+
+            let analytics_config = dedalus::analytics::AnalyticsConfig {
+                db_path: args.db_path.clone(),
+                output_dir: args.output.clone(),
+                ..Default::default()
+            };
+
+            let analytics_stats = rt
+                .block_on(dedalus::analytics::run_analytics(analytics_config))
+                .context("Analytics step failed")?;
+
+            println!(
+                "    PageRank ({} iters), {} communities, {:.1}s",
+                analytics_stats.pagerank_iterations_run,
+                analytics_stats.communities_found,
+                analytics_stats.elapsed_secs
+            );
+        }
     } else {
         println!();
-        println!(
-            "==> Step {0}/{0}: Skipping import (--no-import)",
-            step_count
-        );
+        println!("==> Skipping load and analytics (--no-load)");
     }
 
     let total_duration = overall_start.elapsed();
@@ -516,10 +560,17 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
         "==> Pipeline complete! ({:.1}s)",
         total_duration.as_secs_f64()
     );
-    println!("    Output:  {}", args.output);
-    if !args.no_import {
-        println!("    Neo4j:   {}", args.bolt_uri);
-        println!("    Browser: http://localhost:7474");
+    println!("    Output:   {}", args.output);
+    if !args.no_load {
+        let db_display = if Path::new(&args.db_path).is_absolute() {
+            args.db_path.clone()
+        } else {
+            Path::new(&args.output)
+                .join(&args.db_path)
+                .to_string_lossy()
+                .to_string()
+        };
+        println!("    Database: {}", db_display);
     }
     println!();
 
@@ -570,8 +621,8 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         let mut blob_size = 0u64;
         if let Ok(shard_dirs) = fs::read_dir(&blobs_dir) {
             for shard_dir in shard_dirs.filter_map(|e| e.ok()) {
-                if shard_dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    if let Ok(files) = fs::read_dir(shard_dir.path()) {
+                if shard_dir.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && let Ok(files) = fs::read_dir(shard_dir.path()) {
                         for file in files.filter_map(|e| e.ok()) {
                             if file.file_name().to_string_lossy().ends_with(".json") {
                                 blob_count += 1;
@@ -579,7 +630,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
                             }
                         }
                     }
-                }
             }
         }
         println!("  Total blobs: {}", blob_count);
@@ -588,6 +638,16 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         println!("  None found");
     }
     println!();
+
+    // SurrealDB database
+    let db_dir = output_dir.join(dedalus::config::DEFAULT_DB_PATH);
+    if db_dir.exists() {
+        let db_size = dir_size(&db_dir);
+        println!("SurrealDB:");
+        println!("  Path: {}", db_dir.display());
+        println!("  Size: {}", format_size(db_size));
+        println!();
+    }
 
     // Archived shards
     let shards_dir = output_dir.join("shards");
@@ -615,7 +675,6 @@ fn dir_size(path: &Path) -> u64 {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.filter_map(|e| e.ok()) {
             let ft = entry.file_type().unwrap_or_else(|_| {
-                // Fallback: treat as file
                 fs::metadata(entry.path())
                     .map(|m| m.file_type())
                     .unwrap_or_else(|_| entry.file_type().unwrap())
@@ -672,7 +731,8 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Commands::Extract(args) => run_extract(args),
-        Commands::Import(args) => run_import(args),
+        Commands::Load(args) => run_load(args),
+        Commands::Analytics(args) => run_analytics(args),
         Commands::MergeCsvs(args) => {
             let output = args.output.clone();
             let archive = args.archive;

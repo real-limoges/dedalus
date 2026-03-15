@@ -40,22 +40,30 @@ pub const INDEX_INITIAL_ARTICLES: usize = 8_000_000;
 /// Pre-sized capacity for the redirect resolution hash map.
 pub const INDEX_INITIAL_REDIRECTS: usize = 10_000_000;
 
-// -- Import constants --
+// -- SurrealDB constants --
 
-/// Default Bolt URI for Neo4j connection.
-pub const DEFAULT_BOLT_URI: &str = "bolt://localhost:7687";
+/// SurrealDB namespace.
+pub const SURREAL_NAMESPACE: &str = "dedalus";
 
-/// Maximum connection retry attempts.
-pub const IMPORT_MAX_RETRIES: u32 = 30;
+/// SurrealDB database name.
+pub const SURREAL_DATABASE: &str = "wikipedia";
 
-/// Delay between connection retry attempts in seconds.
-pub const IMPORT_RETRY_DELAY_SECS: u64 = 2;
+/// Default batch size for SurrealDB inserts.
+pub const SURREAL_BATCH_SIZE: usize = 10_000;
 
-/// Default max parallel edge loads (increased with explicit connection pool).
-pub const IMPORT_MAX_PARALLEL_EDGES: usize = 4;
+/// Default database path (relative to output directory).
+pub const DEFAULT_DB_PATH: &str = "wikipedia.db";
 
-/// Default max parallel light relationship loads (increased with 8-conn pool).
-pub const IMPORT_MAX_PARALLEL_LIGHT: usize = 8;
+// -- Analytics constants --
 
-/// Default import file URI prefix for Neo4j LOAD CSV.
-pub const DEFAULT_IMPORT_PREFIX: &str = "file://";
+/// Default number of PageRank power iterations.
+pub const PAGERANK_ITERATIONS: u32 = 20;
+
+/// PageRank damping factor.
+pub const PAGERANK_DAMPING: f64 = 0.85;
+
+/// PageRank convergence threshold.
+pub const PAGERANK_EPSILON: f64 = 1e-6;
+
+/// Maximum iterations for Louvain / label propagation.
+pub const LOUVAIN_MAX_ITERATIONS: u32 = 50;
