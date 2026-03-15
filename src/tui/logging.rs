@@ -9,8 +9,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 const MAX_LOG_LINES: usize = 1000;
 

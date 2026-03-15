@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Dedalus is a Rust pipeline that extracts Wikipedia dumps into structured graph data and imports it into Neo4j. It processes compressed Wikipedia XML dumps (.bz2), outputs nodes/edges as CSV files along with article content as sharded JSON blobs, and loads everything into Neo4j. The project emphasizes performance optimizations including multistream parallel parsing, parallel extraction, CSV sharding, and bulk import via neo4j-admin. When using Wikipedia's multistream dump format with the accompanying index file, both indexing and extraction passes decompress and parse bz2 streams in parallel across all CPU cores.
+Dedalus is a Rust pipeline that extracts Wikipedia dumps into structured graph data and loads it into an embedded SurrealDB (RocksDB) database. It processes compressed Wikipedia XML dumps (.bz2), outputs nodes/edges as CSV files along with article content as sharded JSON blobs, loads articles and edges into SurrealDB, and computes graph analytics (PageRank, community detection, degree). The project emphasizes performance optimizations including multistream parallel parsing, parallel extraction, CSV sharding, and embedded database storage. When using Wikipedia's multistream dump format with the accompanying index file, both indexing and extraction passes decompress and parse bz2 streams in parallel across all CPU cores.
 
 ## Build & Optimization
 
@@ -38,7 +38,7 @@ This yields ~1.6x faster extraction on ARM64 due to NEON SIMD and single-pass co
 
 ```bash
 cargo build --release          # Build optimized binary with Apple Silicon targeting
-cargo test --verbose           # Run all tests (161 unit + integration tests)
+cargo test --verbose           # Run all tests (177 unit + integration tests)
 cargo fmt -- --check           # Check formatting
 cargo clippy -- -D warnings    # Lint with strict warnings
 ```
@@ -47,11 +47,11 @@ The binary uses `mimalloc` as the global allocator for better multi-core perform
 
 ## Running
 
-The binary uses subcommands: `extract`, `import`, `merge-csvs`, `pipeline`, `stats`, and `tui`.
+The binary uses subcommands: `extract`, `load`, `analytics`, `merge-csvs`, `pipeline`, `stats`, and `tui`.
 
 ### Pipeline (Recommended)
 
-Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → import.
+Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → load into SurrealDB → compute analytics.
 
 ```bash
 dedalus pipeline -i <path-to-dump.xml.bz2> -o <output-directory>
@@ -66,18 +66,12 @@ dedalus pipeline -i <path-to-dump.xml.bz2> -o <output-directory>
 - `--resume` -- resume from last checkpoint
 - `--no-cache` -- force rebuild of index cache
 - `--checkpoint-interval` -- save checkpoint every N articles (default: 10000)
-- `--clean` -- clear existing outputs and Neo4j data before starting
-- `--bolt-uri` -- Neo4j Bolt URI (default: `bolt://localhost:7687`)
-- `--import-prefix` -- import file URI prefix (default: `file://`)
-- `--max-parallel-edges` -- max concurrent edge import jobs (default: 4)
-- `--max-parallel-light` -- max concurrent light import jobs (default: 8)
-- `--compose-file` -- Docker compose file path (auto-detected)
-- `--no-docker` -- connect to already-running Neo4j
-- `--no-import` -- skip import step (extract + merge only)
+- `--clean` -- clear existing outputs before starting
+- `--db-path` -- SurrealDB database path (default: `wikipedia.db`, relative to output dir)
+- `--no-load` -- skip load + analytics steps (extract + merge only)
+- `--no-analytics` -- skip analytics computation
 - `--no-archive` -- don't archive sharded CSVs after merging
 - `--multistream-index` -- path to multistream index file (`.txt.bz2`) for parallel parsing (auto-detected from dump filename)
-
-Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based import, use the individual `import` subcommand.
 
 ### Extract
 
@@ -100,32 +94,37 @@ dedalus extract -i <path-to-wiki-dump.xml.bz2> -o <output-directory>
 - `--clean` -- clear existing checkpoint and outputs before starting
 - `--multistream-index` -- path to multistream index file (`.txt.bz2`) for parallel parsing (auto-detected from dump filename)
 
-### Import
+### Load
 
-Loads extracted CSV files into Neo4j. Supports two import modes: (1) `--admin-import` for bulk loading (10-100x faster), or (2) default Bolt mode for incremental loading. Manages Docker lifecycle automatically.
+Loads extracted CSV files (articles + edges) into an embedded SurrealDB database with RocksDB backend. Requires merged (non-sharded) CSVs.
 
 ```bash
-dedalus import -o <output-directory>
+dedalus load -o <output-directory>
 ```
 
-**Import flags:**
+**Load flags:**
 - `-o` / `--output` -- directory containing Dedalus CSV output files (required)
-- `--bolt-uri` -- Neo4j Bolt URI (default: `bolt://localhost:7687`)
-- `--import-prefix` -- import file URI prefix for Neo4j LOAD CSV (default: `file://`)
-- `--max-parallel-edges` -- max concurrent LOAD CSV jobs for edges (default: 4)
-- `--max-parallel-light` -- max concurrent LOAD CSV jobs for lighter relationships (default: 8)
-- `--compose-file` -- Docker compose file path (auto-detected if not specified)
-- `--no-docker` -- skip Docker management, connect to an already-running Neo4j
-- `--clean` -- tear down existing Neo4j volumes before importing
-- `--admin-import` -- use neo4j-admin bulk import (10-100x faster, requires empty DB)
+- `--db-path` -- SurrealDB database path (default: `wikipedia.db`, relative to output dir)
+- `--batch-size` -- batch size for SurrealDB inserts (default: 10000)
+- `--clean` -- remove existing database before loading
 
-**Import modes:**
-- `--admin-import`: Uses neo4j-admin database import tool. Fastest option (10-100x faster than Bolt). Requires non-sharded CSVs (single files). Use `dedalus merge-csvs` first if you extracted with `--csv-shards > 1`. Requires empty Neo4j database.
-- Default (Bolt): Uses LOAD CSV via Bolt protocol and `FuturesUnordered` throttled parallelism. Works with sharded CSVs and existing data. Slower but more flexible.
+### Analytics
+
+Computes graph analytics (PageRank, community detection via label propagation, in+out degree) from CSVs and writes results back to SurrealDB.
+
+```bash
+dedalus analytics -o <output-directory>
+```
+
+**Analytics flags:**
+- `-o` / `--output` -- directory containing Dedalus CSV output files (required)
+- `--db-path` -- SurrealDB database path (default: `wikipedia.db`, relative to output dir)
+- `--pagerank-iterations` -- max PageRank iterations (default: 20)
+- `--damping` -- PageRank damping factor (default: 0.85)
 
 ### Merge CSVs
 
-Merges sharded CSV files (from `--csv-shards > 1` extraction) into single files for `--admin-import`. Performs deduplication of categories, images, and external links across shards using streaming I/O (256KB buffers).
+Merges sharded CSV files (from `--csv-shards > 1` extraction) into single files for SurrealDB loading. Performs deduplication of categories, images, and external links across shards using streaming I/O (256KB buffers).
 
 ```bash
 dedalus merge-csvs -o <output-directory>
@@ -141,7 +140,7 @@ dedalus merge-csvs -o <output-directory>
 
 ### Stats
 
-Shows output directory statistics: CSV file sizes, blob counts, and total disk usage.
+Shows output directory statistics: CSV file sizes, blob counts, SurrealDB size, and total disk usage.
 
 ```bash
 dedalus stats -o <output-directory>
@@ -153,7 +152,7 @@ dedalus stats -o <output-directory>
 ### Typical Workflows
 
 ```bash
-# Recommended: Full pipeline (extract 14 shards → merge → admin import)
+# Recommended: Full pipeline (extract → merge → load → analytics)
 dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ -v
 
 ---
@@ -163,8 +162,8 @@ dedalus pipeline -i small-dump.xml.bz2 -o out/ --limit 10000 -vv
 
 ---
 
-# Extract + merge only (no Neo4j)
-dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --no-import -v
+# Extract + merge only (no SurrealDB)
+dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --no-load -v
 
 ---
 
@@ -173,7 +172,7 @@ dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 1 
 
 ---
 
-# Clean slate (clear outputs + Neo4j data)
+# Clean slate (clear outputs before starting)
 dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o out/ --clean -v
 
 ---
@@ -183,14 +182,11 @@ dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --resume -v
 
 ---
 
-# Bolt-based import (slower, for incremental updates)
+# Manual step-by-step workflow
 dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o out/ --csv-shards 14 -v
-dedalus import -o out/  # omit --admin-import to use Bolt
-
----
-
-# Import into already-running Neo4j (no Docker)
-dedalus import -o out/ --no-docker --bolt-uri bolt://my-neo4j:7687
+dedalus merge-csvs -o out/ --archive
+dedalus load -o out/ --clean
+dedalus analytics -o out/
 
 ---
 
@@ -211,19 +207,21 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 
 ## Architecture
 
-### Two-Pass Extraction Pipeline
+### Multi-Pass Pipeline
 
 1. **Indexing Pass** (`index.rs`): Builds title-to-ID mapping (FxHashMap, pre-sized for 8M articles) and redirect resolution table without reading article text. Uses `skip_text` parser mode for speed. With multistream dumps, `build_multistream()` decompresses and parses bz2 streams in parallel via `rayon`, then merges results into a single index.
 
 2. **Extraction Pass** (`extract.rs`): Uses the index to extract nodes, edges, categories, images, external links, and enriched article content in parallel via `rayon::par_bridge()`. `ShardedCsvWriter` distributes rows across N files by `page_id % csv_shards`. `DashSet` deduplicates categories, images, and external links concurrently. With multistream dumps, uses `multistream::par_iter_pages()` to parallelize both decompression and XML parsing across bz2 streams.
 
-3. **Merge Pass** (`merge.rs`, optional): If `--csv-shards > 1`, use `dedalus merge-csvs` to combine shards into single files with cross-shard deduplication for `--admin-import` compatibility.
+3. **Merge Pass** (`merge.rs`, optional): If `--csv-shards > 1`, use `dedalus merge-csvs` to combine shards into single files with cross-shard deduplication.
 
-4. **Import Pass** (`import.rs`): Two modes: (1) `--admin-import` uses `neo4j-admin database import` for bulk loading; (2) default Bolt mode uses `neo4rs` driver with `LOAD CSV` and throttled `FuturesUnordered` parallelism.
+4. **Load Pass** (`surrealdb_writer.rs`): Reads merged `nodes.csv` and `edges.csv`, creates schema (article table + links_to relation), and batch-inserts records into embedded SurrealDB (RocksDB). Only articles and edges are loaded; categories, images, and external links remain as CSV output.
+
+5. **Analytics Pass** (`analytics.rs`): Builds a CSR (Compressed Sparse Row) graph from CSVs, computes PageRank (rayon-parallel power iteration), label propagation communities, and in+out degree. Writes results back to SurrealDB as article fields.
 
 ### Core Modules
 
-- **`main.rs`**: CLI entry point using `clap` subcommands. Initializes `tracing` logging with configurable verbosity. Uses `mimalloc` global allocator for better performance. Manually creates `tokio` runtime only for import path; extraction uses sync/rayon.
+- **`main.rs`**: CLI entry point using `clap` subcommands. Initializes `tracing` logging with configurable verbosity. Uses `mimalloc` global allocator for better performance. Manually creates `tokio` runtime only for load/analytics paths; extraction uses sync/rayon.
 
 - **`parser.rs`**: `PageParser<R>` -- generic streaming XML parser implementing `Iterator<Item = WikiPage>` over any `Read` source. State machine over `quick-xml` events for memory-efficient parsing. `WikiReader` wraps `PageParser` with BZ2 decompression, probing PATH for `lbzip2`/`pbzip2` for parallel decompression (256KB BufReader); falls back to in-process `MultiBzDecoder`. `Drop` cleans up child processes. `skip_text` flag enables lightweight indexing mode.
 
@@ -242,9 +240,13 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
   - `article_external_links[_NNN].csv` -- `:START_ID`, `:END_ID(ExternalLink)`, `:TYPE` (HAS_LINK)
   - `blobs/{shard:03}/{id}.json` -- enriched article content
 
-- **`import.rs`**: Neo4j import pipeline with two modes. (1) `--admin-import` uses `neo4j-admin database import` for 10-100x faster bulk loading. (2) Default Bolt mode uses `neo4rs` driver with `LOAD CSV` and throttled parallelism via `FuturesUnordered`. Both modes load all CSV types. Detects CSV layout (single vs sharded). Manages Docker via `tokio::process::Command`. Connects with retry (30 attempts, 2s delay). **Critical**: Creates indexes BEFORE `LOAD CSV` with `MERGE` to prevent O(n²) full label scans.
+- **`surrealdb_writer.rs`**: Embedded SurrealDB loader. Opens a RocksDB-backed database, creates schema (article table with title/pagerank/community/degree fields, links_to relation table), reads merged CSVs, and batch-inserts records using SurQL queries. Record IDs use Wikipedia page IDs (`article:{id}`). Only loads articles + edges; other CSV types are extraction-only output.
 
-- **`merge.rs`**: CSV shard merger for neo4j-admin compatibility. Detects shard count from `nodes_*.csv` files. Concatenates all CSV types with streaming I/O (256KB buffers). Deduplicates categories, images, and external links using `FxHashSet` to handle cross-shard duplicates. Outputs single merged files ready for `--admin-import`. `archive_shards()` moves `*_NNN.csv` files to `output/shards/` after merging to keep the output directory clean.
+- **`analytics.rs`**: Graph analytics engine. Builds CSR (Compressed Sparse Row) adjacency from CSVs with `FxHashMap<u32, u32>` for sparse Wikipedia IDs → dense 0..N mapping. Computes PageRank via rayon-parallel power iteration with configurable damping/epsilon/iterations. Label propagation for community detection. Batch-writes results to SurrealDB.
+
+- **`csv_util.rs`**: CSV layout detection and validation. `CsvType` enum for all 8 CSV file types. `detect_csv_layout()` determines single vs sharded. `csv_files_for()` generates filename lists. `validate_csv_files()` checks existence.
+
+- **`merge.rs`**: CSV shard merger. Detects shard count from `nodes_*.csv` files. Concatenates all CSV types with streaming I/O (256KB buffers). Deduplicates categories, images, and external links using `FxHashSet` to handle cross-shard duplicates. Outputs single merged files. `archive_shards()` moves `*_NNN.csv` files to `output/shards/` after merging to keep the output directory clean.
 
 - **`models.rs`**: Core types -- `WikiPage`, `PageType` (Article/Redirect/Special), `ArticleBlob` with conditional serialization for compact JSON.
 
@@ -254,15 +256,16 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 
 - **`stats.rs`**: `ExtractionStats` -- thread-safe atomic counters for extraction statistics. Avoids locking for performance. Supports checkpoint serialization.
 
-- **`config.rs`**: Constants for both extraction and import:
+- **`config.rs`**: Constants for extraction, SurrealDB, and analytics:
   - Extraction: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `PROGRESS_INTERVAL` (1000), `CACHE_VERSION` (2), `CHECKPOINT_VERSION` (3), `CHECKPOINT_INTERVAL` (10000)
-  - Import: `DEFAULT_BOLT_URI`, `IMPORT_MAX_RETRIES` (30), `IMPORT_RETRY_DELAY_SECS` (2), `IMPORT_MAX_PARALLEL_EDGES` (4), `IMPORT_MAX_PARALLEL_LIGHT` (8), `DEFAULT_IMPORT_PREFIX` (file://)
+  - SurrealDB: `SURREAL_NAMESPACE` ("dedalus"), `SURREAL_DATABASE` ("wikipedia"), `SURREAL_BATCH_SIZE` (10000), `DEFAULT_DB_PATH` ("wikipedia.db")
+  - Analytics: `PAGERANK_ITERATIONS` (20), `PAGERANK_DAMPING` (0.85), `PAGERANK_EPSILON` (1e-6), `LOUVAIN_MAX_ITERATIONS` (50)
 
 - **`cache.rs`**: Index persistence using `bincode`. Saves/loads `WikiIndex` as `index.cache`. Validates against input file mtime and size. Zero-copy serialization via `IndexCacheSer` (borrows FxHashMaps instead of cloning). Single-pass deserialization.
 
 - **`checkpoint.rs`**: `CheckpointManager` with double-checked locking for periodic checkpoint saves. Atomic write via `.tmp` + rename for crash safety. Cleared on successful completion.
 
-- **`tui/`**: Interactive terminal UI (`ratatui` + `crossterm`). `mod.rs` sets up tracing capture and the alternate-screen event loop. `app.rs` defines `App` state, per-operation config structs, field enums, and validation. `event.rs` polls `crossterm` on a background thread via `mpsc`. `logging.rs` implements a `tracing::Layer` that pushes formatted lines into a shared `VecDeque`. `runner.rs` spawns worker threads for extract/import/merge with shared `Arc<AtomicBool>` completion signals. `ui.rs` renders config forms, real-time stats panels, scrollable logs, and done summaries.
+- **`tui/`**: Interactive terminal UI (`ratatui` + `crossterm`). `mod.rs` sets up tracing capture and the alternate-screen event loop. `app.rs` defines `App` state, per-operation config structs, field enums, and validation. `event.rs` polls `crossterm` on a background thread via `mpsc`. `logging.rs` implements a `tracing::Layer` that pushes formatted lines into a shared `VecDeque`. `runner.rs` spawns worker threads for extract/load/analytics/merge with shared `Arc<AtomicBool>` completion signals. `ui.rs` renders config forms, real-time stats panels, scrollable logs, and done summaries.
 
 ### Key Performance Patterns
 
@@ -280,9 +283,10 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 - **Conditional serialization**: `#[serde(skip_serializing_if = "...", default)]` for compact JSON blobs
 - **Parallel decompression**: external `lbzip2`/`pbzip2` (with `pbzip2` fallback) and `Drop`-based cleanup
 - **Multistream parallel parsing**: with multistream dumps, each rayon worker independently seeks to a bz2 stream offset, decompresses with `BzDecoder`, wraps in synthetic `<mediawiki>` tags, and parses XML -- true parallelism in both decompression and parsing
-- **Throttled parallel import**: `FuturesUnordered` with bounded concurrency; edges at 4 concurrent, lighter operations at 8 concurrent
-- **Neo4j transactional batching**: `CALL { ... } IN TRANSACTIONS OF N ROWS` for memory-bounded bulk loading
-- **Tokio runtime isolation**: manually created only for import path; extraction uses sync rayon
+- **Embedded SurrealDB**: RocksDB backend, no external services or Docker required
+- **CSR graph representation**: Compressed Sparse Row for memory-efficient analytics on 7M+ node graphs (~1GB)
+- **Rayon-parallel PageRank**: power iteration with parallel rank computation and convergence check
+- **Tokio runtime isolation**: manually created only for load/analytics paths; extraction uses sync rayon
 - **Apple Silicon targeting**: `target-cpu=native` for NEON SIMD, `codegen-units=1` for better optimization
 - **String allocations**: single-pass building in `sanitize_field()` and `extract_abstract()` (vs replace→split→collect→join chains)
 - **BufWriter**: 128KB buffers (increased from 64KB) for CSV writers, 256KB for merge operations
@@ -292,12 +296,12 @@ dedalus extract -i dump-multistream.xml.bz2 -o out/ \
 
 The hybrid workflow solves a performance trade-off:
 - **Pure extraction with `--csv-shards 14`**: 1.62x speedup but produces 14 files per CSV type
-- **neo4j-admin import**: Requires single files (10-100x faster than Bolt but needs merged CSVs)
+- **SurrealDB load**: Requires single merged files
 - **Solution**: `dedalus merge-csvs` merges shards with cross-shard deduplication in <5 minutes
 
 Recommended for full Wikipedia dumps:
 ```
-Extract (14 shards, 1.62x faster) → Merge (<5 min, dedup) → Admin Import (10-100x faster)
+Extract (14 shards, 1.62x faster) → Merge (<5 min, dedup) → Load SurrealDB → Analytics
 ```
 
 ## Dependencies
@@ -305,7 +309,7 @@ Extract (14 shards, 1.62x faster) → Merge (<5 min, dedup) → Admin Import (10
 Key crates and their roles:
 - `quick-xml` -- streaming XML parsing (state machine, never full dump in memory)
 - `bzip2` -- BZ2 decompression fallback (uses external `lbzip2`/`pbzip2` when available)
-- `rayon` -- data parallelism for extraction (par_bridge)
+- `rayon` -- data parallelism for extraction and PageRank computation
 - `clap` -- CLI with subcommands
 - `csv` -- CSV writing with multiple files per type
 - `serde` / `serde_json` -- serialization, conditional field skipping for compact blobs
@@ -316,9 +320,9 @@ Key crates and their roles:
 - `bincode` -- cache/checkpoint serialization (zero-copy via IndexCacheSer)
 - `dashmap` -- concurrent category deduplication (DashSet)
 - `rustc-hash` -- FxHashMap/FxHashSet for faster hashing (trusted input, no DoS risk)
-- `neo4rs` -- Neo4j Bolt protocol driver
-- `tokio` -- async runtime for import operations (manually created, not for extraction)
-- `futures` -- FuturesUnordered for throttled parallel operations
+- `surrealdb` -- embedded graph database with RocksDB backend (kv-rocksdb feature)
+- `tokio` -- async runtime for SurrealDB load/analytics (manually created, not for extraction)
+- `futures` -- async utilities
 - `mimalloc` -- global allocator for better performance on multi-core systems
 
 ## Testing
@@ -326,33 +330,15 @@ Key crates and their roles:
 All tests must pass before committing:
 
 ```bash
-cargo test --verbose           # Run all tests (161 unit + integration)
+cargo test --verbose           # Run all tests (177 unit + integration)
 cargo clippy -- -D warnings    # Lint with strict warnings
 cargo fmt -- --check           # Check formatting
 ```
 
 Test suites:
-- **Unit tests**: Inline in modules (parser, index, extract, merge, content, infobox)
+- **Unit tests**: Inline in modules (parser, index, extract, merge, content, infobox, csv_util, surrealdb_writer, analytics)
 - **Integration tests**: `tests/integration_test.rs` (end-to-end extract + merge)
 - **Merge tests**: `tests/test_merge_csvs.rs` (CSV merging with deduplication)
-
-## Recent Optimizations (2026-02-09)
-
-- Apple Silicon targeting via `.cargo/config.toml` (`target-cpu=native`, `codegen-units=1`, `opt-level=3`)
-- String allocation optimizations in `sanitize_field()` (single-pass build vs replace→split→collect→join)
-- Direct string building in `extract_abstract()` (vs collect+join)
-- Increased CSV writer buffer size to 128KB (was 64KB)
-- Pre-create shard directories once (not per-article)
-- Cache: single-pass deserialization (was deserializing twice)
-- Cache: zero-copy serialization via `IndexCacheSer` (borrows FxHashMaps, no clone)
-- Single-pass regex via `captures_iter()` (not `find_iter()` + `captures()`)
-- Batched category writes (collect locally, lock once)
-- `contains()` check before clone+insert in DashSet
-- Page title/timestamp moved into blob instead of cloned
-- Edge tuples store only (target_id, edge_type), not source_id per edge
-- Consolidated duplicate LINK_REGEX into content.rs
-- CSV merging with 256KB streaming buffers and `FxHashSet` deduplication
-- MiMalloc global allocator for better multi-core performance
 
 ## Architecture Decisions
 
@@ -366,15 +352,19 @@ FxHash is faster than SipHash for trusted input (Wikipedia dump) and we don't ca
 
 ### Why csv-shards with merge?
 
-CSV sharding provides 1.62x extraction speedup on multi-core systems, but `neo4j-admin import` requires single files. Merge with deduplication solves this in <5 minutes and enables the fastest overall pipeline.
+CSV sharding provides 1.62x extraction speedup on multi-core systems, but SurrealDB loading requires single files. Merge with deduplication solves this in <5 minutes and enables the fastest overall pipeline.
 
-### Neo4j: indexes BEFORE LOAD CSV
+### Why SurrealDB embedded?
 
-**Critical lesson**: Always create indexes BEFORE `LOAD CSV` with `MERGE`. Without indexes, `MERGE` performs a full label scan per row, resulting in O(n²) performance. `neo4j-admin import` doesn't need pre-existing indexes (builds its own), but Bolt-based `LOAD CSV` absolutely does. The `import.rs` creates indexes before any loading.
+Eliminates Docker infrastructure, simplifies deployment to a single `wikipedia.db/` directory, and provides native graph relations. RocksDB backend gives persistent storage with good write throughput for batch loading.
 
-### Why throttle parallel edge jobs?
+### Why CSR for analytics?
 
-Memory pressure: each concurrent edge job buffers all its rows in memory before committing. Edges are the largest CSV type. Default of 4 concurrent edge jobs balances throughput vs memory usage; lighter operations use 8 concurrent. Reduce `--max-parallel-edges` if OOM occurs.
+Compressed Sparse Row is the most memory-efficient representation for sparse graphs. For 7M nodes / ~200M edges, CSR uses ~1GB vs ~3GB+ for adjacency lists. The dense ID mapping via `FxHashMap<u32, u32>` handles sparse Wikipedia page IDs efficiently.
+
+### Why label propagation instead of full Louvain?
+
+Label propagation is simpler, faster, and produces reasonable community structure for the Wikipedia graph. Full Louvain modularity optimization is significantly more complex to implement correctly and may be added as a future enhancement.
 
 ### Why multistream parallel parsing?
 
@@ -386,8 +376,9 @@ Stats are updated at high frequency (per-article). Atomic operations avoid locki
 
 ## Troubleshooting
 
-- **OOM during import**: Reduce `--max-parallel-edges` or `--max-parallel-light`. Use `--admin-import` for fastest memory-efficient loading.
 - **Slow extraction**: Ensure `cargo build --release` with Apple Silicon targeting. Set `--csv-shards 14` for 1.62x speedup. Use multistream dumps (`*-multistream.xml.bz2` + index) for parallel decompression.
 - **Index cache invalid**: Use `--no-cache` to rebuild. Cache validates against input file mtime and size.
 - **Checkpoint conflicts**: Use `--clean` to start fresh or `--resume` to continue.
-- **Neo4j connection timeout**: Increase `IMPORT_MAX_RETRIES` or check Docker logs with `docker compose -f neo4j-platform/docker-compose.yml logs neo4j`.
+- **SurrealDB load fails with sharded CSVs**: Run `dedalus merge-csvs -o <output>` first, or use `--csv-shards 1`.
+- **OOM during analytics**: CSR graph for full Wikipedia uses ~1GB. Ensure sufficient RAM (4GB+ recommended).
+- **Existing database conflicts**: Use `--clean` flag on load/pipeline to remove existing `wikipedia.db/` before loading.

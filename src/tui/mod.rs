@@ -1,8 +1,8 @@
 //! Interactive terminal UI for configuring and monitoring Dedalus operations.
 //!
-//! Provides a form-based interface for extract, import, and merge-csvs operations
-//! with real-time progress monitoring, live extraction stats, and log streaming.
-//! Built on `ratatui` and `crossterm`.
+//! Provides a form-based interface for extract, load, analytics, and merge-csvs
+//! operations with real-time progress monitoring, live extraction stats, and log
+//! streaming. Built on `ratatui` and `crossterm`.
 
 pub mod app;
 pub mod event;
@@ -14,16 +14,16 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use app::{App, Operation, Screen};
 use event::{AppEvent, EventHandler};
@@ -214,7 +214,8 @@ fn handle_tick(app: &mut App) {
         {
             app.done_message = match app.operation {
                 Operation::Extract => "Extraction completed successfully".to_string(),
-                Operation::Import => "Import completed successfully".to_string(),
+                Operation::Load => "SurrealDB load completed successfully".to_string(),
+                Operation::Analytics => "Analytics completed successfully".to_string(),
                 Operation::MergeCsvs => "CSV merge completed successfully".to_string(),
             };
         }

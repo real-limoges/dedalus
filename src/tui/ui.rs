@@ -3,11 +3,11 @@
 //! Uses `ratatui` widgets to draw tabbed configuration forms, real-time stats panels
 //! with optional progress bars, scrollable log output, and completion summaries.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
-use ratatui::Frame;
 
 use super::app::*;
 
@@ -37,8 +37,9 @@ fn draw_config(f: &mut Frame, app: &App) {
         .collect();
     let tab_index = match app.operation {
         Operation::Extract => 0,
-        Operation::Import => 1,
-        Operation::MergeCsvs => 2,
+        Operation::Load => 1,
+        Operation::Analytics => 2,
+        Operation::MergeCsvs => 3,
     };
     let tabs = Tabs::new(titles)
         .block(
@@ -58,7 +59,8 @@ fn draw_config(f: &mut Frame, app: &App) {
     // Form fields
     match app.operation {
         Operation::Extract => draw_extract_form(f, app, chunks[1]),
-        Operation::Import => draw_import_form(f, app, chunks[1]),
+        Operation::Load => draw_load_form(f, app, chunks[1]),
+        Operation::Analytics => draw_analytics_form(f, app, chunks[1]),
         Operation::MergeCsvs => draw_merge_form(f, app, chunks[1]),
     }
 
@@ -147,54 +149,56 @@ fn draw_extract_form(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_import_form(f: &mut Frame, app: &App, area: Rect) {
-    let cfg = &app.import_config;
-    let items: Vec<ListItem> = IMPORT_FIELDS
+fn draw_load_form(f: &mut Frame, app: &App, area: Rect) {
+    let cfg = &app.load_config;
+    let items: Vec<ListItem> = LOAD_FIELDS
         .iter()
         .enumerate()
         .map(|(i, field)| {
             let selected = i == app.field_index;
             match field {
-                ImportField::Output => {
+                LoadField::Output => field_line("Output dir:", &cfg.output, selected, false, false),
+                LoadField::DbPath => field_line("DB path:", &cfg.db_path, selected, false, false),
+                LoadField::BatchSize => {
+                    field_line("Batch size:", &cfg.batch_size, selected, false, false)
+                }
+                LoadField::Clean => field_line("Clean", "", selected, true, cfg.clean),
+            }
+        })
+        .collect();
+    let title = format!(" Load Settings ({} fields) ", items.len());
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(list, area);
+}
+
+fn draw_analytics_form(f: &mut Frame, app: &App, area: Rect) {
+    let cfg = &app.analytics_config;
+    let items: Vec<ListItem> = ANALYTICS_FIELDS
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let selected = i == app.field_index;
+            match field {
+                AnalyticsField::Output => {
                     field_line("Output dir:", &cfg.output, selected, false, false)
                 }
-                ImportField::BoltUri => {
-                    field_line("Bolt URI:", &cfg.bolt_uri, selected, false, false)
+                AnalyticsField::DbPath => {
+                    field_line("DB path:", &cfg.db_path, selected, false, false)
                 }
-                ImportField::ImportPrefix => {
-                    field_line("Import prefix:", &cfg.import_prefix, selected, false, false)
-                }
-                ImportField::MaxParallelEdges => field_line(
-                    "Max par edges:",
-                    &cfg.max_parallel_edges,
+                AnalyticsField::PageRankIterations => field_line(
+                    "PR iterations:",
+                    &cfg.pagerank_iterations,
                     selected,
                     false,
                     false,
                 ),
-                ImportField::MaxParallelLight => field_line(
-                    "Max par light:",
-                    &cfg.max_parallel_light,
-                    selected,
-                    false,
-                    false,
-                ),
-                ImportField::ComposeFile => {
-                    let display = if cfg.compose_file.is_empty() {
-                        "(auto-detect)"
-                    } else {
-                        &cfg.compose_file
-                    };
-                    field_line("Compose file:", display, selected, false, false)
-                }
-                ImportField::NoDocker => field_line("No Docker", "", selected, true, cfg.no_docker),
-                ImportField::CleanImport => field_line("Clean", "", selected, true, cfg.clean),
-                ImportField::AdminImport => {
-                    field_line("Admin import", "", selected, true, cfg.admin_import)
+                AnalyticsField::Damping => {
+                    field_line("Damping:", &cfg.damping, selected, false, false)
                 }
             }
         })
         .collect();
-    let title = format!(" Import Settings ({} fields) ", items.len());
+    let title = format!(" Analytics Settings ({} fields) ", items.len());
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(list, area);
 }
@@ -350,25 +354,24 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
 
     // Progress bar if limit is set
     let mut all_lines = lines;
-    if !app.extract_config.limit.is_empty() {
-        if let Ok(limit) = app.extract_config.limit.parse::<u64>() {
-            if limit > 0 {
-                let pct = (s.articles() as f64 / limit as f64 * 100.0).min(100.0);
-                let bar_width = 30usize;
-                let filled = (pct / 100.0 * bar_width as f64) as usize;
-                let empty = bar_width.saturating_sub(filled);
-                all_lines.push(Line::from(""));
-                all_lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        "\u{2591}".repeat(empty),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::raw(format!("  {:.0}%", pct)),
-                ]));
-            }
-        }
+    if !app.extract_config.limit.is_empty()
+        && let Ok(limit) = app.extract_config.limit.parse::<u64>()
+        && limit > 0
+    {
+        let pct = (s.articles() as f64 / limit as f64 * 100.0).min(100.0);
+        let bar_width = 30usize;
+        let filled = (pct / 100.0 * bar_width as f64) as usize;
+        let empty = bar_width.saturating_sub(filled);
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "\u{2591}".repeat(empty),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!("  {:.0}%", pct)),
+        ]));
     }
 
     let stats_widget =
@@ -378,7 +381,6 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
-    // Clone log lines to avoid lifetime issues with the MutexGuard
     let log_lines: Vec<String> = if let Ok(logs) = app.logs.lock() {
         let total = logs.len();
         let max_scroll = total.saturating_sub(inner_height);
@@ -444,14 +446,14 @@ fn draw_done(f: &mut Frame, app: &App) {
 
     // Summary
     let mut lines = Vec::new();
-    if let Ok(err) = app.worker_error.lock() {
-        if let Some(ref e) = *err {
-            lines.push(Line::from(Span::styled(
-                format!("  Error: {}", e),
-                Style::default().fg(Color::Red),
-            )));
-            lines.push(Line::from(""));
-        }
+    if let Ok(err) = app.worker_error.lock()
+        && let Some(ref e) = *err
+    {
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {}", e),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
     }
 
     if app.operation == Operation::Extract {

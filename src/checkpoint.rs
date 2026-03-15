@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 

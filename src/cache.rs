@@ -6,7 +6,7 @@
 
 use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bincode::Options;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};

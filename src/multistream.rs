@@ -172,8 +172,8 @@ pub fn detect_index_path(dump_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bzip2::write::BzEncoder;
     use bzip2::Compression;
+    use bzip2::write::BzEncoder;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 

@@ -1,492 +1,303 @@
 # Dedalus
 
-A Rust pipeline that extracts Wikipedia XML dumps into structured graph data and imports it into [Neo4j](https://neo4j.com).
+A high-performance Rust pipeline that transforms Wikipedia XML dumps into a structured graph database. Dedalus extracts articles, links, categories, and metadata from compressed dumps, loads them into an embedded [SurrealDB](https://surrealdb.com) database, and computes graph analytics like PageRank and community detection.
 
-Dedalus reads compressed Wikipedia dumps (`.xml.bz2`), resolves redirects, extracts article link graphs, and loads everything into Neo4j as a queryable knowledge graph. It can also output raw CSV/JSON files for use with other tools.
+No external services required -- everything runs as a single binary with a local `wikipedia.db/` directory as output.
 
-## Features
+## What It Does
 
-- **Two-pass streaming pipeline** -- indexing pass builds a title-to-ID map, extraction pass produces output in parallel (1.62x faster with 14 shards)
-- **Multistream parallel parsing** -- with Wikipedia's multistream dump format, both indexing and extraction decompress and parse bz2 streams in parallel via `rayon`, eliminating the single-threaded decompression bottleneck
-- **Memory-efficient** -- event-based XML parsing with `quick-xml`; never loads the full dump into memory
-- **Parallel extraction** -- uses `rayon` for multi-core article processing
-- **Parallel decompression** -- automatically uses `lbzip2` or `pbzip2` when available on PATH; falls back to in-process `MultiBzDecoder`
-- **Redirect resolution** -- follows redirect chains (up to 5 hops) to resolve target article IDs
-- **CSV sharding with merge** -- `--csv-shards N` splits output for parallel extraction; `merge-csvs` combines with deduplication (<5 min overhead)
-- **Fast Neo4j import** -- neo4j-admin bulk import (10-100x faster than Bolt) or incremental Bolt-based loading
-- **Rich content extraction** -- categories, infoboxes, abstracts, see-also links, images, external links, section headings, disambiguation detection, revision timestamps
-- **Namespace-aware** -- parses `<ns>` XML tag for page classification; filters namespace-prefixed links from article edges
-- **Sharded JSON blobs** -- enriched article content stored as `blobs/{shard}/{id}.json` (1000 shards by default)
-- **Resumable processing** -- index caching and checkpoint-based resume to skip redundant work
-- **Dry-run mode** -- validate pipeline without writing files
-- **Progress reporting and structured logging** via `indicatif` and `tracing`
-- **Apple Silicon optimizations** -- Native SIMD targeting for ~1.6x faster extraction on ARM64
-- **Interactive TUI** -- terminal UI for configuring and monitoring extract/import/merge operations
+```
+Wikipedia dump (.xml.bz2)
+    |
+    v
+[Extract] ---> CSV files + JSON blobs
+    |
+    v
+[Merge]   ---> Deduplicated single CSVs
+    |
+    v
+[Load]    ---> SurrealDB (RocksDB)
+    |
+    v
+[Analytics] -> PageRank, communities, degree
+```
 
-## Prerequisites
+**Output**: A `wikipedia.db/` directory containing the full article graph with computed analytics, plus CSV/JSON files for use with other tools.
 
-- **Rust 1.87+** (stable) -- [install via rustup](https://rustup.rs/)
-- **Docker** -- required for Neo4j import (manages container lifecycle automatically)
-- **lbzip2** (optional, recommended) -- parallel bzip2 decompression for standard (non-multistream) dumps
-  ```bash
-  # macOS
-  brew install lbzip2
-  # Debian/Ubuntu
-  apt install lbzip2
-  ```
-- **Wikipedia dump file** -- see [Obtaining Wikipedia Dumps](#obtaining-wikipedia-dumps) below
+## Quick Start
 
-## Obtaining Wikipedia Dumps
+```bash
+# Build
+cargo build --release
 
-Download dumps from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/). Two formats are available:
+# Run the full pipeline (extract -> merge -> load -> analytics)
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
 
-| Format | Files | Decompression |
-|--------|-------|---------------|
-| **Multistream** (recommended) | `enwiki-latest-pages-articles-multistream.xml.bz2` + `enwiki-latest-pages-articles-multistream-index.txt.bz2` | Parallel -- each rayon worker decompresses its own bz2 stream |
-| Standard | `enwiki-latest-pages-articles.xml.bz2` | Sequential -- single bz2 stream (uses `lbzip2` if available) |
+# Test with a small subset first
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
+```
 
-**Recommendation**: Use the multistream format. It contains ~200K independent bz2 streams (~100 pages each), allowing Dedalus to parallelize both decompression and XML parsing across all CPU cores. The standard format is a single bz2 stream, limiting parallelism to extraction only.
+That's it. No Docker, no database setup, no configuration files.
 
-Download both files for multistream:
+## Getting a Wikipedia Dump
+
+Download from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/). Use the **multistream** format for best performance:
+
 ```bash
 # ~22GB dump + ~250MB index
 wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
 wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream-index.txt.bz2
 ```
 
-## Building
-Requires Rust 1.87+ (stable).
+The multistream format contains ~200K independent bz2 streams, allowing Dedalus to parallelize both decompression and XML parsing across all CPU cores. The standard (non-multistream) format works too, but decompression is single-threaded.
 
-```bash
-cargo build --release
-```
+## Prerequisites
 
-**Performance Note**: The project uses `.cargo/config.toml` to enable native CPU targeting (`target-cpu=native`) for SIMD optimizations. On Apple Silicon (M1--M5), this provides ~1.6x faster extraction via NEON SIMD instructions. Always use `--release` for production workloads.
+- **Rust 1.87+** -- [install via rustup](https://rustup.rs/)
+- **lbzip2** (optional) -- parallel bzip2 decompression for standard (non-multistream) dumps
+  ```bash
+  brew install lbzip2        # macOS
+  apt install lbzip2         # Debian/Ubuntu
+  ```
 
-## Performance
+## Subcommands
 
-**Full English Wikipedia** (~22M pages, 87GB compressed):
+### `pipeline` -- Full Workflow (Recommended)
 
-| Stage | Configuration | Time | Speedup |
-|-------|--------------|------|---------|
-| Extraction | Single shard (`--csv-shards 1`) | ~4.5 hours | 1x baseline |
-| Extraction | 14 shards (`--csv-shards 14`) | ~2.8 hours | **1.62x faster** |
-| Merge | After 14-shard extraction | <5 minutes | minimal overhead |
-| Import (neo4j-admin) | Bulk import (merged CSVs) | ~15-20 minutes | **10-100x vs Bolt** |
-| Import (Bolt) | LOAD CSV via Bolt protocol | 4-6 hours | 1x baseline |
+Runs everything in sequence: extract, merge, load into SurrealDB, compute analytics.
 
-**Recommended workflow**: Extract with multistream + 14 shards → Merge → neo4j-admin import for best overall performance.
-
-**Multistream parallel parsing**: When using Wikipedia's multistream dump format (`*-multistream.xml.bz2`) with the accompanying index file (`*-multistream-index.txt.bz2`), Dedalus can decompress and parse bz2 streams in parallel across all CPU cores. This parallelizes both the indexing and extraction passes, eliminating the single-threaded decompression bottleneck that limits throughput with standard dumps. Use `--multistream-index` or let Dedalus auto-detect the index file from the dump filename.
-
-**Hardware recommendations**:
-- **CPU**: 8+ cores for parallel extraction (rayon scales well; 14+ cores on M5 Max)
-- **RAM**: 16GB minimum (32GB+ recommended for full Wikipedia)
-- **Storage**: SSD strongly recommended (CSV writes are I/O intensive)
-- **Platform**: Apple Silicon benefits from NEON SIMD optimizations
-
-## Quick Start
-
-The `pipeline` subcommand runs the full workflow in one command (extract → merge → import):
-
-```bash
-# Full pipeline with multistream dump (recommended)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
-
-# Test with a page limit first
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
-
-# Extract + merge only (no Neo4j)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --no-import -v
-```
-
-After import completes, Neo4j is available at:
-- **Bolt**: `bolt://localhost:7687`
-- **Browser**: `http://localhost:7474`
-
-<details>
-<summary>Manual workflow (extract → merge → import separately)</summary>
-
-```bash
-# Step 1: Fast extraction with 14 shards (1.62x speedup)
-dedalus extract -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --csv-shards 14 -v
-
-# Step 2: Merge CSVs (deduplicates categories/images/external links, <5 min overhead)
-dedalus merge-csvs -o output/
-
-# Step 3: Fast bulk import using neo4j-admin (10-100x faster than Bolt)
-dedalus import -o output/ --admin-import
-```
-
-</details>
-
-## Usage
-
-Dedalus uses subcommands: `pipeline`, `extract`, `import`, `merge-csvs`, `stats`, and `tui`.
-
-### `dedalus pipeline`
-
-Runs the full workflow in one command: extract → merge (if shards > 1) → archive shards → import. Pipeline always uses `--admin-import` mode (10-100x faster). For Bolt-based import, use the individual `import` subcommand.
 ```bash
 dedalus pipeline -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i, --input <PATH>` | Path to Wikipedia dump file (`.xml.bz2`) | required |
-| `-o, --output <DIR>` | Output directory for generated files | required |
-| `--shard-count <N>` | Number of shards for blob storage | `1000` |
-| `--csv-shards <N>` | Number of CSV output shards for parallel extraction | `8` |
-| `--limit <N>` | Limit pages processed (useful for testing) | none |
-| `--resume` | Resume from last checkpoint if available | `false` |
-| `--no-cache` | Force rebuild of index cache | `false` |
-| `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
-| `--clean` | Clear existing outputs and Neo4j data before starting | `false` |
-| `--bolt-uri <URI>` | Neo4j Bolt URI | `bolt://localhost:7687` |
-| `--import-prefix <PREFIX>` | Import file URI prefix for Neo4j LOAD CSV | `file://` |
-| `--max-parallel-edges <N>` | Max concurrent edge import jobs | `4` |
-| `--max-parallel-light <N>` | Max concurrent light import jobs | `8` |
-| `--compose-file <PATH>` | Docker compose file path (auto-detected if omitted) | auto |
-| `--no-docker` | Skip Docker management, connect to already-running Neo4j | `false` |
-| `--no-import` | Skip the import step (extract + merge only) | `false` |
-| `--no-archive` | Don't archive sharded CSVs after merging | `false` |
-| `--multistream-index <PATH>` | Path to multistream index file (`.txt.bz2`) for parallel parsing | auto-detected |
+| `-i, --input` | Path to Wikipedia dump (`.xml.bz2`) | required |
+| `-o, --output` | Output directory | required |
+| `--csv-shards <N>` | Parallel extraction shards | `8` |
+| `--limit <N>` | Cap pages processed (for testing) | none |
+| `--db-path` | SurrealDB database path | `wikipedia.db` |
+| `--clean` | Clear existing outputs before starting | `false` |
+| `--resume` | Resume from last checkpoint | `false` |
+| `--no-load` | Skip SurrealDB load + analytics | `false` |
+| `--no-analytics` | Skip analytics computation | `false` |
+| `--no-archive` | Keep sharded CSVs after merging | `false` |
+| `--multistream-index` | Path to multistream index file | auto-detected |
 
-### `dedalus extract`
+### `extract` -- CSV/JSON Extraction
 
-Processes a Wikipedia dump into CSV/JSON output files.
+Processes a dump into CSV files and JSON blobs without loading into a database.
 
 ```bash
 dedalus extract -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-i, --input <PATH>` | Path to Wikipedia dump file (`.xml.bz2`) | required |
-| `-o, --output <DIR>` | Output directory for generated files | required |
-| `--shard-count <N>` | Number of shards for blob storage | `1000` |
-| `--csv-shards <N>` | Number of CSV output shards for parallel extraction (match to core count) | `8` |
-| `--limit <N>` | Limit pages processed (useful for testing) | none |
-| `--dry-run` | Run pipeline without writing output files | `false` |
-| `--resume` | Resume from last checkpoint if available | `false` |
-| `--no-cache` | Force rebuild of index cache | `false` |
-| `--checkpoint-interval <N>` | Save checkpoint every N articles | `10000` |
-| `--clean` | Clear existing checkpoint and outputs before starting | `false` |
-| `--multistream-index <PATH>` | Path to multistream index file (`.txt.bz2`) for parallel parsing | auto-detected |
+Key flags: `--csv-shards`, `--limit`, `--dry-run`, `--resume`, `--clean`, `--no-cache`
 
-### `dedalus import`
+### `load` -- SurrealDB Import
 
-Loads extracted CSV files into Neo4j via the Bolt protocol or neo4j-admin bulk import. Manages Docker lifecycle automatically.
+Loads merged CSVs (articles + edges) into an embedded SurrealDB database.
 
 ```bash
-dedalus import -o <output-dir> [OPTIONS]
+dedalus load -o <output-dir> [OPTIONS]
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-o, --output <DIR>` | Directory containing Dedalus CSV output | required |
-| `--bolt-uri <URI>` | Neo4j Bolt URI | `bolt://localhost:7687` |
-| `--import-prefix <PREFIX>` | Import file URI prefix for Neo4j LOAD CSV | `file://` |
-| `--max-parallel-edges <N>` | Max concurrent edge LOAD CSV jobs (conservative for memory) | `4` |
-| `--max-parallel-light <N>` | Max concurrent light relationship LOAD CSV jobs | `8` |
-| `--compose-file <PATH>` | Docker compose file path (auto-detected if omitted) | auto |
-| `--no-docker` | Skip Docker management, connect to already-running Neo4j | `false` |
-| `--clean` | Tear down existing Neo4j volumes before importing | `false` |
-| `--admin-import` | Use neo4j-admin bulk import (10-100x faster, requires non-sharded CSVs) | `false` |
+| `-o, --output` | Directory containing CSV output | required |
+| `--db-path` | SurrealDB database path | `wikipedia.db` |
+| `--batch-size` | Records per insert batch | `10000` |
+| `--clean` | Remove existing database first | `false` |
 
-**Import modes:**
-- `--admin-import`: Uses neo4j-admin bulk import tool (10-100x faster). Best for full Wikipedia dumps. Requires empty database and non-sharded CSVs (use `merge-csvs` first if you extracted with `--csv-shards > 1`).
-- Default (Bolt): Uses LOAD CSV via Bolt protocol. Slower but works with existing data and sharded CSVs.
+### `analytics` -- Graph Analytics
 
-### `dedalus merge-csvs`
-
-Merges sharded CSV files into single files suitable for neo4j-admin import. Performs deduplication of categories, images, and external links.
+Computes PageRank, community detection (label propagation), and degree centrality from CSVs, writing results back to SurrealDB.
 
 ```bash
-dedalus merge-csvs -o <output-dir> [OPTIONS]
+dedalus analytics -o <output-dir> [OPTIONS]
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-o, --output <DIR>` | Directory containing sharded CSVs (e.g., `nodes_000.csv`) | required |
-| `--archive` | Archive sharded CSVs to `output/shards/` after merging | `false` |
+| `-o, --output` | Directory containing CSV output | required |
+| `--db-path` | SurrealDB database path | `wikipedia.db` |
+| `--pagerank-iterations` | Max PageRank iterations | `20` |
+| `--damping` | PageRank damping factor | `0.85` |
 
-**Note**: When using `dedalus pipeline`, sharded CSV files are automatically archived to a `shards/` subdirectory after merging to prevent import confusion. Use `--no-archive` to skip this. This preserves the original sharded files while keeping only merged files in the main output directory.
+### `merge-csvs` -- Shard Merging
 
-### `dedalus stats`
+Combines sharded CSV files into single files with cross-shard deduplication. Required before `load` if you extracted with `--csv-shards > 1`.
 
-Shows output directory statistics: CSV file sizes, blob counts, and total disk usage.
+```bash
+dedalus merge-csvs -o <output-dir> [--archive]
+```
+
+### `stats` -- Output Statistics
+
+Shows CSV file sizes, blob counts, SurrealDB size, and total disk usage.
 
 ```bash
 dedalus stats -o <output-dir>
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-o, --output <DIR>` | Output directory to inspect | `output` |
+### `tui` -- Interactive Terminal UI
 
-### `dedalus tui`
-
-Launches an interactive terminal UI for configuring and running extract, import, and merge operations. The TUI provides a form-based interface for setting all CLI flags without memorizing them, plus real-time progress monitoring with live stats and log streaming.
+Form-based interface for configuring and monitoring all operations with real-time stats and log streaming.
 
 ```bash
 dedalus tui
 ```
 
-**Keyboard controls:**
+| Key | Action |
+|-----|--------|
+| `Tab` | Switch between operation tabs |
+| `Up/Down` | Navigate form fields |
+| `Enter` | Toggle checkbox or start operation |
+| `c` | Cancel running operation |
+| `r` | Return to config (from done screen) |
+| `q` | Quit |
 
-| Key | Screen | Action |
-|-----|--------|--------|
-| `Tab` / `Shift+Tab` | Config | Switch between Extract / Import / MergeCsvs tabs |
-| `Up` / `Down` | Config | Navigate form fields |
-| `Enter` | Config | Toggle checkbox or start operation |
-| `Space` | Config | Toggle checkbox or type space in text field |
-| `c` | Progress | Cancel running operation |
-| `Up` / `Down` | Progress | Scroll log output |
-| `r` | Done | Return to config screen |
-| `q` | Config/Done | Quit |
-| `Ctrl+C` | Any | Force quit |
+### Global Flags
 
-### Global flags
+| Flag | Description |
+|------|-------------|
+| `-v` | INFO logging |
+| `-vv` | DEBUG logging |
+| `-vvv` | TRACE logging |
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-v, --verbose` | Increase verbosity (`-v` INFO, `-vv` DEBUG, `-vvv` TRACE) | WARN |
-
-### Examples
+## Example Workflows
 
 ```bash
 # Full pipeline (recommended)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
+dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ -v
 
-# Test pipeline with limited pages
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
+# Extract only, no database
+dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ --no-load -v
 
-# Extract + merge only (no Neo4j)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --no-import -v
-
-# Single shard pipeline (simpler, slower extraction)
-dedalus pipeline -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 1 -v
-
-# Clean slate (clear outputs + Neo4j data)
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --clean -v
+# Step-by-step
+dedalus extract -i enwiki-multistream.xml.bz2 -o out/ --csv-shards 14 -v
+dedalus merge-csvs -o out/ --archive
+dedalus load -o out/ --clean
+dedalus analytics -o out/
 
 # Resume interrupted extraction
-dedalus extract -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --resume -v
+dedalus extract -i enwiki-multistream.xml.bz2 -o out/ --resume -v
 
-# Quick test with 10,000 pages
-dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --limit 10000 -vv
-
-# Merge sharded CSVs for neo4j-admin import
-dedalus merge-csvs -o output/
-
-# Import into Neo4j using neo4j-admin bulk import (fastest)
-dedalus import -o output/ --admin-import
-
-# Bolt-based import (slower, for incremental updates)
-dedalus import -o output/
-
-# Import into an already-running Neo4j instance
-dedalus import -o output/ --no-docker --bolt-uri bolt://my-neo4j:7687
-
-# Multistream with explicit index path
-dedalus extract -i dump-multistream.xml.bz2 -o output/ \
-  --multistream-index dump-multistream-index.txt.bz2 -v
-
-# Check output directory statistics
-dedalus stats -o output/
-
-# Launch interactive TUI
-dedalus tui
+# Clean start
+dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ --clean -v
 ```
 
 ## Output Format
 
-With `--csv-shards 1`, extraction produces single files. With `--csv-shards N` (N > 1), each CSV is split into numbered shards (e.g. `edges_000.csv` through `edges_015.csv`).
-
 ```
 output/
-├── nodes.csv              # id:ID | title | :LABEL
-├── edges.csv                   # :START_ID | :END_ID | :TYPE (LINKS_TO, SEE_ALSO)
-├── categories.csv              # id:ID(Category) | name | :LABEL (deduplicated)
-├── article_categories.csv      # :START_ID | :END_ID(Category) | :TYPE (HAS_CATEGORY)
-├── image_nodes.csv             # id:ID(Image) | filename | :LABEL (deduplicated)
-├── article_images.csv          # :START_ID | :END_ID(Image) | :TYPE (HAS_IMAGE)
-├── external_link_nodes.csv     # id:ID(ExternalLink) | url | :LABEL (deduplicated)
-├── article_external_links.csv  # :START_ID | :END_ID(ExternalLink) | :TYPE (HAS_LINK)
-├── index.cache            # Cached index for fast restarts (bincode)
-├── checkpoint.bin         # Extraction progress checkpoint (bincode, cleared on completion)
-├── shards/                # Archived sharded CSVs (after merge-csvs, optional)
-│   ├── nodes_000.csv
-│   ├── edges_000.csv
+├── nodes.csv                   # Article nodes (id, title)
+├── edges.csv                   # Article-to-article links
+├── categories.csv              # Category nodes (deduplicated)
+├── article_categories.csv      # Article-to-category edges
+├── image_nodes.csv             # Image nodes (deduplicated)
+├── article_images.csv          # Article-to-image edges
+├── external_link_nodes.csv     # External link nodes (deduplicated)
+├── article_external_links.csv  # Article-to-external-link edges
+├── wikipedia.db/               # SurrealDB database (RocksDB)
+├── index.cache                 # Cached title-to-ID index
+├── blobs/
+│   ├── 000/{id}.json           # Enriched article content
+│   ├── 001/{id}.json
 │   └── ...
-└── blobs/
-    ├── 000/
-    │   └── {id}.json      # Enriched article blob
-    ├── 001/
-    │   └── ...
-    └── 999/
+└── shards/                     # Archived sharded CSVs (optional)
 ```
 
-### CSV files
+### SurrealDB Schema
 
-- **nodes** -- one row per article: `id:ID`, `title`, `:LABEL`
-- **edges** -- one row per wikilink: `:START_ID`, `:END_ID`, `:TYPE` (`LINKS_TO` or `SEE_ALSO`). Namespace-prefixed links (Category:, File:, Template:, etc.) are excluded.
-- **categories** -- deduplicated category nodes: `id:ID(Category)`, `name`, `:LABEL`
-- **article_categories** -- article-to-category edges: `:START_ID`, `:END_ID(Category)`, `:TYPE` (`HAS_CATEGORY`)
-- **image_nodes** -- deduplicated image nodes extracted from `[[File:...]]` / `[[Image:...]]` wikilinks: `id:ID(Image)`, `filename`, `:LABEL`
-- **article_images** -- article-to-image edges: `:START_ID`, `:END_ID(Image)`, `:TYPE` (`HAS_IMAGE`)
-- **external_link_nodes** -- deduplicated external link nodes from `[http://...]` markup: `id:ID(ExternalLink)`, `url`, `:LABEL`
-- **article_external_links** -- article-to-external-link edges: `:START_ID`, `:END_ID(ExternalLink)`, `:TYPE` (`HAS_LINK`)
+```sql
+-- Tables
+article { id, title, pagerank, community, degree }
+links_to (relation: article -> article)
 
-### JSON blobs
+-- Example queries
+SELECT * FROM article ORDER BY pagerank DESC LIMIT 10;
+SELECT count() FROM article;
+SELECT * FROM article WHERE title = "Rust (programming language)";
+SELECT ->links_to->article.title FROM article:12345;
+```
 
-Enriched article content, sharded by `id % shard_count`:
+### JSON Blobs
 
-- `id`, `title`, `abstract_text` (first paragraph, templates stripped)
-- `categories` (list), `infoboxes` (structured key-value), `sections` (heading list)
-- `timestamp` (revision ISO 8601), `is_disambiguation` (boolean)
+Each article gets an enriched JSON blob at `blobs/{id % 1000}/{id}.json`:
 
-Empty fields are omitted from the JSON for compactness.
+```json
+{
+  "id": 12345,
+  "title": "Example Article",
+  "abstract_text": "First paragraph with templates stripped...",
+  "categories": ["Category A", "Category B"],
+  "infoboxes": [{"template": "Infobox software", "fields": {...}}],
+  "sections": ["History", "Design", "See also"],
+  "timestamp": "2024-01-15T10:30:00Z",
+  "is_disambiguation": false
+}
+```
+
+## Performance
+
+**Full English Wikipedia** (~22M pages, 87GB compressed):
+
+| Stage | Time | Notes |
+|-------|------|-------|
+| Extract (14 shards) | ~2.8 hours | 1.62x faster than single shard |
+| Extract (1 shard) | ~4.5 hours | Simpler but slower |
+| Merge | <5 minutes | Cross-shard deduplication |
+| SurrealDB Load | ~15-30 minutes | Batch inserts to RocksDB |
+| Analytics | ~5-10 minutes | PageRank + communities + degree |
+
+**Hardware recommendations**:
+- 8+ CPU cores (rayon scales linearly)
+- 16GB+ RAM (32GB recommended for full Wikipedia analytics)
+- SSD storage (CSV writes are I/O intensive)
+- Apple Silicon benefits from automatic NEON SIMD optimizations (~1.6x)
 
 ## Architecture
 
-### Two-Pass Pipeline
+Dedalus uses a multi-pass streaming architecture:
 
-1. **Indexing pass** (`index.rs`) -- streams through the dump with `skip_text` enabled to build an in-memory `FxHashMap<String, u32>` of title-to-ID mappings and a redirect resolution table, pre-sized for ~8M articles and ~10M redirects. With multistream dumps, uses `build_multistream()` to decompress and parse bz2 streams in parallel via `rayon`.
+1. **Indexing** -- Streams through the dump with text skipped, building a `FxHashMap` title-to-ID index (pre-sized for 8M articles) with redirect resolution (up to 5 hops). With multistream dumps, this is parallelized across bz2 streams.
 
-2. **Extraction pass** (`extract.rs`) -- streams through the dump a second time, reading article text. Uses `rayon::par_bridge()` to process pages in parallel: extracts wikilinks, categories, infoboxes, images, external links, section headings, and abstracts. `DashSet` deduplicates categories, images, and external links concurrently. `ShardedCsvWriter` distributes rows across N files by `page_id % csv_shards`. With multistream dumps, decompression and XML parsing are also parallelized across bz2 streams via `multistream::par_iter_pages()`.
+2. **Extraction** -- Second pass reads article text. `rayon::par_bridge()` parallelizes processing. `ShardedCsvWriter` distributes output across N files. `DashSet` deduplicates categories/images/external links concurrently. Checkpointing every 10K articles enables resume.
 
-3. **Merge pass** (`merge.rs`, optional) -- if using `--csv-shards > 1`, combines numbered CSV files into single merged files with cross-shard deduplication of categories, images, and external links. Uses streaming I/O (256KB buffers) and `FxHashSet` for deduplication. Overhead: <5 minutes for full Wikipedia.
+3. **Merge** -- Streaming concatenation with `FxHashSet` deduplication across shards. 256KB I/O buffers.
 
-4. **Import pass** (`import.rs`) -- two modes: (1) `--admin-import` uses `neo4j-admin database import` for 10-100x faster bulk loading of all node and relationship types; (2) default Bolt mode connects via `neo4rs`, creates indexes, loads CSVs with throttled parallelism via `FuturesUnordered` using `CALL { ... } IN TRANSACTIONS` for memory-bounded bulk loading, then creates constraints.
+4. **Load** -- Opens embedded SurrealDB (RocksDB backend), creates schema, batch-inserts articles and edges from merged CSVs. Record IDs map directly from Wikipedia page IDs (`article:12345`).
 
-### Modules
+5. **Analytics** -- Builds a CSR (Compressed Sparse Row) graph from CSVs (~1GB for full Wikipedia). Computes PageRank via rayon-parallel power iteration, label propagation communities, and in+out degree. Batch-writes results to SurrealDB.
 
-| Module | Purpose |
-|--------|---------|
-| `main.rs` | CLI subcommands (`clap`), orchestrates extract/import/merge-csvs/pipeline/stats/tui |
-| `parser.rs` | `PageParser<R>` -- generic streaming XML parser implementing `Iterator<Item = WikiPage>`; `WikiReader` wraps it with BZ2 decompression and auto-detects parallel decompressor |
-| `index.rs` | `WikiIndex` -- `FxHashMap`-based title-to-ID mapping with redirect chain resolution; `build_multistream()` for parallel index building |
-| `extract.rs` | Parallel extraction with `ShardedCsvWriter` for split CSV output; multistream-aware parallel decompression |
-| `multistream.rs` | Multistream dump support -- parses the bz2 index file into `StreamRange` offsets, provides `par_iter_pages()` for parallel decompression + parsing, auto-detects index files |
-| `import.rs` | Neo4j import -- Docker management, Bolt connection with retry, throttled LOAD CSV, neo4j-admin bulk import |
-| `merge.rs` | CSV shard merger -- streaming concatenation with deduplication of categories, images, and external links for neo4j-admin compatibility |
-| `models.rs` | Core types: `WikiPage`, `PageType`, `ArticleBlob` |
-| `content.rs` | Text extraction: abstract, sections, see-also links, categories, images, external links, disambiguation |
-| `infobox.rs` | Brace-matching `{{Infobox ...}}` parser producing structured key-value data |
-| `stats.rs` | `ExtractionStats` -- atomic counters for thread-safe metrics |
-| `config.rs` | Constants for extraction and import |
-| `cache.rs` | Index persistence -- zero-copy serialization via `IndexCacheSer` |
-| `checkpoint.rs` | Extraction checkpointing with double-checked locking for resumable processing |
-| `tui/` | Interactive terminal UI (`ratatui` + `crossterm`) -- config forms, progress monitoring with live stats, log streaming |
-
-## Docker / Neo4j Setup
-
-Dedalus includes a Docker Compose configuration in `neo4j-platform/docker-compose.yml` that runs:
-
-- **Neo4j Community 5.x** -- graph database with Bolt protocol (port 7687) and browser UI (port 7474)
-
-The `dedalus import` command manages this container automatically. To run it manually:
-
-```bash
-IMPORT_DIR=./output docker compose -f neo4j-platform/docker-compose.yml up -d
-```
-
-The `IMPORT_DIR` environment variable controls which host directory is mounted at `/import` inside the container.
+Key design choices:
+- **Two-pass pipeline** -- Index first (fast, no text), then extract with redirect resolution
+- **FxHashMap** -- Faster than SipHash for trusted input (no DoS risk)
+- **CSV intermediates** -- Debuggable, reusable, decouples extraction from storage
+- **Embedded SurrealDB** -- No Docker, no external services, single directory output
+- **CSR for analytics** -- ~1GB for 7M nodes / 200M edges vs ~3GB+ for adjacency lists
+- **Tokio isolation** -- Only created for async SurrealDB operations; extraction stays on sync rayon
 
 ## Development
 
 ```bash
 cargo build --release          # Build optimized binary
-cargo test --verbose           # Run all tests (161 unit + integration)
-cargo fmt -- --check           # Check formatting
+cargo test --verbose           # Run all tests (177 unit + integration)
 cargo clippy -- -D warnings    # Lint with strict warnings
+cargo fmt -- --check           # Check formatting
 ```
 
 ## Troubleshooting
 
-### Extraction Issues
-
-**Slow extraction performance**:
-- Ensure you're using `cargo build --release` (debug builds are 10-50x slower)
-- Use `--csv-shards 14` for 1.62x speedup on multi-core systems
-- Check if `lbzip2` or `pbzip2` is available for parallel decompression (`which lbzip2`)
-- On Apple Silicon, verify `.cargo/config.toml` has `target-cpu=native` for SIMD optimizations
-
-**Index cache invalidation**:
-- Use `--no-cache` to force rebuild if Wikipedia dump changes
-- Cache is validated against input file modification time and size
-- Cache location: `<output-dir>/index.cache`
-
-**Checkpointing issues**:
-- Use `--clean` to clear stale checkpoints and start fresh
-- Use `--resume` to continue from last checkpoint (saves every 10,000 articles by default)
-- Checkpoint location: `<output-dir>/checkpoint.bin`
-
-**Out of memory during extraction**:
-- Reduce `--csv-shards` to lower memory usage (more shards = more file handles)
-- Ensure you have 16GB+ RAM for full Wikipedia dumps
-- Check system resource usage with `htop` or Activity Monitor
-
-### Import Issues
-
-**Neo4j connection timeout**:
-- Wait 30-60 seconds for Neo4j to start (import retries 30 times with 2s delay)
-- Check Docker logs: `docker compose -f neo4j-platform/docker-compose.yml logs neo4j`
-- Verify Neo4j is running: `docker compose -f neo4j-platform/docker-compose.yml ps`
-- Ensure port 7687 (Bolt) and 7474 (Browser) are not in use
-
-**Out of memory during import**:
-- Use `--admin-import` for memory-efficient bulk loading (10-100x faster)
-- Reduce `--max-parallel-edges` (default: 4 for Bolt)
-- Reduce `--max-parallel-light` (default: 8 for Bolt)
-- Increase Docker memory limit in Docker Desktop settings
-
-**Import fails with "CSV file not found"**:
-- Verify CSV files exist in output directory
-- For `--admin-import`, merge sharded CSVs first: `dedalus merge-csvs -o output/`
-- Check that `IMPORT_DIR` matches output directory if using manual Docker setup
-
-**Slow Bolt import**:
-- Use `--admin-import` for 10-100x speedup (requires empty database and merged CSVs)
-- Bolt mode is designed for incremental updates, not bulk loading
-- Ensure indexes exist (import creates them automatically before `LOAD CSV`)
-
-### Neo4j Browser Access
-
-After successful import, access Neo4j:
-- **Browser UI**: http://localhost:7474
-- **Bolt connection**: bolt://localhost:7687
-- **Default credentials**: neo4j / password (set in docker-compose.yml)
-
-Query examples:
-```cypher
-// Count articles
-MATCH (a:Article) RETURN count(a);
-
-// Find article by title
-MATCH (a:Article {title: "Rust (programming language)"}) RETURN a;
-
-// Find articles with most outgoing links
-MATCH (a:Article)-[r:LINKS_TO]->()
-RETURN a.title, count(r) as links
-ORDER BY links DESC LIMIT 10;
-
-// Find articles in a category
-MATCH (a:Article)-[:HAS_CATEGORY]->(c:Category {name: "Programming languages"})
-RETURN a.title;
-```
-
-### Performance Tips
-
-1. **Fastest workflow**: multistream dump + `--csv-shards 14` → `merge-csvs` → `--admin-import`
-2. **Use multistream dumps**: Download `*-multistream.xml.bz2` + index for parallel decompression across all cores
-3. **Use SSD storage**: CSV writes are I/O intensive
-4. **Parallel decompression**: Install `lbzip2` for faster XML parsing (standard dumps); multistream dumps don't need external tools
-5. **Apple Silicon**: Automatic NEON SIMD optimization (1.6x faster)
-6. **Resume interrupted runs**: Use `--resume` instead of restarting from scratch
-7. **Test first**: Use `--limit 10000` to validate pipeline before processing full dump
+| Problem | Solution |
+|---------|----------|
+| Slow extraction | Use `--release`, `--csv-shards 14`, multistream dumps, install `lbzip2` |
+| Stale index cache | `--no-cache` to rebuild |
+| Interrupted extraction | `--resume` to continue, or `--clean` to restart |
+| Load fails (sharded CSVs) | Run `dedalus merge-csvs` first |
+| OOM during analytics | Ensure 4GB+ free RAM for CSR graph |
+| Existing database conflicts | Use `--clean` on load/pipeline |
 
 ## License
 

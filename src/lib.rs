@@ -1,16 +1,16 @@
-//! Dedalus: Wikipedia dump extraction and Neo4j import pipeline
+//! Dedalus: Wikipedia dump extraction pipeline with SurrealDB embedded storage
 //!
-//! This crate provides a two-pass pipeline for extracting structured graph data from
-//! Wikipedia XML dumps and importing it into Neo4j:
+//! This crate provides a multi-pass pipeline for extracting structured graph data from
+//! Wikipedia XML dumps and loading it into an embedded SurrealDB (RocksDB) database:
 //!
 //! 1. **Indexing Pass** -- Build an in-memory title-to-ID mapping and redirect resolution
 //!    table by streaming through the dump without reading article text
 //! 2. **Extraction Pass** -- Process articles in parallel to extract nodes, edges, categories,
 //!    images, external links, and enriched content; output CSV files and JSON blobs
 //! 3. **Merge Pass** (optional) -- Combine sharded CSV files into single files with
-//!    deduplication for neo4j-admin compatibility
-//! 4. **Import Pass** -- Load CSV data into Neo4j using either neo4j-admin bulk import
-//!    (10-100x faster) or Bolt protocol (slower but works with existing data)
+//!    deduplication for SurrealDB loading
+//! 4. **Load Pass** -- Load article nodes and edges into embedded SurrealDB (RocksDB)
+//! 5. **Analytics Pass** -- Compute PageRank, community detection, and degree metrics
 //!
 //! # Architecture
 //!
@@ -18,10 +18,11 @@
 //!
 //! - **Streaming XML parsing** -- Never loads full dump into memory; uses event-based parsing
 //! - **Parallel extraction** -- Uses rayon to process articles concurrently
-//! - **CSV sharding** -- Distributes output across N files for parallel import
+//! - **CSV sharding** -- Distributes output across N files for parallel extraction
 //! - **Concurrent deduplication** -- DashSet for thread-safe first-seen category/image tracking
 //! - **Atomic operations** -- Lock-free counters for high-frequency statistics
 //! - **Resumable processing** -- Checkpointing and index caching to skip redundant work
+//! - **Embedded database** -- SurrealDB with RocksDB backend, no external services needed
 //!
 //! # Key Modules
 //!
@@ -29,43 +30,24 @@
 //! - [`index`] -- Title-to-ID mapping with redirect resolution
 //! - [`extract`] -- Parallel extraction with CSV sharding
 //! - [`merge`] -- CSV shard merging with deduplication
-//! - [`import`] -- Neo4j import via admin tool or Bolt protocol
+//! - [`surrealdb_writer`] -- SurrealDB embedded loader (reads CSVs, writes to RocksDB)
+//! - [`analytics`] -- Graph analytics (PageRank, Louvain, degree)
+//! - [`csv_util`] -- CSV layout detection and validation utilities
 //! - [`content`] -- Text extraction (abstracts, sections, links, categories)
 //! - [`infobox`] -- Structured infobox parsing with nested template support
 //! - [`models`] -- Core data types (WikiPage, ArticleBlob, PageType)
 //! - [`cache`] -- Index persistence with zero-copy serialization
 //! - [`checkpoint`] -- Extraction progress checkpointing
 //! - [`stats`] -- Thread-safe atomic counters for extraction metrics
-//! - [`config`] -- Constants for extraction and import
-//!
-//! # Performance Optimizations
-//!
-//! - **FxHashMap** instead of SipHash for trusted input (faster, no DoS risk)
-//! - **Pre-sized collections** -- 8M articles, 10M redirects to avoid reallocation
-//! - **String allocation** -- Single-pass building in hot paths
-//! - **Buffer sizes** -- 128KB for CSV writers, 256KB for merge operations
-//! - **Batch writes** -- Collect locally, lock once to reduce contention
-//! - **M1 CPU targeting** -- NEON SIMD via target-cpu=native
-//!
-//! # Example Usage
-//!
-//! ```bash
-//! # Extract with 8 shards for parallel processing
-//! dedalus extract -i enwiki-latest-pages-articles.xml.bz2 -o output/ --csv-shards 8
-//!
-//! # Merge sharded CSVs for neo4j-admin import
-//! dedalus merge-csvs -o output/
-//!
-//! # Import using fast bulk import
-//! dedalus import -o output/ --admin-import
-//! ```
+//! - [`config`] -- Constants for extraction and loading
 
+pub mod analytics;
 pub mod cache;
 pub mod checkpoint;
 pub mod config;
 pub mod content;
+pub mod csv_util;
 pub mod extract;
-pub mod import;
 pub mod index;
 pub mod infobox;
 pub mod merge;
@@ -73,13 +55,15 @@ pub mod models;
 pub mod multistream;
 pub mod parser;
 pub mod stats;
+pub mod surrealdb_writer;
 pub mod tui;
 
 // Re-export primary API types for convenient library use.
 pub use checkpoint::{Checkpoint, CheckpointManager};
+pub use csv_util::CsvType;
 pub use extract::ExtractionConfig;
-pub use import::{CsvType, ImportConfig};
 pub use index::WikiIndex;
 pub use models::{ArticleBlob, EdgeType, PageType, WikiPage};
 pub use parser::WikiReader;
 pub use stats::ExtractionStats;
+pub use surrealdb_writer::SurrealWriterConfig;
