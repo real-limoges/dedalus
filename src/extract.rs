@@ -1,154 +1,250 @@
-//! Parallel extraction pass producing CSV and JSON output.
+//! Extraction pass: reads every article and writes nodes, edges, categories,
+//! images and external links as CSV, and article content as JSON blobs.
 //!
-//! Uses `rayon::par_bridge()` (or multistream parallel iteration) to process
-//! articles concurrently. `ShardedCsvWriter` distributes rows across N files
-//! by `page_id % csv_shards`. `DashSet` deduplicates categories, images, and
-//! external links across threads.
+//! The dump is read in chunks of pages, in dump order. Each chunk is processed
+//! in parallel with rayon; then every writer is flushed and a checkpoint is
+//! saved, so a checkpoint only ever describes output that is completely on
+//! disk. Reading the next chunk overlaps with processing the current one.
+//!
+//! CSV rows are distributed across `csv_shards` files by `page_id % csv_shards`.
+//! Category, image and external link nodes are deduplicated across the whole
+//! run with `DashSet`s; relationship rows are written once per page.
 
-use crate::checkpoint::{Checkpoint, CheckpointManager};
-use crate::config::{CSV_WRITER_BUF_SIZE, PROGRESS_INTERVAL};
+use crate::cache;
+use crate::checkpoint::{self, Checkpoint, CheckpointManager, ResumePoint, RunIdentity};
+use crate::config::{CSV_WRITER_BUF_SIZE, PAGES_PER_STREAM};
 use crate::content;
 use crate::content::LINK_REGEX;
+use crate::csv_util::CsvType;
 use crate::index::WikiIndex;
 use crate::infobox;
-use crate::models::{ArticleBlob, EdgeType, PageType};
-use crate::multistream::StreamRange;
+use crate::models::{ArticleBlob, EdgeType, PageType, WikiPage};
+use crate::multistream::{self, StreamRange};
 use crate::parser::WikiReader;
 use crate::stats::ExtractionStats;
-use anyhow::{Context, Result};
+use crate::title::{is_namespace_link, normalize_title};
+use anyhow::{Context, Result, ensure};
 use dashmap::DashSet;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
-fn is_namespace_link(target: &str) -> bool {
-    match target.as_bytes().first() {
-        Some(b'C') => target.starts_with("Category:"),
-        Some(b'F') => target.starts_with("File:"),
-        Some(b'I') => target.starts_with("Image:"),
-        Some(b'T') => target.starts_with("Template:"),
-        Some(b'W') => target.starts_with("Wikipedia:"),
-        Some(b'H') => target.starts_with("Help:"),
-        Some(b'P') => target.starts_with("Portal:"),
-        Some(b'D') => target.starts_with("Draft:"),
-        Some(b'U') => target.starts_with("User:"),
-        Some(b'M') => target.starts_with("Module:") || target.starts_with("MediaWiki:"),
-        _ => false,
-    }
+// -- CSV output --------------------------------------------------------------
+
+type CsvRowWriter = csv::Writer<Box<dyn Write + Send>>;
+
+/// How the CSV files of a run are opened.
+#[derive(Clone, Copy, PartialEq)]
+enum OpenMode {
+    /// Write nothing (`--dry-run`).
+    DryRun,
+    /// Create the files and write their headers.
+    Fresh,
+    /// Append to files already cut back to the checkpoint.
+    Resume,
 }
 
-fn strip_section_anchor(target: &str) -> &str {
-    target.split('#').next().unwrap_or(target)
-}
-
-type CsvWriter = Arc<Mutex<csv::Writer<Box<dyn Write + Send>>>>;
-
-fn create_csv_writer(
-    output_dir: &str,
-    filename: &str,
-    dry_run: bool,
-    resuming: bool,
-) -> Result<CsvWriter> {
-    Ok(Arc::new(Mutex::new(if dry_run {
-        csv::Writer::from_writer(Box::new(std::io::sink()) as Box<dyn Write + Send>)
-    } else if resuming {
-        let path = format!("{}/{}", output_dir, filename);
-        let file = if Path::new(&path).exists() {
-            OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("Failed to open {} for append", filename))?
-        } else {
-            File::create(&path)
-                .with_context(|| format!("Failed to create {} during resume", filename))?
-        };
-        csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_writer(
-                Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file))
-                    as Box<dyn Write + Send>,
-            )
-    } else {
-        let file = File::create(format!("{}/{}", output_dir, filename))
-            .with_context(|| format!("Failed to create {}", filename))?;
-        csv::Writer::from_writer(
-            Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file)) as Box<dyn Write + Send>,
-        )
-    })))
-}
-
-fn write_header(writer: &CsvWriter, fields: &[&str]) -> Result<()> {
-    writer
-        .lock()
-        .map_err(|e| anyhow::anyhow!("CSV writer lock poisoned (a writer thread panicked): {}", e))?
-        .write_record(fields)
-        .context("Failed to write CSV header")
-}
-
-/// A set of CSV writers that shard rows by page ID.
-///
-/// When `csv_shards == 1`, produces a single file (e.g. `edges.csv`).
-/// When `csv_shards > 1`, produces N files (e.g. `edges_000.csv`, `edges_001.csv`, ...).
+/// The files of one CSV type, one per shard, chosen by `page_id % csv_shards`.
 struct ShardedCsvWriter {
-    writers: Vec<CsvWriter>,
+    file_names: Vec<String>,
+    writers: Vec<Mutex<CsvRowWriter>>,
 }
 
 impl ShardedCsvWriter {
-    fn new(
-        output_dir: &str,
-        base_name: &str,
-        csv_shards: u32,
-        dry_run: bool,
-        resuming: bool,
-    ) -> Result<Self> {
-        let mut writers = Vec::with_capacity(csv_shards as usize);
-        for shard in 0..csv_shards {
-            let filename = if csv_shards == 1 {
-                format!("{}.csv", base_name)
-            } else {
-                format!("{}_{:03}.csv", base_name, shard)
-            };
-            writers.push(create_csv_writer(output_dir, &filename, dry_run, resuming)?);
-        }
-        Ok(Self { writers })
+    fn open(output_dir: &str, csv_type: CsvType, csv_shards: u32, mode: OpenMode) -> Result<Self> {
+        let file_names = csv_type.file_names(csv_shards);
+        let writers = file_names
+            .iter()
+            .map(|name| open_csv(output_dir, name, csv_type.header(), mode).map(Mutex::new))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            file_names,
+            writers,
+        })
     }
 
-    fn write_headers(&self, fields: &[&str]) -> Result<()> {
-        for writer in &self.writers {
-            write_header(writer, fields)?;
+    /// The writer for a page's shard.
+    fn shard_for(&self, page_id: u32) -> Result<MutexGuard<'_, CsvRowWriter>> {
+        let idx = (page_id as usize) % self.writers.len();
+        self.writers[idx]
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CSV writer lock poisoned (a writer thread panicked)"))
+    }
+
+    fn flush(&self) -> Result<()> {
+        for (name, writer) in self.file_names.iter().zip(&self.writers) {
+            writer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("CSV writer lock poisoned"))?
+                .flush()
+                .with_context(|| format!("Failed to write {name}"))?;
         }
         Ok(())
     }
+}
 
-    fn shard_for(&self, page_id: u32) -> &CsvWriter {
-        let idx = (page_id as usize) % self.writers.len();
-        &self.writers[idx]
+fn open_csv(
+    output_dir: &str,
+    file_name: &str,
+    header: [&str; 3],
+    mode: OpenMode,
+) -> Result<CsvRowWriter> {
+    let path = Path::new(output_dir).join(file_name);
+    let sink: Box<dyn Write + Send> = match mode {
+        OpenMode::DryRun => Box::new(std::io::sink()),
+        OpenMode::Fresh => {
+            let file = File::create(&path)
+                .with_context(|| format!("Failed to create {}", path.display()))?;
+            Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file))
+        }
+        OpenMode::Resume => {
+            let file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("Failed to open {} for append", path.display()))?;
+            Box::new(BufWriter::with_capacity(CSV_WRITER_BUF_SIZE, file))
+        }
+    };
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(sink);
+    if mode != OpenMode::Resume {
+        writer
+            .write_record(header)
+            .with_context(|| format!("Failed to write header of {file_name}"))?;
+    }
+    Ok(writer)
+}
+
+/// Every CSV output of the extraction pass.
+struct CsvOutputs {
+    nodes: ShardedCsvWriter,
+    edges: ShardedCsvWriter,
+    categories: ShardedCsvWriter,
+    article_categories: ShardedCsvWriter,
+    image_nodes: ShardedCsvWriter,
+    article_images: ShardedCsvWriter,
+    external_link_nodes: ShardedCsvWriter,
+    article_external_links: ShardedCsvWriter,
+}
+
+impl CsvOutputs {
+    fn open(output_dir: &str, csv_shards: u32, mode: OpenMode) -> Result<Self> {
+        let open = |csv_type| ShardedCsvWriter::open(output_dir, csv_type, csv_shards, mode);
+        Ok(Self {
+            nodes: open(CsvType::Nodes)?,
+            edges: open(CsvType::Edges)?,
+            categories: open(CsvType::Categories)?,
+            article_categories: open(CsvType::ArticleCategories)?,
+            image_nodes: open(CsvType::ImageNodes)?,
+            article_images: open(CsvType::ArticleImages)?,
+            external_link_nodes: open(CsvType::ExternalLinkNodes)?,
+            article_external_links: open(CsvType::ArticleExternalLinks)?,
+        })
+    }
+
+    fn all(&self) -> [&ShardedCsvWriter; 8] {
+        [
+            &self.nodes,
+            &self.edges,
+            &self.categories,
+            &self.article_categories,
+            &self.image_nodes,
+            &self.article_images,
+            &self.external_link_nodes,
+            &self.article_external_links,
+        ]
+    }
+
+    /// Flushes every file. Any write error, including one held back by a
+    /// buffer since an earlier row, surfaces here.
+    fn flush(&self) -> Result<()> {
+        self.all().iter().try_for_each(|w| w.flush())
+    }
+
+    /// Every file's name and current length. Call right after `flush`.
+    fn lengths(&self, output_dir: &str) -> Result<Vec<(String, u64)>> {
+        self.all()
+            .iter()
+            .flat_map(|w| w.file_names.iter())
+            .map(|name| {
+                let path = Path::new(output_dir).join(name);
+                let len = fs::metadata(&path)
+                    .with_context(|| format!("Failed to stat {}", path.display()))?
+                    .len();
+                Ok((name.clone(), len))
+            })
+            .collect()
     }
 }
 
-/// Extracts edges from article text, classifying as LinksTo or SeeAlso.
-/// Returns (deduplicated edges, invalid link count).
+/// Cuts every CSV back to its length at the checkpoint, discarding rows that
+/// were written after it (including a half-written last row).
+fn truncate_to_checkpoint(output_dir: &str, csv_lengths: &[(String, u64)]) -> Result<()> {
+    for (name, len) in csv_lengths {
+        let path = Path::new(output_dir).join(name);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("Cannot resume: {} is missing", path.display()))?;
+        let actual = file.metadata()?.len();
+        ensure!(
+            actual >= *len,
+            "Cannot resume: {} is shorter ({actual} bytes) than at the checkpoint ({len} bytes)",
+            path.display()
+        );
+        file.set_len(*len)
+            .with_context(|| format!("Failed to truncate {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// The names already written to a node CSV, so a resumed run does not write
+/// a category, image or external link node a second time.
+fn seen_names_in(output_dir: &str, csv_type: CsvType, csv_shards: u32) -> Result<DashSet<String>> {
+    let seen = DashSet::new();
+    for name in csv_type.file_names(csv_shards) {
+        let path = Path::new(output_dir).join(&name);
+        let mut reader = csv::Reader::from_path(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        for record in reader.records() {
+            let record = record.with_context(|| format!("Malformed row in {name}"))?;
+            if let Some(id) = record.get(0) {
+                seen.insert(id.to_string());
+            }
+        }
+    }
+    Ok(seen)
+}
+
+// -- Per-page extraction -----------------------------------------------------
+
+/// Extracts edges from article text: a link inside the "See also" section is
+/// SeeAlso, any other link LinksTo. Returns (deduplicated edges, invalid link count).
 fn process_article_edges(
     text: &str,
     index: &WikiIndex,
-    see_also_start: Option<usize>,
+    see_also: Option<std::ops::Range<usize>>,
 ) -> (Vec<(u32, EdgeType)>, u64) {
     let mut local_edges: Vec<(u32, EdgeType)> = Vec::with_capacity(16);
     let mut invalid_count = 0u64;
 
     for caps in LINK_REGEX.captures_iter(text) {
-        let target_title = strip_section_anchor(&caps[1]);
-        if target_title.is_empty() || is_namespace_link(target_title) {
+        let target_title = normalize_title(&caps[1]);
+        if target_title.is_empty() || is_namespace_link(&target_title) {
             continue;
         }
-        if let Some(target_id) = index.resolve_id(target_title) {
-            let edge_type = match see_also_start {
-                Some(sa_start) if caps.get(0).unwrap().start() >= sa_start => EdgeType::SeeAlso,
+        if let Some(target_id) = index.resolve_id(&target_title) {
+            let link_start = caps.get(0).map_or(0, |m| m.start());
+            let edge_type = match &see_also {
+                Some(section) if section.contains(&link_start) => EdgeType::SeeAlso,
                 _ => EdgeType::LinksTo,
             };
             local_edges.push((target_id, edge_type));
@@ -162,71 +258,307 @@ fn process_article_edges(
     (local_edges, invalid_count)
 }
 
-/// Deduplicates entity items against a global set, writes new nodes and all relationships.
-/// Returns (new unique count, total relationship count).
-fn write_dedup_entities(
-    items: &[std::borrow::Cow<'_, str>],
-    dedup_set: &DashSet<String>,
-    node_writer: &ShardedCsvWriter,
-    rel_writer: &ShardedCsvWriter,
-    page_id: u32,
-    id_str: &str,
-    label: &str,
-    rel_type: &str,
-) -> (u64, u64) {
-    let mut new_items: Vec<&str> = Vec::new();
-    for item in items {
-        if !dedup_set.contains(item.as_ref()) && dedup_set.insert(item.as_ref().to_owned()) {
-            new_items.push(item.as_ref());
-        }
-    }
-
-    if !new_items.is_empty()
-        && let Ok(mut writer) = node_writer.shard_for(page_id).lock()
-    {
-        for name in &new_items {
-            if let Err(e) = writer.write_record([*name, *name, label]) {
-                warn!(error = %e, "Failed to write {} node record", label);
-            }
-        }
-    }
-
-    if let Ok(mut writer) = rel_writer.shard_for(page_id).lock() {
-        for item in items {
-            if let Err(e) = writer.write_record([id_str, item.as_ref(), rel_type]) {
-                warn!(error = %e, "Failed to write {} relationship record", rel_type);
-            }
-        }
-    }
-
-    (new_items.len() as u64, items.len() as u64)
+/// Writes an article's JSON blob to its shard directory, flushing so that a
+/// write error is returned rather than lost when the writer is dropped.
+fn write_article_blob(output_dir: &str, shard_count: u32, blob: &ArticleBlob) -> Result<()> {
+    let shard = blob.id % shard_count;
+    let blob_path = format!("{}/blobs/{:03}/{}.json", output_dir, shard, blob.id);
+    let file = File::create(&blob_path).with_context(|| format!("Failed to create {blob_path}"))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, blob)
+        .with_context(|| format!("Failed to serialize {blob_path}"))?;
+    writer
+        .flush()
+        .with_context(|| format!("Failed to write {blob_path}"))?;
+    debug!(id = blob.id, "Wrote blob");
+    Ok(())
 }
 
-/// Writes an article's JSON blob to the appropriate shard directory.
-fn write_article_blob(
-    output_dir: &str,
+/// One kind of deduplicated entity: its node file, its relationship file, and
+/// the names written so far.
+struct EntityOutput<'a> {
+    nodes: &'a ShardedCsvWriter,
+    relationships: &'a ShardedCsvWriter,
+    seen: &'a DashSet<String>,
+    label: &'static str,
+    rel_type: &'static str,
+}
+
+impl EntityOutput<'_> {
+    /// Writes a node row for each name not seen before in the run and a
+    /// relationship row for every name. Returns how many names were new.
+    fn write(&self, page_id: u32, id_str: &str, names: &[Cow<'_, str>]) -> Result<u64> {
+        // Only the thread whose insert succeeds writes the node row.
+        let new_names: Vec<&str> = names
+            .iter()
+            .map(|n| n.as_ref())
+            .filter(|n| !self.seen.contains(*n) && self.seen.insert((*n).to_owned()))
+            .collect();
+
+        if !new_names.is_empty() {
+            let mut writer = self.nodes.shard_for(page_id)?;
+            for name in &new_names {
+                writer.write_record([*name, *name, self.label])?;
+            }
+        }
+
+        let mut writer = self.relationships.shard_for(page_id)?;
+        for name in names {
+            writer.write_record([id_str, name.as_ref(), self.rel_type])?;
+        }
+
+        Ok(new_names.len() as u64)
+    }
+}
+
+/// Everything a worker needs to turn one page into output rows.
+struct Extractor<'a> {
+    index: &'a WikiIndex,
+    output_dir: &'a str,
     shard_count: u32,
-    page_id: u32,
-    blob: &ArticleBlob,
-    stats: &ExtractionStats,
-) {
-    let shard = page_id % shard_count;
-    let blob_path = format!("{}/blobs/{:03}/{}.json", output_dir, shard, page_id);
-    match File::create(&blob_path) {
-        Ok(f) => {
-            let mut w = BufWriter::new(f);
-            if let Err(e) = serde_json::to_writer(&mut w, blob) {
-                warn!(error = %e, path = %blob_path, "Failed to write blob");
-            } else {
-                stats.inc_blobs();
-                debug!(id = page_id, "Wrote blob");
+    dry_run: bool,
+    csv: CsvOutputs,
+    seen_categories: DashSet<String>,
+    seen_images: DashSet<String>,
+    seen_external_links: DashSet<String>,
+    stats: &'a ExtractionStats,
+}
+
+impl Extractor<'_> {
+    fn categories(&self) -> EntityOutput<'_> {
+        EntityOutput {
+            nodes: &self.csv.categories,
+            relationships: &self.csv.article_categories,
+            seen: &self.seen_categories,
+            label: "Category",
+            rel_type: "HAS_CATEGORY",
+        }
+    }
+
+    fn images(&self) -> EntityOutput<'_> {
+        EntityOutput {
+            nodes: &self.csv.image_nodes,
+            relationships: &self.csv.article_images,
+            seen: &self.seen_images,
+            label: "Image",
+            rel_type: "HAS_IMAGE",
+        }
+    }
+
+    fn external_links(&self) -> EntityOutput<'_> {
+        EntityOutput {
+            nodes: &self.csv.external_link_nodes,
+            relationships: &self.csv.article_external_links,
+            seen: &self.seen_external_links,
+            label: "ExternalLink",
+            rel_type: "HAS_LINK",
+        }
+    }
+
+    /// Writes every row and the blob for one page. Pages other than articles
+    /// produce nothing.
+    fn process_page(&self, page: WikiPage) -> Result<()> {
+        if page.page_type != PageType::Article {
+            return Ok(());
+        }
+
+        let mut itoa_buf = itoa::Buffer::new();
+        let id_str = itoa_buf.format(page.id);
+        self.stats.inc_articles();
+        self.csv
+            .nodes
+            .shard_for(page.id)?
+            .write_record([id_str, &page.title, "Page"])?;
+
+        let Some(text) = &page.text else {
+            return Ok(());
+        };
+
+        // -- Edges --
+        let (edges, invalid_count) =
+            process_article_edges(text, self.index, content::see_also_section_range(text));
+        let see_also_count = edges
+            .iter()
+            .filter(|(_, t)| *t == EdgeType::SeeAlso)
+            .count() as u64;
+        self.stats.add_edges(edges.len() as u64 - see_also_count);
+        self.stats.add_see_also_edges(see_also_count);
+        self.stats.add_invalid_links(invalid_count);
+        if !edges.is_empty() {
+            let mut end_buf = itoa::Buffer::new();
+            let mut writer = self.csv.edges.shard_for(page.id)?;
+            for (end_id, edge_type) in &edges {
+                let type_str = edge_type.to_string();
+                writer.write_record([id_str, end_buf.format(*end_id), &type_str])?;
             }
         }
-        Err(e) => {
-            warn!(error = %e, path = %blob_path, "Failed to create blob file");
+
+        // -- Categories, images, external links --
+        let categories = content::extract_categories(text);
+        let new_categories = self.categories().write(page.id, id_str, &categories)?;
+        self.stats.add_categories(new_categories);
+        self.stats.add_category_edges(categories.len() as u64);
+
+        let images = content::extract_images(text);
+        self.stats
+            .add_images(self.images().write(page.id, id_str, &images)?);
+
+        let links = content::extract_external_links(text);
+        self.stats
+            .add_external_links(self.external_links().write(page.id, id_str, &links)?);
+
+        // -- Infoboxes and blob --
+        let infoboxes = infobox::extract_infoboxes(text);
+        self.stats.add_infoboxes(infoboxes.len() as u64);
+
+        if !self.dry_run {
+            let blob = ArticleBlob {
+                id: page.id,
+                abstract_text: content::extract_abstract(text),
+                categories: categories.into_iter().map(Cow::into_owned).collect(),
+                infoboxes,
+                sections: content::extract_sections(text),
+                is_disambiguation: content::is_disambiguation(text),
+                title: page.title,
+                timestamp: page.timestamp,
+            };
+            write_article_blob(self.output_dir, self.shard_count, &blob)?;
+            self.stats.inc_blobs();
+        }
+        Ok(())
+    }
+
+    /// Processes one chunk of pages in parallel. Any write error stops the run.
+    fn process_chunk(&self, pages: Vec<WikiPage>) -> Result<()> {
+        pages
+            .into_par_iter()
+            .try_for_each(|page| self.process_page(page))
+    }
+}
+
+// -- Reading the dump in chunks ----------------------------------------------
+
+/// The dump as a sequence of page chunks, in dump order.
+// One PageSource exists per run, so the size difference between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum PageSource<'a> {
+    /// A standard dump, decompressed and parsed front to back.
+    Sequential { reader: WikiReader, pages_read: u64 },
+    /// A multistream dump, parsed several streams at a time in parallel.
+    Multistream {
+        dump_path: &'a str,
+        ranges: &'a [StreamRange],
+        next_stream: usize,
+    },
+}
+
+impl<'a> PageSource<'a> {
+    /// Opens the dump, positioned just after `resume` if given.
+    fn open(
+        dump_path: &'a str,
+        ranges: Option<&'a [StreamRange]>,
+        resume: Option<ResumePoint>,
+    ) -> Result<Self> {
+        match (ranges, resume) {
+            (Some(ranges), None) => Ok(Self::Multistream {
+                dump_path,
+                ranges,
+                next_stream: 0,
+            }),
+            (Some(ranges), Some(ResumePoint::AfterStreams(done))) => Ok(Self::Multistream {
+                dump_path,
+                ranges,
+                next_stream: done,
+            }),
+            (None, resume) => {
+                let skip = match resume {
+                    None => 0,
+                    Some(ResumePoint::AfterPages(done)) => done,
+                    Some(other) => anyhow::bail!("Cannot resume a standard dump from {other:?}"),
+                };
+                let mut reader = WikiReader::new(dump_path, false)
+                    .with_context(|| format!("Failed to open wiki dump: {dump_path}"))?;
+                if skip > 0 {
+                    info!(
+                        pages = skip,
+                        "Skipping pages finished before the checkpoint"
+                    );
+                    let skipped = reader.by_ref().take(skip as usize).count() as u64;
+                    ensure!(
+                        skipped == skip,
+                        "The dump ended after {skipped} pages, before the checkpoint at {skip}"
+                    );
+                }
+                Ok(Self::Sequential {
+                    reader,
+                    pages_read: skip,
+                })
+            }
+            (Some(_), Some(other)) => {
+                anyhow::bail!("Cannot resume a multistream dump from {other:?}")
+            }
+        }
+    }
+
+    /// The next chunk of about `chunk_pages` pages, or `None` at the end.
+    fn next_chunk(&mut self, chunk_pages: usize) -> Result<Option<Vec<WikiPage>>> {
+        match self {
+            Self::Sequential { reader, pages_read } => {
+                let chunk: Vec<WikiPage> = reader.by_ref().take(chunk_pages).collect();
+                *pages_read += chunk.len() as u64;
+                Ok((!chunk.is_empty()).then_some(chunk))
+            }
+            Self::Multistream {
+                dump_path,
+                ranges,
+                next_stream,
+            } => {
+                if *next_stream >= ranges.len() {
+                    return Ok(None);
+                }
+                let streams = (chunk_pages / PAGES_PER_STREAM).max(1);
+                let end = (*next_stream + streams).min(ranges.len());
+                let pages =
+                    multistream::parse_streams(dump_path, &ranges[*next_stream..end], false)?;
+                *next_stream = end;
+                Ok(Some(pages))
+            }
+        }
+    }
+
+    /// The resume point just after the last chunk returned.
+    fn position(&self) -> ResumePoint {
+        match self {
+            Self::Sequential { pages_read, .. } => ResumePoint::AfterPages(*pages_read),
+            Self::Multistream { next_stream, .. } => ResumePoint::AfterStreams(*next_stream),
+        }
+    }
+
+    /// Reports whether the dump was read cleanly (see `WikiReader::finish`).
+    fn finish(self) -> Result<()> {
+        match self {
+            Self::Sequential { reader, .. } => reader.finish(),
+            Self::Multistream { .. } => Ok(()),
         }
     }
 }
+
+/// Cuts a chunk down so the run reads at most `limit` pages in total.
+/// Returns `true` if the limit has now been reached.
+fn apply_limit(pages: &mut Vec<WikiPage>, limit: Option<u64>, pages_read: u64) -> bool {
+    let Some(limit) = limit else {
+        return false;
+    };
+    let remaining = limit.saturating_sub(pages_read) as usize;
+    if pages.len() >= remaining {
+        pages.truncate(remaining);
+        true
+    } else {
+        false
+    }
+}
+
+// -- Running the pass --------------------------------------------------------
 
 /// Configuration for the Wikipedia extraction pass.
 #[derive(Debug, Clone)]
@@ -236,307 +568,150 @@ pub struct ExtractionConfig<'a> {
     pub index: &'a WikiIndex,
     pub shard_count: u32,
     pub csv_shards: u32,
+    /// Maximum pages to read from the start of the dump.
     pub limit: Option<u64>,
     pub dry_run: bool,
+    /// Pages per chunk; a checkpoint is saved after each chunk.
+    pub chunk_pages: u32,
     pub resume_from: Option<&'a Checkpoint>,
     pub checkpoint_mgr: Option<&'a CheckpointManager>,
     pub multistream_ranges: Option<&'a [StreamRange]>,
 }
 
-/// Runs extraction with default stats/cancel state. Returns final statistics.
-pub fn run_extraction(config: &ExtractionConfig) -> Result<ExtractionStats> {
-    let stats = Arc::new(if let Some(cp) = config.resume_from {
-        ExtractionStats::from_checkpoint(&cp.stats)
-    } else {
-        ExtractionStats::new()
-    });
-    let cancel = Arc::new(AtomicBool::new(false));
-
-    run_extraction_with_stats(config, stats, cancel, false)
+/// How an extraction run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionEnd {
+    /// The whole dump (or `--limit` pages) was processed.
+    Completed,
+    /// The cancel flag was set. Output and checkpoint describe the last
+    /// finished chunk, so the run can be resumed.
+    Cancelled,
 }
 
-/// Runs extraction with caller-provided stats, cancel flag, and progress visibility.
+/// Runs extraction with fresh stats and no cancel flag. Returns final statistics.
+pub fn run_extraction(config: &ExtractionConfig) -> Result<ExtractionStats> {
+    let stats = Arc::new(ExtractionStats::new());
+    let cancel = Arc::new(AtomicBool::new(false));
+    run_extraction_with_stats(config, Arc::clone(&stats), cancel, false)?;
+    Ok(stats.snapshot())
+}
+
+/// Runs extraction, updating `stats` as it goes and stopping between chunks
+/// once `cancel` is set.
 pub fn run_extraction_with_stats(
     config: &ExtractionConfig,
     stats: Arc<ExtractionStats>,
     cancel: Arc<AtomicBool>,
     hide_progress: bool,
-) -> Result<ExtractionStats> {
-    let path = config.input_path;
+) -> Result<ExtractionEnd> {
     let output_dir = config.output_dir;
-    let index = config.index;
-    let shard_count = config.shard_count;
-    let csv_shards = config.csv_shards;
-    let limit = config.limit;
-    let dry_run = config.dry_run;
-    let resume_from = config.resume_from;
-    let checkpoint_mgr = config.checkpoint_mgr;
-    let multistream_ranges = config.multistream_ranges;
-    let resuming = resume_from.is_some();
-    let resume_after_id = resume_from.map(|cp| cp.last_processed_id).unwrap_or(0);
+    ensure!(config.csv_shards >= 1, "--csv-shards must be at least 1");
+    ensure!(config.shard_count >= 1, "--shard-count must be at least 1");
 
-    let output_path = Path::new(output_dir);
-    if !dry_run {
-        fs::create_dir_all(output_path)
-            .with_context(|| format!("Failed to create output directory: {}", output_dir))?;
-
-        let test_file = output_path.join(".write_test");
-        fs::write(&test_file, "test")
-            .with_context(|| format!("Output directory is not writable: {}", output_dir))?;
-        fs::remove_file(&test_file).ok();
-
-        // Pre-create all blob shard directories once, avoiding millions of
-        // redundant create_dir_all calls inside the parallel loop.
-        for shard in 0..shard_count {
-            let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
-            fs::create_dir_all(&dir_path)
-                .with_context(|| format!("Failed to create blob directory: {}", dir_path))?;
-        }
-    }
-
-    info!("Starting extraction from: {}", path);
-    if resuming {
+    let resume = config.resume_from;
+    if let Some(cp) = resume {
+        stats.restore_from(&cp.stats);
         info!(
-            last_id = resume_after_id,
+            resume_point = ?cp.resume_point,
             articles = stats.articles(),
             "Resuming from checkpoint"
         );
     }
-    if dry_run {
+
+    let mode = match (config.dry_run, resume) {
+        (true, _) => OpenMode::DryRun,
+        (false, None) => OpenMode::Fresh,
+        (false, Some(_)) => OpenMode::Resume,
+    };
+    if mode == OpenMode::DryRun {
         info!("Dry run mode - no files will be written");
-    }
-
-    let nodes_writer = ShardedCsvWriter::new(output_dir, "nodes", csv_shards, dry_run, resuming)?;
-    let edges_writer = ShardedCsvWriter::new(output_dir, "edges", csv_shards, dry_run, resuming)?;
-    let categories_writer =
-        ShardedCsvWriter::new(output_dir, "categories", csv_shards, dry_run, resuming)?;
-    let article_categories_writer = ShardedCsvWriter::new(
-        output_dir,
-        "article_categories",
-        csv_shards,
-        dry_run,
-        resuming,
-    )?;
-    let image_nodes_writer =
-        ShardedCsvWriter::new(output_dir, "image_nodes", csv_shards, dry_run, resuming)?;
-    let article_images_writer =
-        ShardedCsvWriter::new(output_dir, "article_images", csv_shards, dry_run, resuming)?;
-    let external_link_nodes_writer = ShardedCsvWriter::new(
-        output_dir,
-        "external_link_nodes",
-        csv_shards,
-        dry_run,
-        resuming,
-    )?;
-    let article_external_links_writer = ShardedCsvWriter::new(
-        output_dir,
-        "article_external_links",
-        csv_shards,
-        dry_run,
-        resuming,
-    )?;
-
-    if !resuming {
-        nodes_writer.write_headers(&["id:ID", "title", ":LABEL"])?;
-        edges_writer.write_headers(&[":START_ID", ":END_ID", ":TYPE"])?;
-        categories_writer.write_headers(&["id:ID(Category)", "name", ":LABEL"])?;
-        article_categories_writer.write_headers(&[":START_ID", ":END_ID(Category)", ":TYPE"])?;
-        image_nodes_writer.write_headers(&["id:ID(Image)", "filename", ":LABEL"])?;
-        article_images_writer.write_headers(&[":START_ID", ":END_ID(Image)", ":TYPE"])?;
-        external_link_nodes_writer.write_headers(&["id:ID(ExternalLink)", "url", ":LABEL"])?;
-        article_external_links_writer.write_headers(&[
-            ":START_ID",
-            ":END_ID(ExternalLink)",
-            ":TYPE",
-        ])?;
-    }
-
-    let stats_clone = Arc::clone(&stats);
-    let limit_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let limit_reached = Arc::new(AtomicBool::new(false));
-    let seen_categories: Arc<DashSet<String>> = Arc::new(DashSet::new());
-    let seen_images: Arc<DashSet<String>> = Arc::new(DashSet::new());
-    let seen_external_links: Arc<DashSet<String>> = Arc::new(DashSet::new());
-    let cancel_clone = Arc::clone(&cancel);
-
-    let pb = if hide_progress {
-        ProgressBar::hidden()
     } else {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            indicatif::ProgressStyle::default_spinner()
-                .template("{spinner:.cyan} {msg}")
-                .expect("valid progress template"),
-        );
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        pb
+        prepare_output_dir(output_dir, config.shard_count)?;
+    }
+    if mode == OpenMode::Fresh {
+        remove_stale_csvs(output_dir, config.csv_shards)?;
+    }
+    if let Some(cp) = resume {
+        truncate_to_checkpoint(output_dir, &cp.csv_lengths)?;
+    }
+
+    let seen = |csv_type| match mode {
+        OpenMode::Resume => seen_names_in(output_dir, csv_type, config.csv_shards),
+        _ => Ok(DashSet::new()),
     };
-    let pb = Arc::new(pb);
-    let pb_clone = Arc::clone(&pb);
-
-    let process_page = |page: crate::models::WikiPage| {
-        if limit_reached.load(Ordering::Relaxed) || cancel_clone.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some(max) = limit {
-            let current = limit_counter.fetch_add(1, Ordering::Relaxed);
-            if current >= max {
-                limit_reached.store(true, Ordering::Relaxed);
-                return;
-            }
-        }
-
-        if let PageType::Article = page.page_type {
-            let mut itoa_buf = itoa::Buffer::new();
-            let id_str = itoa_buf.format(page.id);
-            stats_clone.inc_articles();
-
-            if let Ok(mut writer) = nodes_writer.shard_for(page.id).lock()
-                && let Err(e) = writer.write_record([id_str, &page.title, "Page"])
-            {
-                warn!(error = %e, "Failed to write node record");
-            }
-
-            if let Some(text) = &page.text {
-                // -- Edges --
-                let see_also_start = content::see_also_section_start(text);
-                let (local_edges, invalid_count) =
-                    process_article_edges(text, index, see_also_start);
-                let links_to_count = local_edges
-                    .iter()
-                    .filter(|(_, t)| *t == EdgeType::LinksTo)
-                    .count() as u64;
-                let see_also_count = local_edges
-                    .iter()
-                    .filter(|(_, t)| *t == EdgeType::SeeAlso)
-                    .count() as u64;
-                stats_clone.add_edges(links_to_count);
-                stats_clone.add_see_also_edges(see_also_count);
-                stats_clone.add_invalid_links(invalid_count);
-
-                if !local_edges.is_empty() {
-                    let mut edge_itoa = itoa::Buffer::new();
-                    if let Ok(mut writer) = edges_writer.shard_for(page.id).lock() {
-                        for (end_id, edge_type) in &local_edges {
-                            let end_str = edge_itoa.format(*end_id);
-                            let type_str = match edge_type {
-                                EdgeType::LinksTo => "LINKS_TO",
-                                EdgeType::SeeAlso => "SEE_ALSO",
-                            };
-                            if let Err(e) = writer.write_record([id_str, end_str, type_str]) {
-                                warn!(error = %e, "Failed to write edge record");
-                            }
-                        }
-                    }
-                }
-
-                // -- Categories --
-                let categories = content::extract_categories(text);
-                if !categories.is_empty() {
-                    let (new_count, rel_count) = write_dedup_entities(
-                        &categories,
-                        &seen_categories,
-                        &categories_writer,
-                        &article_categories_writer,
-                        page.id,
-                        id_str,
-                        "Category",
-                        "HAS_CATEGORY",
-                    );
-                    stats_clone.add_categories(new_count);
-                    stats_clone.add_category_edges(rel_count);
-                }
-
-                // -- Images --
-                let images = content::extract_images(text);
-                if !images.is_empty() {
-                    let (new_count, _rel_count) = write_dedup_entities(
-                        &images,
-                        &seen_images,
-                        &image_nodes_writer,
-                        &article_images_writer,
-                        page.id,
-                        id_str,
-                        "Image",
-                        "HAS_IMAGE",
-                    );
-                    stats_clone.add_images(new_count);
-                }
-
-                // -- External links --
-                let ext_links = content::extract_external_links(text);
-                if !ext_links.is_empty() {
-                    let (new_count, _rel_count) = write_dedup_entities(
-                        &ext_links,
-                        &seen_external_links,
-                        &external_link_nodes_writer,
-                        &article_external_links_writer,
-                        page.id,
-                        id_str,
-                        "ExternalLink",
-                        "HAS_LINK",
-                    );
-                    stats_clone.add_external_links(new_count);
-                }
-
-                // -- Infoboxes & blob --
-                let infoboxes = infobox::extract_infoboxes(text);
-                if !infoboxes.is_empty() {
-                    stats_clone.add_infoboxes(infoboxes.len() as u64);
-                }
-
-                if !dry_run {
-                    let blob = ArticleBlob {
-                        id: page.id,
-                        title: page.title,
-                        abstract_text: content::extract_abstract(text),
-                        categories: categories.into_iter().map(|c| c.into_owned()).collect(),
-                        infoboxes,
-                        sections: content::extract_sections(text),
-                        timestamp: page.timestamp,
-                        is_disambiguation: content::is_disambiguation(text),
-                    };
-                    write_article_blob(output_dir, shard_count, page.id, &blob, &stats_clone);
-                }
-            }
-
-            if let Some(mgr) = checkpoint_mgr
-                && let Err(e) = mgr.maybe_save(page.id, &stats_clone)
-            {
-                warn!(error = %e, "Failed to save checkpoint");
-            }
-
-            let articles = stats_clone.articles();
-            if articles.is_multiple_of(PROGRESS_INTERVAL as u64) {
-                pb_clone.set_message(format!(
-                    "Extracting: {} articles, {} edges, {} blobs",
-                    articles,
-                    stats_clone.edges(),
-                    stats_clone.blobs()
-                ));
-            }
-        }
+    let extractor = Extractor {
+        index: config.index,
+        output_dir,
+        shard_count: config.shard_count,
+        dry_run: config.dry_run,
+        csv: CsvOutputs::open(output_dir, config.csv_shards, mode)?,
+        seen_categories: seen(CsvType::Categories)?,
+        seen_images: seen(CsvType::ImageNodes)?,
+        seen_external_links: seen(CsvType::ExternalLinkNodes)?,
+        stats: &stats,
     };
 
-    #[allow(clippy::needless_borrows_for_generic_args)]
-    if let Some(ranges) = multistream_ranges {
+    info!("Starting extraction from: {}", config.input_path);
+    if let Some(ranges) = config.multistream_ranges {
         info!(
             streams = ranges.len(),
             "Using multistream parallel extraction"
         );
-        crate::multistream::par_iter_pages(path, ranges, false)
-            .filter(|page| page.id > resume_after_id)
-            .for_each(&process_page);
-    } else {
-        let reader = WikiReader::new(path, false)
-            .with_context(|| format!("Failed to open wiki dump: {}", path))?;
-        reader
-            .filter(|page| page.id > resume_after_id)
-            .par_bridge()
-            .for_each(&process_page);
     }
+    let mut source = PageSource::open(
+        config.input_path,
+        config.multistream_ranges,
+        resume.map(|cp| cp.resume_point),
+    )?;
+    let chunk_pages = config.chunk_pages.max(1) as usize;
+    let mut pages_read = resume.map_or(0, |cp| cp.pages_read);
+    let progress = progress_bar(hide_progress);
 
-    pb.finish_and_clear();
+    let mut chunk = source.next_chunk(chunk_pages)?;
+    let end = loop {
+        let Some(mut pages) = chunk else {
+            break ExtractionEnd::Completed;
+        };
+        if cancel.load(Ordering::Acquire) {
+            break ExtractionEnd::Cancelled;
+        }
+        let limit_reached = apply_limit(&mut pages, config.limit, pages_read);
+        pages_read += pages.len() as u64;
+        let done_point = source.position();
+
+        // Read the next chunk while this one is processed.
+        let (next, processed) = if limit_reached {
+            (Ok(None), extractor.process_chunk(pages))
+        } else {
+            rayon::join(
+                || source.next_chunk(chunk_pages),
+                || extractor.process_chunk(pages),
+            )
+        };
+        processed?;
+        extractor.csv.flush()?;
+        // A chunk cut short by --limit ends the run, and the source has read
+        // past the pages that were dropped, so it gets no checkpoint.
+        if let Some(mgr) = config.checkpoint_mgr
+            && !limit_reached
+        {
+            let lengths = extractor.csv.lengths(output_dir)?;
+            mgr.save(done_point, pages_read, lengths, &stats)?;
+        }
+        progress.set_message(format!(
+            "Extracting: {} articles, {} edges, {} blobs",
+            stats.articles(),
+            stats.edges(),
+            stats.blobs()
+        ));
+        chunk = next?;
+    };
+
+    progress.finish_and_clear();
+    extractor.csv.flush()?;
+    if end == ExtractionEnd::Completed {
+        source.finish()?;
+    }
 
     info!(
         articles = stats.articles(),
@@ -545,29 +720,210 @@ pub fn run_extraction_with_stats(
         invalid_links = stats.invalid(),
         categories = stats.categories(),
         infoboxes = stats.infoboxes(),
-        "Extraction complete"
+        ended = ?end,
+        "Extraction finished"
     );
+    Ok(end)
+}
 
-    Ok(
-        Arc::try_unwrap(stats).unwrap_or_else(|arc| ExtractionStats {
-            articles_processed: std::sync::atomic::AtomicU64::new(arc.articles()),
-            edges_extracted: std::sync::atomic::AtomicU64::new(arc.edges()),
-            blobs_written: std::sync::atomic::AtomicU64::new(arc.blobs()),
-            invalid_links: std::sync::atomic::AtomicU64::new(arc.invalid()),
-            categories_found: std::sync::atomic::AtomicU64::new(arc.categories()),
-            category_edges: std::sync::atomic::AtomicU64::new(arc.category_edges()),
-            see_also_edges: std::sync::atomic::AtomicU64::new(arc.see_also_edges()),
-            infoboxes_extracted: std::sync::atomic::AtomicU64::new(arc.infoboxes()),
-            images_found: std::sync::atomic::AtomicU64::new(arc.images()),
-            external_links_found: std::sync::atomic::AtomicU64::new(arc.external_links()),
-        }),
-    )
+/// Checks the output directory is writable and creates every blob shard
+/// directory once, rather than per article.
+fn prepare_output_dir(output_dir: &str, shard_count: u32) -> Result<()> {
+    let output_path = Path::new(output_dir);
+    fs::create_dir_all(output_path)
+        .with_context(|| format!("Failed to create output directory: {}", output_dir))?;
+
+    let test_file = output_path.join(".write_test");
+    fs::write(&test_file, "test")
+        .with_context(|| format!("Output directory is not writable: {}", output_dir))?;
+    fs::remove_file(&test_file).ok();
+
+    for shard in 0..shard_count {
+        let dir_path = format!("{}/blobs/{:03}", output_dir, shard);
+        fs::create_dir_all(&dir_path)
+            .with_context(|| format!("Failed to create blob directory: {}", dir_path))?;
+    }
+    Ok(())
+}
+
+/// Removes CSV files an earlier run left that this run will not overwrite:
+/// merged files when this run shards, shards of another count, and the
+/// earlier run's `analytics.csv`. Without this, a later merge or analytics
+/// run could read an old `nodes.csv` next to new shards.
+fn remove_stale_csvs(output_dir: &str, csv_shards: u32) -> Result<()> {
+    let analytics = Path::new(output_dir).join(crate::analytics::ANALYTICS_FILE);
+    let stale = crate::csv_util::stale_csv_files(output_dir, csv_shards)?
+        .into_iter()
+        .chain(analytics.exists().then_some(analytics));
+    for path in stale {
+        info!(path = %path.display(), "Removing CSV from an earlier run");
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove stale {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn progress_bar(hidden: bool) -> ProgressBar {
+    if hidden {
+        return ProgressBar::hidden();
+    }
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .expect("valid progress template"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb
+}
+
+// -- The whole `extract` command ----------------------------------------------
+
+/// Everything the `extract` command needs, as given on the command line or in
+/// the TUI. Shared by both so they cannot drift apart.
+#[derive(Debug, Clone)]
+pub struct ExtractJob {
+    pub input: String,
+    pub output: String,
+    pub shard_count: u32,
+    pub csv_shards: u32,
+    pub limit: Option<u64>,
+    pub dry_run: bool,
+    pub resume: bool,
+    pub no_cache: bool,
+    pub clean: bool,
+    pub checkpoint_interval: u32,
+    /// Multistream index path; detected from the dump's name when `None`.
+    pub multistream_index: Option<String>,
+}
+
+/// What an `extract` command did.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractReport {
+    pub end: ExtractionEnd,
+    pub indexing_secs: f64,
+    pub extraction_secs: f64,
+}
+
+/// Runs the `extract` command: optional clean, multistream detection, index
+/// (from cache when valid), checkpoint lookup, and the extraction pass. The
+/// checkpoint is cleared only when the run completes.
+pub fn run_extract_job(
+    job: &ExtractJob,
+    stats: Arc<ExtractionStats>,
+    cancel: Arc<AtomicBool>,
+    hide_progress: bool,
+) -> Result<ExtractReport> {
+    ensure!(job.csv_shards >= 1, "--csv-shards must be at least 1");
+    ensure!(job.shard_count >= 1, "--shard-count must be at least 1");
+
+    if job.clean && Path::new(&job.output).exists() {
+        info!("Cleaning output directory: {}", job.output);
+        fs::remove_dir_all(&job.output)
+            .with_context(|| format!("Failed to clean output directory: {}", job.output))?;
+    }
+    fs::create_dir_all(&job.output)
+        .with_context(|| format!("Failed to create output directory: {}", job.output))?;
+
+    let index_path = job
+        .multistream_index
+        .clone()
+        .or_else(|| multistream::detect_index_path(&job.input));
+    let ranges = match &index_path {
+        Some(path) => {
+            info!(index = %path, "Using multistream parallel parsing");
+            Some(multistream::parse_multistream_index(path, &job.input)?)
+        }
+        None => None,
+    };
+
+    let start_indexing = Instant::now();
+    let index = load_or_build_index(job, ranges.as_deref())?;
+    let indexing_secs = start_indexing.elapsed().as_secs_f64();
+    info!(duration_secs = indexing_secs, "Indexing complete");
+
+    let identity = RunIdentity::of(
+        &job.input,
+        &job.output,
+        job.shard_count,
+        job.csv_shards,
+        ranges.is_some(),
+    )?;
+    let checkpoint_mgr = (!job.dry_run).then(|| CheckpointManager::new(identity.clone()));
+    let checkpoint = if job.resume && !job.clean {
+        let found = checkpoint::load_if_valid(&identity)?;
+        if found.is_none() {
+            info!("No valid checkpoint found, starting fresh");
+        }
+        found
+    } else {
+        None
+    };
+
+    if cancel.load(Ordering::Acquire) {
+        return Ok(ExtractReport {
+            end: ExtractionEnd::Cancelled,
+            indexing_secs,
+            extraction_secs: 0.0,
+        });
+    }
+
+    let start_extracting = Instant::now();
+    let config = ExtractionConfig {
+        input_path: &job.input,
+        output_dir: &job.output,
+        index: &index,
+        shard_count: job.shard_count,
+        csv_shards: job.csv_shards,
+        limit: job.limit,
+        dry_run: job.dry_run,
+        chunk_pages: job.checkpoint_interval,
+        resume_from: checkpoint.as_ref(),
+        checkpoint_mgr: checkpoint_mgr.as_ref(),
+        multistream_ranges: ranges.as_deref(),
+    };
+    let end = run_extraction_with_stats(&config, stats, cancel, hide_progress)?;
+    let extraction_secs = start_extracting.elapsed().as_secs_f64();
+
+    if end == ExtractionEnd::Completed
+        && let Some(mgr) = &checkpoint_mgr
+    {
+        mgr.clear()?;
+    }
+
+    Ok(ExtractReport {
+        end,
+        indexing_secs,
+        extraction_secs,
+    })
+}
+
+/// Loads the index from cache when valid, otherwise builds and caches it.
+fn load_or_build_index(job: &ExtractJob, ranges: Option<&[StreamRange]>) -> Result<WikiIndex> {
+    let cache_path = cache::cache_path(&job.output);
+    if job.no_cache {
+        info!("Cache disabled, building fresh index");
+    } else if let Some(index) = cache::try_load_index(&cache_path, &job.input)? {
+        return Ok(index);
+    } else {
+        info!("Building index (cache missing or stale)");
+    }
+
+    let index = match ranges {
+        Some(ranges) => WikiIndex::build_multistream(&job.input, ranges)?,
+        None => WikiIndex::build(&job.input)?,
+    };
+    if !job.dry_run
+        && let Err(e) = cache::save_index(&index, &job.input, &job.output)
+    {
+        warn!(error = %e, "Failed to save index cache");
+    }
+    Ok(index)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SHARD_COUNT;
 
     #[test]
     fn link_regex_simple_link() {
@@ -639,45 +995,99 @@ mod tests {
         assert!(caps.is_empty());
     }
 
-    #[test]
-    fn shard_calculation() {
-        assert_eq!(0 % SHARD_COUNT, 0);
-        assert_eq!(1 % SHARD_COUNT, 1);
-        assert_eq!(999 % SHARD_COUNT, 999);
-        assert_eq!(1000 % SHARD_COUNT, 0);
-        assert_eq!(1001 % SHARD_COUNT, 1);
-        assert_eq!(123456 % SHARD_COUNT, 456);
+    fn edges_index() -> WikiIndex {
+        let articles = [("Rust", 1u32), ("United States", 2), ("Python", 3)]
+            .into_iter()
+            .map(|(t, id)| (t.to_string(), id))
+            .collect();
+        WikiIndex::from_maps(articles, Default::default())
+    }
+
+    fn edges_of(text: &str) -> (Vec<(u32, EdgeType)>, u64) {
+        process_article_edges(text, &edges_index(), content::see_also_section_range(text))
     }
 
     #[test]
-    fn shard_stays_within_bounds() {
-        for id in [0u32, 1, 500, 999, 1000, 99999, u32::MAX] {
-            assert!(id % SHARD_COUNT < SHARD_COUNT);
+    fn edges_resolve_mediawiki_spellings() {
+        let (edges, invalid) = edges_of("[[rust]] [[United_States]] [[ Python ]] [[Rust#History]]");
+        assert_eq!(
+            edges,
+            vec![
+                (1, EdgeType::LinksTo),
+                (2, EdgeType::LinksTo),
+                (3, EdgeType::LinksTo)
+            ]
+        );
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn edges_skip_namespace_links_in_any_case() {
+        let (edges, invalid) =
+            edges_of("[[Category:Rust]] [[category:Rust]] [[:Category:Rust]] [[File:Rust.png]]");
+        assert!(edges.is_empty());
+        assert_eq!(invalid, 0);
+    }
+
+    #[test]
+    fn edges_after_see_also_section_are_links_to() {
+        let text = "[[Rust]]\n== See also ==\n* [[Python]]\n== References ==\n[[United States]]";
+        let (edges, _) = edges_of(text);
+        assert_eq!(
+            edges,
+            vec![
+                (1, EdgeType::LinksTo),
+                (2, EdgeType::LinksTo),
+                (3, EdgeType::SeeAlso)
+            ]
+        );
+    }
+
+    fn page(id: u32) -> WikiPage {
+        WikiPage {
+            id,
+            title: format!("P{id}"),
+            page_type: PageType::Article,
+            text: None,
+            ns: Some(0),
+            timestamp: None,
         }
     }
 
     #[test]
-    fn namespace_filter_works() {
-        assert!(is_namespace_link("Category:Science"));
-        assert!(is_namespace_link("File:Example.jpg"));
-        assert!(is_namespace_link("Image:Logo.png"));
-        assert!(is_namespace_link("Template:Infobox"));
-        assert!(is_namespace_link("Wikipedia:About"));
-        assert!(is_namespace_link("Help:Editing"));
-        assert!(is_namespace_link("Portal:Science"));
-        assert!(is_namespace_link("Draft:New article"));
-        assert!(!is_namespace_link("Rust (programming language)"));
-        assert!(!is_namespace_link("Python"));
+    fn apply_limit_cuts_the_chunk_that_crosses_it() {
+        let mut pages: Vec<_> = (1..=10).map(page).collect();
+        assert!(apply_limit(&mut pages, Some(25), 20));
+        assert_eq!(pages.len(), 5);
     }
 
     #[test]
-    fn strip_section_anchor_works() {
-        assert_eq!(strip_section_anchor("Article#Section"), "Article");
-        assert_eq!(strip_section_anchor("Article"), "Article");
+    fn apply_limit_leaves_chunks_below_it() {
+        let mut pages: Vec<_> = (1..=10).map(page).collect();
+        assert!(!apply_limit(&mut pages, Some(25), 0));
+        assert_eq!(pages.len(), 10);
+        assert!(!apply_limit(&mut pages, None, 1_000));
+    }
+
+    #[test]
+    fn truncate_to_checkpoint_discards_rows_after_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("nodes.csv"), "header\nrow1\nrow2 partial").unwrap();
+
+        truncate_to_checkpoint(out, &[("nodes.csv".to_string(), 12)]).unwrap();
+
         assert_eq!(
-            strip_section_anchor("United States#History"),
-            "United States"
+            fs::read_to_string(dir.path().join("nodes.csv")).unwrap(),
+            "header\nrow1\n"
         );
-        assert_eq!(strip_section_anchor("#Section_only"), "");
+    }
+
+    #[test]
+    fn truncate_to_checkpoint_rejects_a_shorter_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().to_str().unwrap();
+        fs::write(dir.path().join("nodes.csv"), "head").unwrap();
+        assert!(truncate_to_checkpoint(out, &[("nodes.csv".to_string(), 12)]).is_err());
     }
 }

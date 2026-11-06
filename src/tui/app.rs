@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::extract::ExtractReport;
 use crate::stats::ExtractionStats;
 
 /// Which screen the TUI is currently displaying.
@@ -22,9 +23,9 @@ pub enum Screen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     Extract,
-    Load,
-    Analytics,
     MergeCsvs,
+    Analytics,
+    Load,
 }
 
 impl Operation {
@@ -32,19 +33,19 @@ impl Operation {
     pub fn label(&self) -> &str {
         match self {
             Operation::Extract => "Extract",
-            Operation::Load => "Load",
-            Operation::Analytics => "Analytics",
             Operation::MergeCsvs => "MergeCsvs",
+            Operation::Analytics => "Analytics",
+            Operation::Load => "Load",
         }
     }
 
-    /// Returns all available operations in tab order.
+    /// Returns all available operations in tab order, which is pipeline order.
     pub fn all() -> &'static [Operation] {
         &[
             Operation::Extract,
-            Operation::Load,
-            Operation::Analytics,
             Operation::MergeCsvs,
+            Operation::Analytics,
+            Operation::Load,
         ]
     }
 }
@@ -64,22 +65,20 @@ pub enum ExtractField {
     Clean,
 }
 
+/// Navigable fields in the Analytics configuration form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticsField {
+    Output,
+    PageRankIterations,
+    Damping,
+}
+
 /// Navigable fields in the Load configuration form.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LoadField {
     Output,
     DbPath,
-    BatchSize,
     Clean,
-}
-
-/// Navigable fields in the Analytics configuration form.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AnalyticsField {
-    Output,
-    DbPath,
-    PageRankIterations,
-    Damping,
 }
 
 /// Navigable fields in the MergeCsvs configuration form.
@@ -102,21 +101,15 @@ pub static EXTRACT_FIELDS: &[ExtractField] = &[
     ExtractField::Clean,
 ];
 
-/// Ordered list of Load form fields for UI navigation.
-pub static LOAD_FIELDS: &[LoadField] = &[
-    LoadField::Output,
-    LoadField::DbPath,
-    LoadField::BatchSize,
-    LoadField::Clean,
-];
-
 /// Ordered list of Analytics form fields for UI navigation.
 pub static ANALYTICS_FIELDS: &[AnalyticsField] = &[
     AnalyticsField::Output,
-    AnalyticsField::DbPath,
     AnalyticsField::PageRankIterations,
     AnalyticsField::Damping,
 ];
+
+/// Ordered list of Load form fields for UI navigation.
+pub static LOAD_FIELDS: &[LoadField] = &[LoadField::Output, LoadField::DbPath, LoadField::Clean];
 
 /// Ordered list of MergeCsvs form fields for UI navigation.
 pub static MERGE_FIELDS: &[MergeField] = &[MergeField::Output];
@@ -140,10 +133,10 @@ impl Default for ExtractConfig {
         Self {
             input: String::new(),
             output: "output".to_string(),
-            csv_shards: "8".to_string(),
-            blob_shards: "1000".to_string(),
+            csv_shards: crate::config::DEFAULT_CSV_SHARDS.to_string(),
+            blob_shards: crate::config::SHARD_COUNT.to_string(),
             limit: String::new(),
-            checkpoint: "10000".to_string(),
+            checkpoint: crate::config::CHECKPOINT_INTERVAL.to_string(),
             dry_run: false,
             resume: false,
             no_cache: false,
@@ -152,29 +145,9 @@ impl Default for ExtractConfig {
     }
 }
 
-/// Form state for the Load operation's configuration fields.
-pub struct LoadConfigTui {
-    pub output: String,
-    pub db_path: String,
-    pub batch_size: String,
-    pub clean: bool,
-}
-
-impl Default for LoadConfigTui {
-    fn default() -> Self {
-        Self {
-            output: "output".to_string(),
-            db_path: crate::config::DEFAULT_DB_PATH.to_string(),
-            batch_size: crate::config::SURREAL_BATCH_SIZE.to_string(),
-            clean: false,
-        }
-    }
-}
-
 /// Form state for the Analytics operation's configuration fields.
 pub struct AnalyticsConfigTui {
     pub output: String,
-    pub db_path: String,
     pub pagerank_iterations: String,
     pub damping: String,
 }
@@ -183,9 +156,25 @@ impl Default for AnalyticsConfigTui {
     fn default() -> Self {
         Self {
             output: "output".to_string(),
-            db_path: crate::config::DEFAULT_DB_PATH.to_string(),
             pagerank_iterations: crate::config::PAGERANK_ITERATIONS.to_string(),
             damping: crate::config::PAGERANK_DAMPING.to_string(),
+        }
+    }
+}
+
+/// Form state for the Load operation's configuration fields.
+pub struct LoadConfigTui {
+    pub output: String,
+    pub db_path: String,
+    pub clean: bool,
+}
+
+impl Default for LoadConfigTui {
+    fn default() -> Self {
+        Self {
+            output: "output".to_string(),
+            db_path: crate::load::DEFAULT_DB_FILE.to_string(),
+            clean: false,
         }
     }
 }
@@ -222,8 +211,11 @@ pub struct App {
     pub worker_done: Arc<AtomicBool>,
     pub worker_error: Arc<Mutex<Option<String>>>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
-    pub log_scroll: usize,
+    /// How many lines above the newest the log view ends; 0 follows new lines.
+    pub log_offset_from_bottom: usize,
     pub phase: String,
+    /// Set by the extract worker when it finishes.
+    pub extract_report: Arc<Mutex<Option<ExtractReport>>>,
 
     // Done state
     pub done_message: String,
@@ -251,8 +243,9 @@ impl App {
             worker_done: Arc::new(AtomicBool::new(false)),
             worker_error: Arc::new(Mutex::new(None)),
             logs,
-            log_scroll: 0,
+            log_offset_from_bottom: 0,
             phase: String::new(),
+            extract_report: Arc::new(Mutex::new(None)),
 
             done_message: String::new(),
             indexing_secs: 0.0,
@@ -280,7 +273,7 @@ impl App {
                     | ExtractField::NoCache
                     | ExtractField::Clean
             ),
-            Operation::Load => matches!(LOAD_FIELDS[self.field_index], LoadField::Clean),
+            Operation::Load => LOAD_FIELDS[self.field_index] == LoadField::Clean,
             Operation::Analytics => false,
             Operation::MergeCsvs => false,
         }
@@ -323,12 +316,10 @@ impl App {
             Operation::Load => match LOAD_FIELDS[self.field_index] {
                 LoadField::Output => Some(&mut self.load_config.output),
                 LoadField::DbPath => Some(&mut self.load_config.db_path),
-                LoadField::BatchSize => Some(&mut self.load_config.batch_size),
                 LoadField::Clean => None,
             },
             Operation::Analytics => match ANALYTICS_FIELDS[self.field_index] {
                 AnalyticsField::Output => Some(&mut self.analytics_config.output),
-                AnalyticsField::DbPath => Some(&mut self.analytics_config.db_path),
                 AnalyticsField::PageRankIterations => {
                     Some(&mut self.analytics_config.pagerank_iterations)
                 }
@@ -350,11 +341,11 @@ impl App {
                 if self.extract_config.output.is_empty() {
                     return Err("Output directory is required".to_string());
                 }
-                if self.extract_config.csv_shards.parse::<u32>().is_err() {
-                    return Err("CSV shards must be a number".to_string());
+                if !matches!(self.extract_config.csv_shards.parse::<u32>(), Ok(n) if n >= 1) {
+                    return Err("CSV shards must be a number of at least 1".to_string());
                 }
-                if self.extract_config.blob_shards.parse::<u32>().is_err() {
-                    return Err("Blob shards must be a number".to_string());
+                if !matches!(self.extract_config.blob_shards.parse::<u32>(), Ok(n) if n >= 1) {
+                    return Err("Blob shards must be a number of at least 1".to_string());
                 }
                 if !self.extract_config.limit.is_empty()
                     && self.extract_config.limit.parse::<u64>().is_err()
@@ -363,15 +354,6 @@ impl App {
                 }
                 if self.extract_config.checkpoint.parse::<u32>().is_err() {
                     return Err("Checkpoint interval must be a number".to_string());
-                }
-                Ok(())
-            }
-            Operation::Load => {
-                if self.load_config.output.is_empty() {
-                    return Err("Output directory is required".to_string());
-                }
-                if self.load_config.batch_size.parse::<usize>().is_err() {
-                    return Err("Batch size must be a number".to_string());
                 }
                 Ok(())
             }
@@ -389,6 +371,15 @@ impl App {
                 }
                 if self.analytics_config.damping.parse::<f64>().is_err() {
                     return Err("Damping factor must be a number".to_string());
+                }
+                Ok(())
+            }
+            Operation::Load => {
+                if self.load_config.output.is_empty() {
+                    return Err("Output directory is required".to_string());
+                }
+                if self.load_config.db_path.is_empty() {
+                    return Err("DB path is required".to_string());
                 }
                 Ok(())
             }

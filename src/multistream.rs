@@ -11,7 +11,7 @@ use bzip2::read::{BzDecoder, MultiBzDecoder};
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
-use tracing::{info, warn};
+use tracing::info;
 
 /// A contiguous bz2 stream within the multistream dump.
 #[derive(Debug, Clone)]
@@ -66,17 +66,9 @@ pub fn parse_multistream_index(index_path: &str, dump_path: &str) -> Result<Vec<
         .with_context(|| format!("Failed to stat dump file: {}", dump_path))?
         .len();
 
-    // Build StreamRange vec with computed lengths
-    let mut ranges = Vec::with_capacity(offsets.len());
-    for i in 0..offsets.len() {
-        let offset = offsets[i];
-        let length = if i + 1 < offsets.len() {
-            offsets[i + 1] - offset
-        } else {
-            dump_size - offset
-        };
-        ranges.push(StreamRange { offset, length });
-    }
+    let ranges = ranges_from_offsets(&offsets, dump_size).with_context(|| {
+        format!("Multistream index {index_path} does not match dump {dump_path}")
+    })?;
 
     info!(
         streams = ranges.len(),
@@ -87,29 +79,39 @@ pub fn parse_multistream_index(index_path: &str, dump_path: &str) -> Result<Vec<
     Ok(ranges)
 }
 
-/// Parse all pages from a single bz2 stream within the dump file.
-fn parse_stream(dump_path: &str, range: &StreamRange, skip_text: bool) -> Vec<WikiPage> {
-    let result = parse_stream_inner(dump_path, range, skip_text);
-    match result {
-        Ok(pages) => pages,
-        Err(e) => {
-            warn!(
-                offset = range.offset,
-                length = range.length,
-                error = %e,
-                "Failed to parse stream, skipping"
-            );
-            Vec::new()
-        }
-    }
+/// Turns the sorted, distinct stream offsets into ranges. The last stream runs
+/// to the end of the dump. Fails if the offsets do not increase or run past
+/// the end of the dump, which means the index belongs to a different dump.
+fn ranges_from_offsets(offsets: &[u64], dump_size: u64) -> Result<Vec<StreamRange>> {
+    let ends = offsets
+        .iter()
+        .skip(1)
+        .copied()
+        .chain(std::iter::once(dump_size));
+    offsets
+        .iter()
+        .zip(ends)
+        .map(|(&offset, end)| {
+            if end <= offset {
+                anyhow::bail!("stream offset {offset} is not before {end}");
+            }
+            Ok(StreamRange {
+                offset,
+                length: end - offset,
+            })
+        })
+        .collect()
 }
 
-fn parse_stream_inner(
+/// Parses every page in one bz2 stream of the dump. A stream that fails to
+/// decompress or parse is an error: skipping it would silently drop pages.
+pub fn parse_stream(
     dump_path: &str,
     range: &StreamRange,
     skip_text: bool,
 ) -> Result<Vec<WikiPage>> {
-    let mut file = File::open(dump_path)?;
+    let mut file =
+        File::open(dump_path).with_context(|| format!("Failed to open dump: {dump_path}"))?;
     file.seek(SeekFrom::Start(range.offset))?;
     let limited = file.take(range.length);
     let decoder = BzDecoder::new(limited);
@@ -120,28 +122,30 @@ fn parse_stream_inner(
     let suffix = Cursor::new(b"</mediawiki>" as &[u8]);
     let wrapped = prefix.chain(decoder).chain(suffix);
 
-    let parser = PageParser::new(wrapped, skip_text).skip_timestamp(skip_text);
-    Ok(parser.collect())
+    let mut parser = PageParser::new(wrapped, skip_text).skip_timestamp(skip_text);
+    let pages: Vec<WikiPage> = parser.by_ref().collect();
+    match parser.error() {
+        Some(error) => anyhow::bail!(
+            "Stream at byte {} ({} bytes) is unreadable: {error}",
+            range.offset,
+            range.length
+        ),
+        None => Ok(pages),
+    }
 }
 
-/// Parse pages from a single stream for index building (skip_text=true).
-pub fn parse_stream_for_index(dump_path: &str, range: &StreamRange) -> Vec<WikiPage> {
-    parse_stream(dump_path, range, true)
-}
-
-/// Create a parallel iterator over all pages in the multistream dump.
-///
-/// Each rayon worker independently opens the dump file, seeks to a stream offset,
-/// decompresses, and parses XML. This achieves true parallelism in both
-/// decompression and XML parsing.
-pub fn par_iter_pages<'a>(
-    dump_path: &'a str,
-    ranges: &'a [StreamRange],
+/// Parses the given streams in parallel, one rayon task per stream, and
+/// returns their pages in dump order.
+pub fn parse_streams(
+    dump_path: &str,
+    ranges: &[StreamRange],
     skip_text: bool,
-) -> impl ParallelIterator<Item = WikiPage> + 'a {
-    ranges
+) -> Result<Vec<WikiPage>> {
+    let per_stream: Vec<Vec<WikiPage>> = ranges
         .par_iter()
-        .flat_map_iter(move |range| parse_stream(dump_path, range, skip_text))
+        .map(|range| parse_stream(dump_path, range, skip_text))
+        .collect::<Result<_>>()?;
+    Ok(per_stream.into_iter().flatten().collect())
 }
 
 /// Try to auto-detect the multistream index file from the dump path.
@@ -255,18 +259,18 @@ mod tests {
         )
         .unwrap();
 
-        let pages1 = parse_stream(dump.path().to_str().unwrap(), &ranges[0], false);
+        let pages1 = parse_stream(dump.path().to_str().unwrap(), &ranges[0], false).unwrap();
         assert_eq!(pages1.len(), 2);
         assert_eq!(pages1[0].title, "Article One");
         assert_eq!(pages1[1].title, "Article Two");
 
-        let pages2 = parse_stream(dump.path().to_str().unwrap(), &ranges[1], false);
+        let pages2 = parse_stream(dump.path().to_str().unwrap(), &ranges[1], false).unwrap();
         assert_eq!(pages2.len(), 1);
         assert_eq!(pages2[0].title, "Article Three");
     }
 
     #[test]
-    fn par_iter_pages_collects_all() {
+    fn parse_streams_returns_pages_in_dump_order() {
         let (dump, index) = create_multistream_dump();
         let ranges = parse_multistream_index(
             index.path().to_str().unwrap(),
@@ -275,17 +279,34 @@ mod tests {
         .unwrap();
 
         let dump_path = dump.path().to_str().unwrap();
-        let mut pages: Vec<_> = par_iter_pages(dump_path, &ranges, false).collect();
-        pages.sort_by_key(|p| p.id);
+        let pages = parse_streams(dump_path, &ranges, false).unwrap();
 
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0].title, "Article One");
-        assert_eq!(pages[1].title, "Article Two");
-        assert_eq!(pages[2].title, "Article Three");
+        let titles: Vec<&str> = pages.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, vec!["Article One", "Article Two", "Article Three"]);
     }
 
     #[test]
-    fn par_iter_pages_skip_text() {
+    fn corrupt_stream_is_an_error() {
+        let (dump, _index) = create_multistream_dump();
+        let dump_path = dump.path().to_str().unwrap();
+        // Start one byte into the first stream, so it is not valid bzip2.
+        let bad = StreamRange {
+            offset: 1,
+            length: 20,
+        };
+        assert!(parse_stream(dump_path, &bad, false).is_err());
+    }
+
+    #[test]
+    fn offsets_must_increase_and_stay_inside_the_dump() {
+        assert!(ranges_from_offsets(&[0, 100], 200).is_ok());
+        assert!(ranges_from_offsets(&[100, 50], 200).is_err());
+        assert!(ranges_from_offsets(&[0, 300], 200).is_err());
+        assert!(ranges_from_offsets(&[0, 100, 100], 200).is_err());
+    }
+
+    #[test]
+    fn parse_streams_skip_text() {
         let (dump, index) = create_multistream_dump();
         let ranges = parse_multistream_index(
             index.path().to_str().unwrap(),
@@ -294,7 +315,7 @@ mod tests {
         .unwrap();
 
         let dump_path = dump.path().to_str().unwrap();
-        let pages: Vec<_> = par_iter_pages(dump_path, &ranges, true).collect();
+        let pages = parse_streams(dump_path, &ranges, true).unwrap();
 
         assert_eq!(pages.len(), 3);
         for page in &pages {

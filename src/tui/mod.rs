@@ -1,6 +1,6 @@
 //! Interactive terminal UI for configuring and monitoring Dedalus operations.
 //!
-//! Provides a form-based interface for extract, load, analytics, and merge-csvs
+//! Provides a form-based interface for extract, merge-csvs, analytics, and load
 //! operations with real-time progress monitoring, live extraction stats, and log
 //! streaming. Built on `ratatui` and `crossterm`.
 
@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::extract::ExtractionEnd;
 use app::{App, Operation, Screen};
 use event::{AppEvent, EventHandler};
 use logging::TuiLogLayer;
@@ -44,6 +45,14 @@ pub fn run_tui() -> Result<()> {
         .with(log_layer)
         .init();
 
+    // Restore the terminal before any panic message is printed, so a panic
+    // (which aborts in release builds) does not leave the shell in raw mode.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+
     // Set up terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -56,12 +65,16 @@ pub fn run_tui() -> Result<()> {
 
     let result = run_app(&mut terminal, &mut app, &events);
 
-    // Restore terminal
-    terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    restore_terminal();
     terminal.show_cursor()?;
 
     result
+}
+
+/// Leaves raw mode and the alternate screen. Safe to call more than once.
+fn restore_terminal() {
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
 fn run_app(
@@ -78,14 +91,16 @@ fn run_app(
                     return Ok(());
                 }
 
-                match app.screen {
+                let quit = match app.screen {
                     Screen::Config => handle_config_key(app, key.code),
-                    Screen::Progress => handle_progress_key(app, key.code),
-                    Screen::Done => {
-                        if handle_done_key(app, key.code) {
-                            return Ok(());
-                        }
+                    Screen::Progress => {
+                        handle_progress_key(app, key.code);
+                        false
                     }
+                    Screen::Done => handle_done_key(app, key.code),
+                };
+                if quit {
+                    return Ok(());
                 }
             }
             AppEvent::Tick => {
@@ -97,12 +112,14 @@ fn run_app(
     }
 }
 
-fn handle_config_key(app: &mut App, code: KeyCode) {
+/// Handles a key on the config screen. Returns `true` to quit.
+///
+/// Esc always quits; `q` quits only when the selected field is not a text
+/// field, so a path such as `/data/qwiki` can be typed.
+fn handle_config_key(app: &mut App, code: KeyCode) -> bool {
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => {
-            // Signal quit by transitioning - handled in run_app
-            std::process::exit(0);
-        }
+        KeyCode::Esc => return true,
+        KeyCode::Char('q') if app.current_text_field().is_none() => return true,
         KeyCode::Tab => {
             let ops = Operation::all();
             let current = ops.iter().position(|&op| op == app.operation).unwrap_or(0);
@@ -164,20 +181,24 @@ fn handle_config_key(app: &mut App, code: KeyCode) {
         }
         _ => {}
     }
+    false
 }
 
 fn handle_progress_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('c') | KeyCode::Esc => {
+        // Only extraction can stop part way; the other operations run to the end.
+        KeyCode::Char('c') | KeyCode::Esc if app.operation == Operation::Extract => {
             app.cancel.store(true, Ordering::Release);
-            app.phase = "Cancelling...".to_string();
+            app.phase = "Canceling after the current chunk...".to_string();
         }
         KeyCode::Up => {
-            app.log_scroll = app.log_scroll.saturating_sub(1);
+            let total = app.logs.lock().map(|l| l.len()).unwrap_or(0);
+            app.log_offset_from_bottom = (app.log_offset_from_bottom + 1).min(total);
         }
         KeyCode::Down => {
-            app.log_scroll = app.log_scroll.saturating_add(1);
+            app.log_offset_from_bottom = app.log_offset_from_bottom.saturating_sub(1);
         }
+        KeyCode::End => app.log_offset_from_bottom = 0,
         _ => {}
     }
 }
@@ -196,36 +217,27 @@ fn handle_done_key(app: &mut App, code: KeyCode) -> bool {
 }
 
 fn handle_tick(app: &mut App) {
-    if app.worker_done.load(Ordering::Acquire) {
-        // Worker finished - compute timings from start_time
-        if let Some(start) = app.start_time {
-            let total = start.elapsed().as_secs_f64();
-            if app.operation == Operation::Extract {
-                // Use total time as extraction time (indexing is included)
-                app.extraction_secs = total;
-            }
-        }
-        app.screen = Screen::Done;
-        if app
-            .worker_error
-            .lock()
-            .map(|e| e.is_none())
-            .unwrap_or(false)
-        {
-            app.done_message = match app.operation {
-                Operation::Extract => "Extraction completed successfully".to_string(),
-                Operation::Load => "SurrealDB load completed successfully".to_string(),
-                Operation::Analytics => "Analytics completed successfully".to_string(),
-                Operation::MergeCsvs => "CSV merge completed successfully".to_string(),
-            };
-        }
+    if !app.worker_done.load(Ordering::Acquire) {
+        return;
     }
-
-    // Auto-scroll logs to bottom
-    if let Ok(logs) = app.logs.lock() {
-        let total = logs.len();
-        if total > 0 {
-            app.log_scroll = total.saturating_sub(1);
-        }
+    app.screen = Screen::Done;
+    let report = runner::take_extract_report(app);
+    let failed = app.worker_error.lock().map(|e| e.is_some()).unwrap_or(true);
+    if failed {
+        return;
     }
+    app.done_message = match (app.operation, report.map(|r| r.end)) {
+        (Operation::Extract, Some(ExtractionEnd::Cancelled)) => {
+            "Extraction canceled; check Resume to continue from the last checkpoint".to_string()
+        }
+        (Operation::Extract, _) => "Extraction completed successfully".to_string(),
+        (Operation::Analytics, _) => {
+            format!(
+                "Analytics completed successfully; results in {}",
+                crate::analytics::ANALYTICS_FILE
+            )
+        }
+        (Operation::Load, _) => "DuckDB load completed successfully".to_string(),
+        (Operation::MergeCsvs, _) => "CSV merge completed successfully".to_string(),
+    };
 }

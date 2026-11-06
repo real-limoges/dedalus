@@ -1,18 +1,23 @@
-//! Extraction checkpoint management for resumable processing.
+//! Extraction checkpoints for resumable processing.
 //!
-//! `CheckpointManager` uses double-checked locking for periodic saves with
-//! atomic write-via-rename for crash safety. Cleared on successful completion.
+//! Extraction reads the dump in chunks and saves a checkpoint after each chunk
+//! has been fully written and flushed. A checkpoint records how far into the
+//! dump the run got (`ResumePoint`) and the length of every CSV file at that
+//! moment. Resuming cuts each CSV back to its recorded length, discarding any
+//! rows written after the checkpoint, and continues from the resume point, so
+//! no page is skipped and none is written twice.
+//!
+//! Checkpoints are written atomically and removed when a run completes.
 
+use crate::atomic_file::write_atomically;
 use crate::config::CHECKPOINT_VERSION;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
@@ -31,16 +36,68 @@ pub struct CheckpointStats {
     pub external_links_found: u64,
 }
 
-/// A saved extraction checkpoint for resume support.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Checkpoint {
-    pub version: u32,
+/// How far into the dump a run has fully written its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumePoint {
+    /// Reading a standard dump front to back: this many pages are done.
+    AfterPages(u64),
+    /// Reading a multistream dump: the first this-many streams are done.
+    AfterStreams(usize),
+}
+
+/// What a checkpoint belongs to. A checkpoint is only used by a run with an
+/// identical identity: same dump (path, size and modification time), same
+/// output directory, same sharding, and same reading mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunIdentity {
     pub input_path: String,
     pub input_mtime: u64,
+    pub input_size: u64,
     pub output_dir: String,
     pub shard_count: u32,
     pub csv_shards: u32,
-    pub last_processed_id: u32,
+    pub multistream: bool,
+}
+
+impl RunIdentity {
+    /// Describes a run over `input_path`, reading the dump's size and mtime.
+    pub fn of(
+        input_path: &str,
+        output_dir: &str,
+        shard_count: u32,
+        csv_shards: u32,
+        multistream: bool,
+    ) -> Result<Self> {
+        let metadata = fs::metadata(input_path)
+            .with_context(|| format!("Failed to get metadata for: {}", input_path))?;
+        let input_mtime = metadata
+            .modified()
+            .context("Failed to get modification time")?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .context("Invalid modification time")?
+            .as_secs();
+        Ok(Self {
+            input_path: input_path.to_string(),
+            input_mtime,
+            input_size: metadata.len(),
+            output_dir: output_dir.to_string(),
+            shard_count,
+            csv_shards,
+            multistream,
+        })
+    }
+}
+
+/// A saved extraction checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub version: u32,
+    pub identity: RunIdentity,
+    pub resume_point: ResumePoint,
+    /// Pages read from the start of the dump, for `--limit`.
+    pub pages_read: u64,
+    /// Every CSV file's name and byte length when the checkpoint was taken.
+    pub csv_lengths: Vec<(String, u64)>,
     pub stats: CheckpointStats,
 }
 
@@ -50,107 +107,49 @@ pub fn checkpoint_path(output_dir: &str) -> PathBuf {
     Path::new(output_dir).join("checkpoint.bin")
 }
 
-fn get_input_mtime(input_path: &str) -> Result<u64> {
-    let metadata = fs::metadata(input_path)
-        .with_context(|| format!("Failed to get metadata for: {}", input_path))?;
-    let mtime = metadata
-        .modified()
-        .context("Failed to get modification time")?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .context("Invalid modification time")?
-        .as_secs();
-    Ok(mtime)
-}
-
-/// Loads a checkpoint if it exists and matches the current extraction parameters.
-pub fn load_if_valid(
-    input_path: &str,
-    output_dir: &str,
-    shard_count: u32,
-    csv_shards: u32,
-) -> Result<Option<Checkpoint>> {
-    let path = checkpoint_path(output_dir);
-
+/// Loads the checkpoint in the output directory if it belongs to this run.
+pub fn load_if_valid(identity: &RunIdentity) -> Result<Option<Checkpoint>> {
+    let path = checkpoint_path(&identity.output_dir);
     if !path.exists() {
         return Ok(None);
     }
 
     let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-
     let file = File::open(&path).context("Failed to open checkpoint file")?;
     let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
-
     let options = bincode::options().with_limit(file_size.saturating_add(1024));
 
     let checkpoint: Checkpoint = match options.deserialize_from(reader) {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "Checkpoint file is corrupt or unreadable");
+            warn!(error = %e, "Checkpoint file is corrupt or from an older version");
             return Ok(None);
         }
     };
 
     if checkpoint.version != CHECKPOINT_VERSION {
         info!(
-            cached = checkpoint.version,
+            saved = checkpoint.version,
             current = CHECKPOINT_VERSION,
             "Checkpoint version mismatch"
         );
         return Ok(None);
     }
 
-    if checkpoint.input_path != input_path {
+    if checkpoint.identity != *identity {
         info!(
-            cached = checkpoint.input_path,
-            current = input_path,
-            "Checkpoint input path mismatch"
-        );
-        return Ok(None);
-    }
-
-    let current_mtime = get_input_mtime(input_path)?;
-    if checkpoint.input_mtime != current_mtime {
-        info!(
-            cached_mtime = checkpoint.input_mtime,
-            current_mtime = current_mtime,
-            "Input file has changed since checkpoint was created"
-        );
-        return Ok(None);
-    }
-
-    if checkpoint.output_dir != output_dir {
-        info!(
-            cached = checkpoint.output_dir,
-            current = output_dir,
-            "Checkpoint output directory mismatch"
-        );
-        return Ok(None);
-    }
-
-    if checkpoint.shard_count != shard_count {
-        info!(
-            cached = checkpoint.shard_count,
-            current = shard_count,
-            "Checkpoint shard count mismatch"
-        );
-        return Ok(None);
-    }
-
-    if checkpoint.csv_shards != csv_shards {
-        info!(
-            cached = checkpoint.csv_shards,
-            current = csv_shards,
-            "Checkpoint CSV shard count mismatch"
+            saved = ?checkpoint.identity,
+            current = ?identity,
+            "Checkpoint belongs to a different run"
         );
         return Ok(None);
     }
 
     info!(
-        last_id = checkpoint.last_processed_id,
+        resume_point = ?checkpoint.resume_point,
         articles = checkpoint.stats.articles_processed,
         "Loaded valid checkpoint"
     );
-
     Ok(Some(checkpoint))
 }
 
@@ -165,132 +164,49 @@ pub fn clear(output_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Manages periodic checkpoint saves during extraction.
+/// Saves checkpoints for one run.
+#[derive(Debug)]
 pub struct CheckpointManager {
-    checkpoint_path: PathBuf,
-    input_path: String,
-    input_mtime: u64,
-    output_dir: String,
-    shard_count: u32,
-    csv_shards: u32,
-    interval: u32,
-    last_saved_id: AtomicU32,
-    pages_since_save: AtomicU32,
-    save_lock: Mutex<()>,
-}
-
-impl std::fmt::Debug for CheckpointManager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CheckpointManager")
-            .field("checkpoint_path", &self.checkpoint_path)
-            .field("interval", &self.interval)
-            .field("last_saved_id", &self.last_saved_id.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
+    identity: RunIdentity,
 }
 
 impl CheckpointManager {
-    pub fn new(
-        input_path: &str,
-        output_dir: &str,
-        shard_count: u32,
-        csv_shards: u32,
-        interval: u32,
-    ) -> Result<Self> {
-        let input_mtime = get_input_mtime(input_path)?;
-        Ok(Self {
-            checkpoint_path: checkpoint_path(output_dir),
-            input_path: input_path.to_string(),
-            input_mtime,
-            output_dir: output_dir.to_string(),
-            shard_count,
-            csv_shards,
-            interval,
-            last_saved_id: AtomicU32::new(0),
-            pages_since_save: AtomicU32::new(0),
-            save_lock: Mutex::new(()),
-        })
+    #[must_use]
+    pub fn new(identity: RunIdentity) -> Self {
+        Self { identity }
     }
 
-    /// Sets the last saved page ID (used when resuming from an existing checkpoint).
-    pub fn set_last_id(&self, id: u32) {
-        self.last_saved_id.store(id, Ordering::Relaxed);
-    }
-
-    /// Double-checked locking: atomic counter for fast path, mutex for serialized saves.
-    pub fn maybe_save(&self, page_id: u32, stats: &ExtractionStats) -> Result<bool> {
-        let count = self.pages_since_save.fetch_add(1, Ordering::Relaxed) + 1;
-
-        if count >= self.interval {
-            let _guard = match self.save_lock.lock() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    warn!(error = %e, "Checkpoint save lock poisoned, skipping save");
-                    return Ok(false);
-                }
-            };
-
-            let current = self.pages_since_save.load(Ordering::Relaxed);
-            if current < self.interval {
-                return Ok(false);
-            }
-
-            self.save(page_id, stats)?;
-            self.pages_since_save.store(0, Ordering::Relaxed);
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    /// Writes the current extraction state to disk atomically via `.tmp` + rename.
-    pub fn save(&self, page_id: u32, stats: &ExtractionStats) -> Result<()> {
+    /// Writes a checkpoint. Call only after every row and blob up to
+    /// `resume_point` has been written and flushed.
+    pub fn save(
+        &self,
+        resume_point: ResumePoint,
+        pages_read: u64,
+        csv_lengths: Vec<(String, u64)>,
+        stats: &ExtractionStats,
+    ) -> Result<()> {
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
-            input_path: self.input_path.clone(),
-            input_mtime: self.input_mtime,
-            output_dir: self.output_dir.clone(),
-            shard_count: self.shard_count,
-            csv_shards: self.csv_shards,
-            last_processed_id: page_id,
+            identity: self.identity.clone(),
+            resume_point,
+            pages_read,
+            csv_lengths,
             stats: stats.to_checkpoint(),
         };
 
-        if let Some(parent) = self.checkpoint_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-        }
-
-        let tmp_path = self.checkpoint_path.with_extension("bin.tmp");
-        let file = File::create(&tmp_path)
-            .with_context(|| format!("Failed to create temp checkpoint file: {:?}", tmp_path))?;
-        let writer = BufWriter::new(file);
-
-        bincode::DefaultOptions::new()
-            .serialize_into(writer, &checkpoint)
-            .context("Failed to serialize checkpoint")?;
-
-        fs::rename(&tmp_path, &self.checkpoint_path).with_context(|| {
-            format!(
-                "Failed to rename temp checkpoint: {:?}",
-                self.checkpoint_path
-            )
+        write_atomically(&checkpoint_path(&self.identity.output_dir), |writer| {
+            bincode::DefaultOptions::new()
+                .serialize_into(writer, &checkpoint)
+                .context("Failed to serialize checkpoint")
         })?;
 
-        self.last_saved_id.store(page_id, Ordering::Relaxed);
-
-        debug!(
-            page_id = page_id,
-            articles = stats.articles(),
-            "Checkpoint saved"
-        );
-
+        debug!(resume_point = ?resume_point, articles = stats.articles(), "Checkpoint saved");
         Ok(())
     }
 
     /// Removes the checkpoint file (called after successful extraction).
     pub fn clear(&self) -> Result<()> {
-        clear(&self.output_dir)
+        clear(&self.identity.output_dir)
     }
 }
 
@@ -307,6 +223,21 @@ mod tests {
         path
     }
 
+    fn identity(input: &Path, output: &str, shard_count: u32) -> RunIdentity {
+        RunIdentity::of(input.to_str().unwrap(), output, shard_count, 1, false).unwrap()
+    }
+
+    fn save_sample(id: &RunIdentity, stats: &ExtractionStats) {
+        CheckpointManager::new(id.clone())
+            .save(
+                ResumePoint::AfterPages(42),
+                42,
+                vec![("nodes.csv".to_string(), 100)],
+                stats,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn checkpoint_path_returns_correct_path() {
         let path = checkpoint_path("/output/dir");
@@ -317,36 +248,26 @@ mod tests {
     fn load_if_valid_returns_none_when_no_checkpoint() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let result = load_if_valid(
-            input_path.to_str().unwrap(),
-            dir.path().to_str().unwrap(),
-            1000,
-            1,
-        )
-        .unwrap();
-        assert!(result.is_none());
+        let id = identity(&input_path, dir.path().to_str().unwrap(), 1000);
+        assert!(load_if_valid(&id).unwrap().is_none());
     }
 
     #[test]
     fn checkpoint_manager_save_and_load() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
-        let output_dir = dir.path().to_str().unwrap();
-
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
+        let id = identity(&input_path, dir.path().to_str().unwrap(), 1000);
 
         let stats = ExtractionStats::new();
         stats.inc_articles();
         stats.inc_articles();
         stats.add_edges(10);
+        save_sample(&id, &stats);
 
-        manager.save(42, &stats).unwrap();
-
-        let loaded = load_if_valid(input_str, output_dir, 1000, 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.last_processed_id, 42);
+        let loaded = load_if_valid(&id).unwrap().unwrap();
+        assert_eq!(loaded.resume_point, ResumePoint::AfterPages(42));
+        assert_eq!(loaded.pages_read, 42);
+        assert_eq!(loaded.csv_lengths, vec![("nodes.csv".to_string(), 100)]);
         assert_eq!(loaded.stats.articles_processed, 2);
         assert_eq!(loaded.stats.edges_extracted, 10);
     }
@@ -355,58 +276,58 @@ mod tests {
     fn checkpoint_invalidated_by_input_change() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
+        save_sample(
+            &identity(&input_path, output_dir, 1000),
+            &ExtractionStats::new(),
+        );
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
-        manager.save(42, &ExtractionStats::new()).unwrap();
-
-        // mtime has second granularity
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // A different size is caught even within the same mtime second.
         let mut file = File::create(&input_path).unwrap();
-        writeln!(file, "modified content").unwrap();
+        writeln!(file, "modified content that is longer").unwrap();
 
-        let loaded = load_if_valid(input_str, output_dir, 1000, 1).unwrap();
-        assert!(loaded.is_none());
+        let id = identity(&input_path, output_dir, 1000);
+        assert!(load_if_valid(&id).unwrap().is_none());
     }
 
     #[test]
     fn checkpoint_invalidated_by_shard_count_change() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
+        save_sample(
+            &identity(&input_path, output_dir, 1000),
+            &ExtractionStats::new(),
+        );
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
-        manager.save(42, &ExtractionStats::new()).unwrap();
-
-        let loaded = load_if_valid(input_str, output_dir, 500, 1).unwrap();
-        assert!(loaded.is_none());
+        let id = identity(&input_path, output_dir, 500);
+        assert!(load_if_valid(&id).unwrap().is_none());
     }
 
     #[test]
-    fn checkpoint_invalidated_by_output_dir_change() {
+    fn checkpoint_invalidated_by_reading_mode_change() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
+        save_sample(
+            &identity(&input_path, output_dir, 1000),
+            &ExtractionStats::new(),
+        );
 
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
-        manager.save(42, &ExtractionStats::new()).unwrap();
-
-        let loaded = load_if_valid(input_str, "/different/output", 1000, 1).unwrap();
-        assert!(loaded.is_none());
+        let mut id = identity(&input_path, output_dir, 1000);
+        id.multistream = true;
+        assert!(load_if_valid(&id).unwrap().is_none());
     }
 
     #[test]
     fn clear_removes_checkpoint() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
         let output_dir = dir.path().to_str().unwrap();
-
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 100).unwrap();
-        manager.save(42, &ExtractionStats::new()).unwrap();
+        save_sample(
+            &identity(&input_path, output_dir, 1000),
+            &ExtractionStats::new(),
+        );
 
         let path = checkpoint_path(output_dir);
         assert!(path.exists());
@@ -423,41 +344,16 @@ mod tests {
     }
 
     #[test]
-    fn maybe_save_respects_interval() {
-        let dir = TempDir::new().unwrap();
-        let input_path = create_test_input(&dir);
-        let input_str = input_path.to_str().unwrap();
-        let output_dir = dir.path().to_str().unwrap();
-
-        let manager = CheckpointManager::new(input_str, output_dir, 1000, 1, 3).unwrap();
-        let stats = ExtractionStats::new();
-
-        assert!(!manager.maybe_save(1, &stats).unwrap());
-        assert!(!manager.maybe_save(2, &stats).unwrap());
-        assert!(manager.maybe_save(3, &stats).unwrap());
-
-        // Counter resets
-        assert!(!manager.maybe_save(4, &stats).unwrap());
-        assert!(!manager.maybe_save(5, &stats).unwrap());
-        assert!(manager.maybe_save(6, &stats).unwrap());
-    }
-
-    #[test]
     fn corrupt_checkpoint_returns_none() {
         let dir = TempDir::new().unwrap();
         let input_path = create_test_input(&dir);
-        let checkpoint_file = checkpoint_path(dir.path().to_str().unwrap());
+        let output_dir = dir.path().to_str().unwrap();
+        let checkpoint_file = checkpoint_path(output_dir);
 
         let mut file = File::create(&checkpoint_file).unwrap();
         file.write_all(b"not valid bincode").unwrap();
 
-        let result = load_if_valid(
-            input_path.to_str().unwrap(),
-            dir.path().to_str().unwrap(),
-            1000,
-            1,
-        )
-        .unwrap();
-        assert!(result.is_none());
+        let id = identity(&input_path, output_dir, 1000);
+        assert!(load_if_valid(&id).unwrap().is_none());
     }
 }

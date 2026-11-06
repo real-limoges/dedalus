@@ -4,14 +4,15 @@
 //! mtime and size. Uses zero-copy serialization via `IndexCacheSer` to avoid
 //! cloning ~17M strings during writes.
 
+use crate::atomic_file::write_atomically;
 use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use bincode::Options;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{info, warn};
@@ -147,17 +148,11 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
         redirects,
     };
 
-    let tmp_path = path.with_extension("cache.tmp");
-    let file = File::create(&tmp_path)
-        .with_context(|| format!("Failed to create temp cache file: {:?}", tmp_path))?;
-    let writer = BufWriter::new(file);
-
-    bincode::DefaultOptions::new()
-        .serialize_into(writer, &cache)
-        .context("Failed to serialize index cache")?;
-
-    fs::rename(&tmp_path, &path)
-        .with_context(|| format!("Failed to rename temp cache file to: {:?}", path))?;
+    write_atomically(&path, |writer| {
+        bincode::DefaultOptions::new()
+            .serialize_into(writer, &cache)
+            .context("Failed to serialize index cache")
+    })?;
 
     info!(
         articles = article_count,
@@ -169,45 +164,15 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     Ok(())
 }
 
-/// Returns `true` if the cache exists and matches the current input file.
-pub fn is_cache_valid(cache_path: &Path, input_path: &str) -> Result<bool> {
-    Ok(try_load_index(cache_path, input_path)?.is_some())
-}
-
-/// Loads an index from the cache file without validating staleness.
-pub fn load_index(cache_path: &Path) -> Result<WikiIndex> {
-    if !cache_path.exists() {
-        bail!("Cache file does not exist: {:?}", cache_path);
-    }
-
-    let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
-
-    let file = File::open(cache_path)
-        .with_context(|| format!("Failed to open cache file: {:?}", cache_path))?;
-    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
-
-    let options = bincode::options().with_limit(file_size.saturating_add(1024));
-
-    let cache: IndexCacheDe = options
-        .deserialize_from(reader)
-        .context("Failed to deserialize index cache")?;
-
-    let index = WikiIndex::from_maps(cache.articles, cache.redirects);
-
-    info!(
-        articles = cache.metadata.article_count,
-        redirects = cache.metadata.redirect_count,
-        "Index loaded from cache"
-    );
-
-    Ok(index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    fn is_cache_valid(cache_path: &Path, input_path: &str) -> bool {
+        try_load_index(cache_path, input_path).unwrap().is_some()
+    }
 
     fn create_test_input(dir: &TempDir) -> PathBuf {
         let path = dir.path().join("test_input.txt");
@@ -233,8 +198,7 @@ mod tests {
     fn is_cache_valid_returns_false_when_no_cache() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.cache");
-        let result = is_cache_valid(&path, "/some/input").unwrap();
-        assert!(!result);
+        assert!(!is_cache_valid(&path, "/some/input"));
     }
 
     #[test]
@@ -248,7 +212,7 @@ mod tests {
         save_index(&original, input_str, output_dir).unwrap();
 
         let cache_file = cache_path(output_dir);
-        let loaded = load_index(&cache_file).unwrap();
+        let loaded = try_load_index(&cache_file, input_str).unwrap().unwrap();
 
         assert_eq!(loaded.resolve_id("Article1"), Some(1));
         assert_eq!(loaded.resolve_id("Article2"), Some(2));
@@ -283,7 +247,7 @@ mod tests {
         save_index(&index, input_str, output_dir).unwrap();
 
         let cache_file = cache_path(output_dir);
-        assert!(is_cache_valid(&cache_file, input_str).unwrap());
+        assert!(is_cache_valid(&cache_file, input_str));
     }
 
     #[test]
@@ -301,7 +265,7 @@ mod tests {
         writeln!(file, "modified content that is longer").unwrap();
 
         let cache_file = cache_path(output_dir);
-        assert!(!is_cache_valid(&cache_file, input_str).unwrap());
+        assert!(!is_cache_valid(&cache_file, input_str));
     }
 
     #[test]
@@ -315,14 +279,7 @@ mod tests {
         save_index(&index, input_str, output_dir).unwrap();
 
         let cache_file = cache_path(output_dir);
-        assert!(!is_cache_valid(&cache_file, "/different/input/path").unwrap());
-    }
-
-    #[test]
-    fn load_index_fails_for_nonexistent_file() {
-        let path = PathBuf::from("/nonexistent/cache.bin");
-        let result = load_index(&path);
-        assert!(result.is_err());
+        assert!(!is_cache_valid(&cache_file, "/different/input/path"));
     }
 
     #[test]
@@ -333,8 +290,7 @@ mod tests {
         let mut file = File::create(&cache_file).unwrap();
         file.write_all(b"not valid bincode data").unwrap();
 
-        let result = is_cache_valid(&cache_file, "/some/input").unwrap();
-        assert!(!result);
+        assert!(!is_cache_valid(&cache_file, "/some/input"));
     }
 
     #[test]

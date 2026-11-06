@@ -2,12 +2,12 @@
 # Enable native Apple Silicon optimizations (NEON SIMD, branch prediction, etc.)
 rustflags = ["-C", "target-cpu=native"]
 
-[profile.release]
-# Maximum optimization level
-opt-level = 3
+# The release profile lives in Cargo.toml.
 
-# Single codegen unit for better optimization (slower compile, faster runtime)
-codegen-units = 1
-
-# Strip debug symbols for smaller binary
-strip = true
+[env]
+# Link the DuckDB that Homebrew installs (`brew install duckdb`). Its version
+# must match the duckdb crate's (crate 1.20000.x wraps DuckDB 2.0.x). A value
+# already set in the environment wins, which is how CI points the build at
+# DuckDB's prebuilt Linux library instead.
+DUCKDB_LIB_DIR = "/opt/homebrew/opt/duckdb/lib"
+DUCKDB_INCLUDE_DIR = "/opt/homebrew/opt/duckdb/include"

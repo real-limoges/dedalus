@@ -8,7 +8,7 @@ cargo fmt -- --check
 echo "     Formatting OK"
 
 echo "2/4 Running clippy..."
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 echo "     Clippy OK"
 
 echo "3/4 Building..."

@@ -1,8 +1,8 @@
 //! Tests for CSV shard merging and deduplication.
 //!
-//! This module validates the `merge::merge_csv_shards()` function, which combines
-//! numbered CSV files (e.g., `nodes_000.csv`, `nodes_001.csv`) into single merged files
-//! suitable for neo4j-admin bulk import.
+//! This module validates `merge::merge_csv_shards()` and `merge::merge_detected_shards()`,
+//! which combine numbered CSV files (e.g., `nodes_000.csv`, `nodes_001.csv`) into the
+//! single merged files that `dedalus load` and `dedalus analytics` read.
 //!
 //! # Merge Strategy
 //!
@@ -18,16 +18,13 @@
 //!
 //! Tests use the `create_test_shard()` helper to generate realistic CSV shards with
 //! intentional duplicates across shards to validate that deduplication works correctly.
-//! The helper creates proper CSV headers and data rows matching Neo4j import format.
+//! The helper writes the same typed-column headers that extraction writes.
 //!
 //! # Typical Workflow
 //!
 //! 1. Extract with `--csv-shards 8` to get 8 shard files per CSV type (1.62x faster)
 //! 2. Run `dedalus merge-csvs` to produce single files (<5 min overhead)
-//! 3. Import using `--admin-import` for 10-100x faster bulk loading
-//!
-//! This hybrid workflow provides the best of both: fast extraction (parallel shards)
-//! and fast import (neo4j-admin requires single files).
+//! 3. Run `dedalus load`, which reads only the merged files
 
 use anyhow::Result;
 use dedalus::merge;
@@ -202,7 +199,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
     )?;
 
     // Run merge
-    merge::merge_csv_shards(output_dir)?;
+    merge::merge_csv_shards(output_dir, 2)?;
 
     // Verify merged files exist
     assert!(temp_dir.path().join("nodes.csv").exists());
@@ -397,8 +394,8 @@ fn test_merge_csvs_handles_many_shards() -> Result<()> {
         )?;
     }
 
-    // Run merge
-    merge::merge_csv_shards(output_dir)?;
+    // Run merge, letting it count the shards
+    assert_eq!(merge::merge_detected_shards(output_dir)?, 8);
 
     // Verify categories deduplication worked - "Common" should appear only once
     let categories_content = fs::read_to_string(temp_dir.path().join("categories.csv"))?;

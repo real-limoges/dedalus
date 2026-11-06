@@ -3,7 +3,7 @@
 //! Correctly handles nested `{{...}}` templates using depth tracking with
 //! SIMD-accelerated `memchr` to skip over plain text between brace pairs.
 
-use memchr::{memchr, memchr2, memchr3};
+use memchr::{memchr, memchr2};
 use serde::{Deserialize, Serialize};
 
 /// A parsed `{{Infobox ...}}` template with its type name and key-value fields.
@@ -35,48 +35,35 @@ pub fn extract_infoboxes(text: &str) -> Vec<Infobox> {
     results
 }
 
-/// Case-insensitive search for `{{Infobox` on raw bytes.
-/// Uses SIMD-accelerated memchr to jump to `{` candidates instead of scanning every byte.
+/// Byte offset of the first `{{Infobox` (case-insensitive, whitespace allowed
+/// after the braces). Uses SIMD-accelerated memchr to jump between `{` candidates.
 fn find_infobox_start(bytes: &[u8]) -> Option<usize> {
-    let needle = b"{{infobox";
-    if bytes.len() < needle.len() {
-        return None;
-    }
     let mut offset = 0;
-    while offset + needle.len() <= bytes.len() {
-        // SIMD jump to next '{' candidate
-        match memchr(b'{', &bytes[offset..]) {
-            None => return None,
-            Some(pos) => {
-                let i = offset + pos;
-                if i + needle.len() > bytes.len() {
-                    return None;
-                }
-                if bytes[i..i + needle.len()]
-                    .iter()
-                    .zip(needle.iter())
-                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
-                {
-                    let next_idx = i + needle.len();
-                    if next_idx >= bytes.len() {
-                        return Some(i);
-                    }
-                    let next = bytes[next_idx];
-                    if next == b' '
-                        || next == b'_'
-                        || next == b'\n'
-                        || next == b'\r'
-                        || next == b'|'
-                        || next == b'}'
-                    {
-                        return Some(i);
-                    }
-                }
-                offset = i + 1;
-            }
+    while let Some(pos) = memchr(b'{', &bytes[offset..]) {
+        let i = offset + pos;
+        if is_infobox_open(&bytes[i..]) {
+            return Some(i);
         }
+        offset = i + 1;
     }
     None
+}
+
+/// True if `bytes` starts with `{{`, optional whitespace, then the word
+/// `infobox` ending at a space, underscore, newline, `|` or `}`.
+fn is_infobox_open(bytes: &[u8]) -> bool {
+    let word = b"infobox";
+    let Some(after_braces) = bytes.strip_prefix(b"{{") else {
+        return false;
+    };
+    let rest = after_braces.trim_ascii_start();
+    if rest.len() < word.len() || !rest[..word.len()].eq_ignore_ascii_case(word) {
+        return false;
+    }
+    match rest.get(word.len()) {
+        None => true,
+        Some(next) => matches!(next, b' ' | b'_' | b'\n' | b'\r' | b'|' | b'}'),
+    }
 }
 
 /// Finds the matching `}}` for a `{{` starting at `start`.
@@ -122,12 +109,10 @@ fn parse_infobox_inner(inner: &str) -> Option<Infobox> {
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(eq_pos) = trimmed.find('=') {
-            let key = trimmed[..eq_pos].trim().to_string();
-            let value = trimmed[eq_pos + 1..].trim().to_string();
-            if !key.is_empty() {
-                fields.push((key, value));
-            }
+        if let Some((key, value)) = split_field(trimmed)
+            && !key.is_empty()
+        {
+            fields.push((key.to_string(), value.to_string()));
         }
     }
 
@@ -137,32 +122,52 @@ fn parse_infobox_inner(inner: &str) -> Option<Infobox> {
     })
 }
 
-/// Splits on `|` at brace depth 0, respecting nested `{{ }}`.
-/// Uses SIMD-accelerated memchr3 to skip to the next `{`, `}`, or `|` character.
+/// Splits `key = value` at the first `=`, unless that `=` sits inside a nested
+/// template or link, in which case the segment is positional and has no key.
+fn split_field(segment: &str) -> Option<(&str, &str)> {
+    let eq_pos = segment.find('=')?;
+    let key = &segment[..eq_pos];
+    if key.contains("{{") || key.contains("[[") {
+        return None;
+    }
+    Some((key.trim(), segment[eq_pos + 1..].trim()))
+}
+
+/// Splits on `|` outside any nested `{{ }}` template or `[[ ]]` link, so a
+/// piped link such as `[[London|London, England]]` stays in one segment.
 fn split_at_depth_zero(content: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let bytes = content.as_bytes();
-    let mut depth: i32 = 0;
+    let mut template_depth: i32 = 0;
+    let mut link_depth: i32 = 0;
     let mut last_split = 0;
     let mut i = 0;
 
     while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            depth += 1;
+        let pair = bytes.get(i..i + 2);
+        if pair == Some(b"{{") {
+            template_depth += 1;
             i += 2;
-        } else if i + 1 < bytes.len() && bytes[i] == b'}' && bytes[i + 1] == b'}' {
-            depth -= 1;
+        } else if pair == Some(b"}}") {
+            template_depth -= 1;
             i += 2;
-        } else if bytes[i] == b'|' && depth == 0 {
+        } else if pair == Some(b"[[") {
+            link_depth += 1;
+            i += 2;
+        } else if pair == Some(b"]]") {
+            link_depth -= 1;
+            i += 2;
+        } else if bytes[i] == b'|' && template_depth <= 0 && link_depth <= 0 {
             segments.push(&content[last_split..i]);
             last_split = i + 1;
             i += 1;
         } else {
-            // SIMD jump to next interesting character
-            match memchr3(b'{', b'}', b'|', &bytes[i..]) {
-                Some(offset) if offset > 0 => i += offset,
-                _ => i += 1,
-            }
+            // Jump to the next byte that can change depth or split.
+            let skip = bytes[i + 1..]
+                .iter()
+                .position(|b| matches!(b, b'{' | b'}' | b'[' | b']' | b'|'))
+                .map_or(bytes.len() - i, |p| p + 1);
+            i += skip;
         }
     }
     segments.push(&content[last_split..]);
@@ -282,6 +287,50 @@ mod tests {
     fn split_at_depth_zero_nested() {
         let result = split_at_depth_zero("a|b={{x|y}}|c");
         assert_eq!(result, vec!["a", "b={{x|y}}", "c"]);
+    }
+
+    #[test]
+    fn split_at_depth_zero_keeps_piped_links_whole() {
+        let result = split_at_depth_zero("a|place=[[London|London, England]]|c");
+        assert_eq!(result, vec!["a", "place=[[London|London, England]]", "c"]);
+    }
+
+    #[test]
+    fn infobox_value_with_piped_link_is_not_truncated() {
+        let text = "{{Infobox person\n| birth_place = [[London|London, England]]\n| name = X\n}}";
+        let infoboxes = extract_infoboxes(text);
+        assert_eq!(
+            infoboxes[0].fields,
+            vec![
+                (
+                    "birth_place".to_string(),
+                    "[[London|London, England]]".to_string()
+                ),
+                ("name".to_string(), "X".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn positional_template_parameter_has_no_key() {
+        let text = "{{Infobox person\n| {{birth date|df=yes|1990}}\n| name = X\n}}";
+        let infoboxes = extract_infoboxes(text);
+        assert_eq!(
+            infoboxes[0].fields,
+            vec![("name".to_string(), "X".to_string())]
+        );
+    }
+
+    #[test]
+    fn infobox_with_space_after_braces_is_found() {
+        let infoboxes = extract_infoboxes("{{ Infobox person\n| name = X\n}}");
+        assert_eq!(infoboxes.len(), 1);
+        assert_eq!(infoboxes[0].infobox_type, "Infobox person");
+    }
+
+    #[test]
+    fn infobox_prefix_of_longer_word_is_ignored() {
+        assert!(extract_infoboxes("{{Infoboxes are great}}").is_empty());
     }
 
     #[test]
