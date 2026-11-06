@@ -1,343 +1,287 @@
-//! CSV shard merger for neo4j-admin compatibility.
+//! CSV shard merger.
 //!
-//! Concatenates sharded CSV files into single merged files with cross-shard
-//! deduplication of categories, images, and external links using `FxHashSet`.
-//! Uses streaming I/O with 256KB buffers.
+//! Concatenates the numbered shards of each CSV type (`nodes_000.csv`, ...)
+//! into one merged file (`nodes.csv`), which is what load and analytics read.
+//! Category, image and external link nodes can be written by pages in
+//! different shards, so their merge keeps only the first row for each id.
+//! Each merged file is written to a `.tmp` sibling and renamed into place, so
+//! an interrupted merge never leaves a truncated `nodes.csv` behind.
 
+use crate::atomic_file::write_atomically;
+use crate::config::MERGE_BUF_SIZE;
+use crate::csv_util::{self, CsvType};
 use anyhow::{Context, Result, bail};
-use csv::{Reader, Writer};
 use rustc_hash::FxHashSet;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::path::Path;
 use tracing::info;
 
-/// Merges sharded CSV files into single files suitable for neo4j-admin import.
+/// Merges `shard_count` shards of every CSV type into single files.
 ///
-/// Performs cross-shard deduplication for categories, images, and external links.
-pub fn merge_csv_shards(output_dir: &str) -> Result<()> {
-    info!("Detecting CSV shards in: {}", output_dir);
-
-    // Detect shard count from nodes_*.csv
-    let shard_count = detect_shard_count(output_dir)?;
-    info!("  Found {} shards", shard_count);
-
-    // Merge each CSV type
-    merge_simple(output_dir, "nodes", shard_count)?;
-    merge_simple(output_dir, "edges", shard_count)?;
-    merge_with_dedup(output_dir, "categories", shard_count)?; // Needs dedup
-    merge_simple(output_dir, "article_categories", shard_count)?;
-    merge_with_dedup(output_dir, "image_nodes", shard_count)?; // Needs dedup
-    merge_simple(output_dir, "article_images", shard_count)?;
-    merge_with_dedup(output_dir, "external_link_nodes", shard_count)?; // Needs dedup
-    merge_simple(output_dir, "article_external_links", shard_count)?;
-
-    info!("Merge complete. Single CSV files ready for --admin-import.");
-    Ok(())
-}
-
-/// Detect shard count by counting nodes_*.csv files.
-fn detect_shard_count(output_dir: &str) -> Result<u32> {
-    let count = (0u32..)
-        .take_while(|&i| {
-            Path::new(output_dir)
-                .join(format!("nodes_{i:03}.csv"))
-                .exists()
-        })
-        .count() as u32;
-    if count == 0 {
-        bail!("No sharded CSV files found (expected nodes_000.csv, etc.)");
-    }
-    Ok(count)
-}
-
-/// Simple concatenation for CSV types without deduplication needs
-fn merge_simple(output_dir: &str, base_name: &str, shard_count: u32) -> Result<()> {
-    info!("  Merging {}...", base_name);
-
-    let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
-    let mut writer = Writer::from_writer(BufWriter::with_capacity(
-        crate::config::MERGE_BUF_SIZE,
-        File::create(&output_path)?,
-    ));
-
-    // Write header from first shard
-    let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
-    let mut first_reader = Reader::from_reader(BufReader::with_capacity(
-        crate::config::MERGE_BUF_SIZE,
-        File::open(&first_shard)?,
-    ));
-    writer.write_record(first_reader.headers()?)?;
-
-    // Copy data rows from all shards
-    for shard in 0..shard_count {
-        let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
-        let mut reader = Reader::from_reader(BufReader::with_capacity(
-            crate::config::MERGE_BUF_SIZE,
-            File::open(&shard_path)?,
-        ));
-
-        for result in reader.records() {
-            let record = result?;
-            writer.write_record(&record)?;
-        }
-    }
-
-    writer.flush()?;
-    Ok(())
-}
-
-/// Merge with deduplication for node files (first column is ID)
-fn merge_with_dedup(output_dir: &str, base_name: &str, shard_count: u32) -> Result<()> {
-    info!("  Merging {} (with deduplication)...", base_name);
-
-    let output_path = Path::new(output_dir).join(format!("{}.csv", base_name));
-    let mut writer = Writer::from_writer(BufWriter::with_capacity(
-        crate::config::MERGE_BUF_SIZE,
-        File::create(&output_path)?,
-    ));
-
-    // Track seen node IDs
-    let mut seen_ids = FxHashSet::default();
-
-    // Write header from first shard
-    let first_shard = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, 0));
-    let mut first_reader = Reader::from_reader(BufReader::with_capacity(
-        crate::config::MERGE_BUF_SIZE,
-        File::open(&first_shard)?,
-    ));
-    writer.write_record(first_reader.headers()?)?;
-
-    // Read all shards, skip duplicates
-    for shard in 0..shard_count {
-        let shard_path = Path::new(output_dir).join(format!("{}_{:03}.csv", base_name, shard));
-        let mut reader = Reader::from_reader(BufReader::with_capacity(
-            crate::config::MERGE_BUF_SIZE,
-            File::open(&shard_path)?,
-        ));
-
-        for result in reader.records() {
-            let record = result?;
-            let node_id = record.get(0).context("Missing node ID")?;
-
-            // Only write if first occurrence
-            if seen_ids.insert(node_id.to_string()) {
-                writer.write_record(&record)?;
+/// Every shard file is checked to exist before anything is written, so a
+/// missing shard fails the merge instead of producing a partial result.
+pub fn merge_csv_shards(output_dir: &str, shard_count: u32) -> Result<()> {
+    info!("Merging {shard_count} CSV shards in {output_dir}");
+    for csv_type in CsvType::ALL {
+        for name in csv_type.file_names(shard_count) {
+            let path = Path::new(output_dir).join(&name);
+            if !path.is_file() {
+                bail!("Missing CSV shard: {}", path.display());
             }
         }
     }
-
-    writer.flush()?;
-    info!("    Unique nodes: {}", seen_ids.len());
+    for &csv_type in CsvType::ALL {
+        let rows = merge_type(output_dir, csv_type, shard_count)?;
+        info!("  {}: {rows} rows", csv_type.merged_file_name());
+    }
+    info!("Merge complete");
     Ok(())
 }
 
-/// Check if a filename matches the shard pattern `*_NNN.csv`
-fn is_shard_file(name: &str) -> bool {
-    if !name.ends_with(".csv") {
-        return false;
-    }
-    let stem = &name[..name.len() - 4]; // strip .csv
-    if stem.len() < 5 {
-        // Need at least 1 char base name + _NNN
-        return false;
-    }
-    let suffix = &stem[stem.len() - 4..];
-    suffix.starts_with('_') && suffix[1..].chars().all(|c| c.is_ascii_digit())
+/// Counts the shards in `output_dir` and merges them. Returns the count.
+///
+/// For a standalone merge, where no extraction run says how many shards to
+/// expect; fails unless the shards are numbered exactly `0..N`.
+pub fn merge_detected_shards(output_dir: &str) -> Result<u32> {
+    let shard_count = csv_util::count_shards(output_dir)?;
+    merge_csv_shards(output_dir, shard_count)?;
+    Ok(shard_count)
 }
 
-/// Archive sharded CSV files (e.g. `nodes_000.csv`) to `output_dir/shards/`
+/// Merges the shards of one CSV type. Returns the number of rows written.
+fn merge_type(output_dir: &str, csv_type: CsvType, shard_count: u32) -> Result<u64> {
+    let merged_path = Path::new(output_dir).join(csv_type.merged_file_name());
+    let mut seen_ids = FxHashSet::default();
+    let mut rows = 0u64;
+
+    write_atomically(&merged_path, |out| {
+        let mut writer = csv::WriterBuilder::new()
+            .has_headers(false)
+            .buffer_capacity(MERGE_BUF_SIZE)
+            .from_writer(out);
+        writer.write_record(csv_type.header())?;
+
+        for name in csv_type.file_names(shard_count) {
+            let shard_path = Path::new(output_dir).join(&name);
+            let file = File::open(&shard_path)
+                .with_context(|| format!("Failed to open {}", shard_path.display()))?;
+            let mut reader =
+                csv::Reader::from_reader(BufReader::with_capacity(MERGE_BUF_SIZE, file));
+
+            let header = reader.headers()?;
+            if !header.iter().eq(csv_type.header()) {
+                bail!(
+                    "{name} has header {:?}, expected {:?}",
+                    header.iter().collect::<Vec<_>>(),
+                    csv_type.header()
+                );
+            }
+
+            for record in reader.records() {
+                let record = record.with_context(|| format!("Failed to read {name}"))?;
+                if csv_type.is_shared_node() {
+                    let id = record
+                        .get(0)
+                        .with_context(|| format!("Row without an id in {name}"))?;
+                    if !seen_ids.insert(id.to_string()) {
+                        continue;
+                    }
+                }
+                writer.write_record(&record)?;
+                rows += 1;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    })
+    .with_context(|| format!("Failed to merge {}", csv_type.merged_file_name()))?;
+
+    Ok(rows)
+}
+
+/// Moves shard files (`nodes_000.csv`, ...) into `output_dir/shards/`.
+///
+/// Shards archived by an earlier run are removed first, so the archive only
+/// ever holds the shards of the latest merge.
 pub fn archive_shards(output_dir: &str) -> Result<()> {
     let shards_dir = Path::new(output_dir).join("shards");
     fs::create_dir_all(&shards_dir).context("Failed to create shards archive directory")?;
 
+    for entry in fs::read_dir(&shards_dir).context("Failed to read shards directory")? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            && csv_util::is_shard_file(&entry.file_name().to_string_lossy())
+        {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("Failed to remove stale {}", entry.path().display()))?;
+        }
+    }
+
     let mut archived = 0u32;
     for entry in fs::read_dir(output_dir).context("Failed to read output directory")? {
         let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if entry.file_type()?.is_file() && is_shard_file(&name_str) {
-            let dest = shards_dir.join(&*name_str);
-            fs::rename(entry.path(), &dest)
-                .with_context(|| format!("Failed to archive {}", name_str))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_file() && csv_util::is_shard_file(&name) {
+            fs::rename(entry.path(), shards_dir.join(&name))
+                .with_context(|| format!("Failed to archive {name}"))?;
             archived += 1;
         }
     }
 
-    info!(
-        "Archived {} shard files to {}/shards/",
-        archived, output_dir
-    );
+    info!("Archived {archived} shard files to {output_dir}/shards/");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Write;
     use tempfile::TempDir;
 
-    fn create_test_shard(
-        dir: &Path,
-        base_name: &str,
-        shard: u32,
-        header: &str,
-        rows: &[&str],
-    ) -> Result<()> {
-        let path = dir.join(format!("{}_{:03}.csv", base_name, shard));
-        let mut file = File::create(path)?;
-        writeln!(file, "{}", header)?;
+    fn write_shard(dir: &Path, csv_type: CsvType, shard: u32, rows: &[&str]) {
+        let mut file = File::create(dir.join(csv_type.shard_file_name(shard))).unwrap();
+        writeln!(file, "{}", csv_type.header().join(",")).unwrap();
         for row in rows {
-            writeln!(file, "{}", row)?;
+            writeln!(file, "{row}").unwrap();
         }
-        Ok(())
     }
 
-    #[test]
-    fn test_detect_shard_count() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-
-        // Create 3 node shards
-        for i in 0..3 {
-            create_test_shard(temp_dir.path(), "nodes", i, "id:ID,title,:LABEL", &[])?;
+    /// Writes empty shards of every type, so a full merge can run.
+    fn write_empty_shards(dir: &Path, shard_count: u32) {
+        for &csv_type in CsvType::ALL {
+            for shard in 0..shard_count {
+                write_shard(dir, csv_type, shard, &[]);
+            }
         }
+    }
 
-        let count = detect_shard_count(temp_dir.path().to_str().unwrap())?;
-        assert_eq!(count, 3);
-        Ok(())
+    fn lines(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
-    fn test_detect_no_shards() {
-        let temp_dir = TempDir::new().unwrap();
-        let result = detect_shard_count(temp_dir.path().to_str().unwrap());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_merge_simple() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-
-        // Create test shards
-        create_test_shard(
-            temp_dir.path(),
-            "nodes",
+    fn merge_concatenates_shards_under_one_header() {
+        let dir = TempDir::new().unwrap();
+        write_empty_shards(dir.path(), 2);
+        write_shard(
+            dir.path(),
+            CsvType::Nodes,
             0,
-            "id:ID,title,:LABEL",
-            &["1,Article1,Article", "2,Article2,Article"],
-        )?;
-        create_test_shard(
-            temp_dir.path(),
-            "nodes",
-            1,
-            "id:ID,title,:LABEL",
-            &["3,Article3,Article", "4,Article4,Article"],
-        )?;
+            &["1,A,Article", "2,B,Article"],
+        );
+        write_shard(dir.path(), CsvType::Nodes, 1, &["3,C,Article"]);
 
-        merge_simple(temp_dir.path().to_str().unwrap(), "nodes", 2)?;
+        merge_csv_shards(dir.path().to_str().unwrap(), 2).unwrap();
 
-        // Verify merged file
-        let merged_path = temp_dir.path().join("nodes.csv");
-        let content = fs::read_to_string(merged_path)?;
-        let lines: Vec<&str> = content.lines().collect();
-
-        assert_eq!(lines.len(), 5); // 1 header + 4 data rows
-        assert!(lines[0].contains("id:ID,title,:LABEL"));
-        assert!(lines.iter().any(|l| l.contains("Article1")));
-        assert!(lines.iter().any(|l| l.contains("Article4")));
-        Ok(())
-    }
-
-    #[test]
-    fn test_is_shard_file() {
-        assert!(is_shard_file("nodes_000.csv"));
-        assert!(is_shard_file("edges_001.csv"));
-        assert!(is_shard_file("categories_099.csv"));
-        assert!(is_shard_file("article_categories_123.csv"));
-        assert!(!is_shard_file("nodes.csv"));
-        assert!(!is_shard_file("edges.csv"));
-        assert!(!is_shard_file("something.txt"));
-        assert!(!is_shard_file("nodes_00.csv")); // only 2 digits
-        assert!(!is_shard_file("_000.csv")); // no base name
-    }
-
-    #[test]
-    fn test_archive_shards() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-        let dir = temp_dir.path().to_str().unwrap();
-
-        // Create shard files and a merged file
-        for i in 0..3 {
-            create_test_shard(
-                temp_dir.path(),
-                "nodes",
-                i,
+        assert_eq!(
+            lines(&dir.path().join("nodes.csv")),
+            vec![
                 "id:ID,title,:LABEL",
-                &["1,A,Page"],
-            )?;
-        }
-        // Create a merged (non-shard) file
-        let merged = temp_dir.path().join("nodes.csv");
-        fs::write(&merged, "id:ID,title,:LABEL\n1,A,Page\n")?;
-
-        archive_shards(dir)?;
-
-        // Shard files should be moved
-        assert!(!temp_dir.path().join("nodes_000.csv").exists());
-        assert!(!temp_dir.path().join("nodes_001.csv").exists());
-        assert!(!temp_dir.path().join("nodes_002.csv").exists());
-
-        // Merged file should remain
-        assert!(merged.exists());
-
-        // Shard files should be in shards/
-        let shards_dir = temp_dir.path().join("shards");
-        assert!(shards_dir.join("nodes_000.csv").exists());
-        assert!(shards_dir.join("nodes_001.csv").exists());
-        assert!(shards_dir.join("nodes_002.csv").exists());
-
-        Ok(())
+                "1,A,Article",
+                "2,B,Article",
+                "3,C,Article"
+            ]
+        );
+        assert!(!dir.path().join("nodes.csv.tmp").exists());
     }
 
     #[test]
-    fn test_merge_with_dedup() -> Result<()> {
-        let temp_dir = TempDir::new()?;
-
-        // Create shards with duplicate categories
-        create_test_shard(
-            temp_dir.path(),
-            "categories",
+    fn merge_dedups_shared_nodes_but_not_relations() {
+        let dir = TempDir::new().unwrap();
+        write_empty_shards(dir.path(), 2);
+        write_shard(
+            dir.path(),
+            CsvType::Categories,
             0,
-            "id:ID(Category),name,:LABEL",
             &["Science,Science,Category", "Math,Math,Category"],
-        )?;
-        create_test_shard(
-            temp_dir.path(),
-            "categories",
+        );
+        write_shard(
+            dir.path(),
+            CsvType::Categories,
             1,
-            "id:ID(Category),name,:LABEL",
             &["Science,Science,Category", "History,History,Category"],
-        )?;
+        );
+        write_shard(
+            dir.path(),
+            CsvType::ArticleCategories,
+            0,
+            &["1,Science,HAS_CATEGORY"],
+        );
+        write_shard(
+            dir.path(),
+            CsvType::ArticleCategories,
+            1,
+            &["1,Science,HAS_CATEGORY"],
+        );
 
-        merge_with_dedup(temp_dir.path().to_str().unwrap(), "categories", 2)?;
+        merge_csv_shards(dir.path().to_str().unwrap(), 2).unwrap();
 
-        // Verify merged file has deduplication
-        let merged_path = temp_dir.path().join("categories.csv");
-        let content = fs::read_to_string(merged_path)?;
-        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines(&dir.path().join("categories.csv"))[1..],
+            [
+                "Science,Science,Category",
+                "Math,Math,Category",
+                "History,History,Category"
+            ]
+        );
+        assert_eq!(lines(&dir.path().join("article_categories.csv")).len(), 3);
+    }
 
-        // Should have 1 header + 3 unique categories (Science, Math, History)
-        assert_eq!(lines.len(), 4);
+    #[test]
+    fn merge_fails_before_writing_when_a_shard_is_missing() {
+        let dir = TempDir::new().unwrap();
+        write_empty_shards(dir.path(), 2);
+        fs::remove_file(dir.path().join("article_images_001.csv")).unwrap();
 
-        // Count occurrences of "Science" - should appear exactly once in data rows
-        let science_count = lines
-            .iter()
-            .skip(1)
-            .filter(|l| l.contains("Science"))
-            .count();
-        assert_eq!(science_count, 1);
+        let err = merge_csv_shards(dir.path().to_str().unwrap(), 2).unwrap_err();
 
-        Ok(())
+        assert!(err.to_string().contains("article_images_001.csv"));
+        assert!(!dir.path().join("nodes.csv").exists());
+    }
+
+    #[test]
+    fn merge_rejects_a_shard_with_the_wrong_header() {
+        let dir = TempDir::new().unwrap();
+        write_empty_shards(dir.path(), 2);
+        fs::write(dir.path().join("edges_001.csv"), "a,b,c\n").unwrap();
+
+        let err = merge_csv_shards(dir.path().to_str().unwrap(), 2).unwrap_err();
+
+        assert!(format!("{err:#}").contains("edges_001.csv has header"));
+    }
+
+    #[test]
+    fn merge_detected_shards_counts_contiguous_shards() {
+        let dir = TempDir::new().unwrap();
+        write_empty_shards(dir.path(), 3);
+        assert_eq!(
+            merge_detected_shards(dir.path().to_str().unwrap()).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn archive_moves_shards_and_replaces_stale_ones() {
+        let dir = TempDir::new().unwrap();
+        let shards_dir = dir.path().join("shards");
+        fs::create_dir_all(&shards_dir).unwrap();
+        fs::write(shards_dir.join("nodes_007.csv"), "stale\n").unwrap();
+        write_shard(dir.path(), CsvType::Nodes, 0, &["1,A,Article"]);
+        write_shard(dir.path(), CsvType::ImageNodes, 0, &[]);
+        fs::write(dir.path().join("nodes.csv"), "merged\n").unwrap();
+
+        archive_shards(dir.path().to_str().unwrap()).unwrap();
+
+        assert!(!dir.path().join("nodes_000.csv").exists());
+        assert!(!dir.path().join("image_nodes_000.csv").exists());
+        assert!(dir.path().join("nodes.csv").exists());
+        assert!(shards_dir.join("nodes_000.csv").exists());
+        assert!(shards_dir.join("image_nodes_000.csv").exists());
+        assert!(!shards_dir.join("nodes_007.csv").exists());
     }
 }

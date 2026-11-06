@@ -35,12 +35,10 @@ fn draw_config(f: &mut Frame, app: &App) {
         .iter()
         .map(|op| Line::from(op.label()))
         .collect();
-    let tab_index = match app.operation {
-        Operation::Extract => 0,
-        Operation::Load => 1,
-        Operation::Analytics => 2,
-        Operation::MergeCsvs => 3,
-    };
+    let tab_index = Operation::all()
+        .iter()
+        .position(|&op| op == app.operation)
+        .unwrap_or(0);
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
@@ -74,7 +72,7 @@ fn draw_config(f: &mut Frame, app: &App) {
         )
     };
     let help = Span::styled(
-        "  Tab: switch op | Up/Down: fields | Enter: toggle/run | q: quit  ",
+        "  Tab: switch op | Up/Down: fields | Enter/Space: toggle/run | Esc: quit  ",
         Style::default().fg(Color::DarkGray),
     );
     let status = Paragraph::new(Line::from(vec![status_text, help]))
@@ -159,10 +157,7 @@ fn draw_load_form(f: &mut Frame, app: &App, area: Rect) {
             match field {
                 LoadField::Output => field_line("Output dir:", &cfg.output, selected, false, false),
                 LoadField::DbPath => field_line("DB path:", &cfg.db_path, selected, false, false),
-                LoadField::BatchSize => {
-                    field_line("Batch size:", &cfg.batch_size, selected, false, false)
-                }
-                LoadField::Clean => field_line("Clean", "", selected, true, cfg.clean),
+                LoadField::Clean => field_line("Replace DB", "", selected, true, cfg.clean),
             }
         })
         .collect();
@@ -181,9 +176,6 @@ fn draw_analytics_form(f: &mut Frame, app: &App, area: Rect) {
             match field {
                 AnalyticsField::Output => {
                     field_line("Output dir:", &cfg.output, selected, false, false)
-                }
-                AnalyticsField::DbPath => {
-                    field_line("DB path:", &cfg.db_path, selected, false, false)
                 }
                 AnalyticsField::PageRankIterations => field_line(
                     "PR iterations:",
@@ -288,8 +280,13 @@ fn draw_progress(f: &mut Frame, app: &App) {
     draw_log_panel(f, app, chunks[2]);
 
     // Controls
+    let controls_text = if app.operation == Operation::Extract {
+        "  [c: Cancel after the current chunk]"
+    } else {
+        "  (runs to completion; Ctrl+C quits)"
+    };
     let controls = Paragraph::new(Line::from(vec![Span::styled(
-        "  [c: Cancel]",
+        controls_text,
         Style::default().fg(Color::Red),
     )]))
     .block(Block::default().borders(Borders::ALL));
@@ -382,14 +379,9 @@ fn draw_stats_panel(f: &mut Frame, app: &App, area: Rect) {
 fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let log_lines: Vec<String> = if let Ok(logs) = app.logs.lock() {
-        let total = logs.len();
-        let max_scroll = total.saturating_sub(inner_height);
-        let scroll = app.log_scroll.min(max_scroll);
-        logs.iter()
-            .skip(scroll)
-            .take(inner_height)
-            .cloned()
-            .collect()
+        let end = logs.len().saturating_sub(app.log_offset_from_bottom);
+        let start = end.saturating_sub(inner_height);
+        logs.iter().skip(start).take(end - start).cloned().collect()
     } else {
         vec![]
     };
@@ -411,7 +403,7 @@ fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Log (Up/Down to scroll) "),
+            .title(" Log (Up/Down to scroll, End to follow) "),
     );
     f.render_widget(list, area);
 }

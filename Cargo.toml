@@ -2,12 +2,12 @@
 name = "dedalus"
 version = "0.1.0"
 edition = "2024"
-description = "A Rust pipeline that extracts Wikipedia dumps into structured graph data with SurrealDB embedded storage"
+description = "A Rust pipeline that extracts Wikipedia dumps into graph CSVs, JSON blobs and graph analytics"
 repository = "https://github.com/real-limoges/dedalus"
 license = "MIT"
 authors = ["Real Limoges"]
-keywords = ["wikipedia", "surrealdb", "graph", "extraction"]
-categories = ["command-line-utilities", "database"]
+keywords = ["wikipedia", "graph", "extraction", "pagerank"]
+categories = ["command-line-utilities"]
 rust-version = "1.94.0"
 readme = "README.md"
 
@@ -19,7 +19,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 crossterm = "0.29.0"
 csv = "1.4.0"
 dashmap = "6"
-futures = "0.3"
+duckdb = "1.20000.1"
 indicatif = "0.18.4"
 itoa = "1"
 memchr = "2"
@@ -32,8 +32,6 @@ regex = "1.12.3"
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-surrealdb = { version = "3.0.4", features = ["kv-rocksdb"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -46,3 +44,4 @@ codegen-units = 1
 lto = true
 panic = 'abort'
 overflow-checks = false
+strip = true

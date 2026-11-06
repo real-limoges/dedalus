@@ -1,13 +1,16 @@
 //! Comprehensive integration tests for the Dedalus Wikipedia extraction pipeline.
 //!
-//! This module tests the complete data flow from BZ2-compressed XML input through to
-//! CSV extraction and JSON blob generation. Tests are organized into logical sections:
+//! This module tests the complete data flow from BZ2-compressed XML input through
+//! CSV extraction and JSON blobs to merge, analytics and the DuckDB load. Tests are
+//! organized into logical sections:
 //!
 //! - **Parser Tests** -- XML parsing, BZ2 decompression, page type classification
 //! - **Index Tests** -- Title-to-ID mapping, redirect chain resolution
-//! - **Extraction Tests** -- CSV generation, edge creation, JSON blob output
+//! - **Extraction Tests** -- CSV generation, exact edges, JSON blob output, abstracts
 //! - **Feature Tests** -- Categories, images, external links, infoboxes, see-also sections
-//! - **Sharding Tests** -- CSV shard distribution for parallel import
+//! - **Sharding Tests** -- CSV shard distribution for parallel extraction
+//! - **Resume and Limit Tests** -- Crash recovery and exact page limits across chunks
+//! - **End to End** -- Extract, merge, analytics and load into DuckDB
 //!
 //! # Test Strategy
 //!
@@ -33,8 +36,12 @@
 
 use bzip2::Compression;
 use bzip2::write::BzEncoder;
+use dedalus::analytics::{self, AnalyticsConfig};
+use dedalus::checkpoint::{self, CheckpointManager, ResumePoint, RunIdentity};
 use dedalus::extract::{ExtractionConfig, run_extraction};
 use dedalus::index::WikiIndex;
+use dedalus::load::{self, LoadConfig};
+use dedalus::merge;
 use dedalus::models::{ArticleBlob, PageType};
 use dedalus::parser::WikiReader;
 use std::io::Write;
@@ -154,6 +161,8 @@ fn make_config<'a>(
         csv_shards,
         limit,
         dry_run,
+        // Two pages per chunk, so the fixture spans several chunks.
+        chunk_pages: 2,
         resume_from: None,
         checkpoint_mgr: None,
         multistream_ranges: None,
@@ -322,12 +331,20 @@ fn extraction_creates_edges() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Rust -> Python is a valid edge (both exist in index)
-    // Python -> Rust is a valid edge
-    // Rust -> C++ is invalid (C++ not in index)
-    // Rust -> Mozilla is invalid (not in index)
-    assert!(stats.edges() >= 1);
-    assert!(stats.invalid() >= 1); // C++ or Mozilla links should be invalid
+    // Rust links to Python in its body and again under "See also"; Python
+    // links back. C++ and Mozilla are not in the dump, so they are invalid.
+    // The File: and Category: links are namespace links, never edges.
+    assert_eq!(
+        sorted_lines(&output_dir.path().join("edges.csv")),
+        // Sorted, so the header (`:` sorts after digits) comes last.
+        vec![
+            "1,2,LINKS_TO",
+            "1,2,SEE_ALSO",
+            "2,1,LINKS_TO",
+            ":START_ID,:END_ID,:TYPE",
+        ]
+    );
+    assert_eq!(stats.invalid(), 2);
 }
 
 #[test]
@@ -348,9 +365,8 @@ fn extraction_writes_json_blobs() {
 
     assert!(stats.blobs() >= 1);
 
-    // Check that a blob file exists and is valid JSON
-    let shard = 1 % 1000; // page id 1
-    let blob_path = output_dir.path().join(format!("blobs/{:03}/1.json", shard));
+    // Check that a blob file exists and is valid JSON (page id 1 is in shard 001)
+    let blob_path = output_dir.path().join("blobs/001/1.json");
     assert!(
         blob_path.exists(),
         "Blob file should exist at {:?}",
@@ -412,7 +428,7 @@ fn extraction_respects_limit() {
 }
 
 #[test]
-fn nodes_csv_format_is_neo4j_compatible() {
+fn nodes_csv_has_typed_headers_and_numeric_ids() {
     let tmp = create_bz2_xml(sample_xml());
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
@@ -447,7 +463,7 @@ fn nodes_csv_format_is_neo4j_compatible() {
 }
 
 #[test]
-fn edges_csv_format_is_neo4j_compatible() {
+fn edges_csv_has_typed_headers_and_known_types() {
     let tmp = create_bz2_xml(sample_xml());
     let output_dir = TempDir::new().unwrap();
     let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
@@ -614,8 +630,7 @@ fn blob_contains_enriched_data() {
     );
     run_extraction(&config).unwrap();
 
-    let shard = 1 % 1000;
-    let blob_path = output_dir.path().join(format!("blobs/{:03}/1.json", shard));
+    let blob_path = output_dir.path().join("blobs/001/1.json");
     let blob_content = std::fs::read_to_string(&blob_path).unwrap();
     let blob: ArticleBlob = serde_json::from_str(&blob_content).unwrap();
 
@@ -687,17 +702,49 @@ fn edges_exclude_namespace_links() {
     );
     run_extraction(&config).unwrap();
 
-    // edges.csv should not contain Category: or File: links
-    let edges_path = output_dir.path().join("edges.csv");
-    let content = std::fs::read_to_string(&edges_path).unwrap();
-    let mut rdr = csv::Reader::from_reader(content.as_bytes());
+    // The dump holds a File: page (id 4) and a Category: page (id 5), and
+    // the Rust article links to both; neither may become an edge target.
+    let mut rdr = csv::Reader::from_path(output_dir.path().join("edges.csv")).unwrap();
     for record in rdr.records() {
-        let record = record.unwrap();
-        let edge_type = record.get(2).unwrap();
+        let target: u32 = record.unwrap().get(1).unwrap().parse().unwrap();
         assert!(
-            edge_type == "LINKS_TO" || edge_type == "SEE_ALSO",
-            "Unexpected edge type: {}",
-            edge_type
+            target == 1 || target == 2,
+            "edge to non-article page {target}"
+        );
+    }
+}
+
+#[test]
+fn abstract_is_the_lead_without_infobox_or_later_sections() {
+    let tmp = create_bz2_xml(sample_xml());
+    let output_dir = TempDir::new().unwrap();
+    let index = WikiIndex::build(tmp.path().to_str().unwrap()).unwrap();
+    let config = make_config(
+        tmp.path().to_str().unwrap(),
+        output_dir.path().to_str().unwrap(),
+        &index,
+        1,
+        None,
+        false,
+    );
+    run_extraction(&config).unwrap();
+
+    let blob: ArticleBlob = serde_json::from_str(
+        &std::fs::read_to_string(output_dir.path().join("blobs/001/1.json")).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        blob.abstract_text
+            .starts_with("Rust is a systems programming language."),
+        "abstract: {:?}",
+        blob.abstract_text
+    );
+    for leaked in ["Infobox", "Graydon", "first announced", "Some refs", "[["] {
+        assert!(
+            !blob.abstract_text.contains(leaked),
+            "abstract contains {leaked:?}: {:?}",
+            blob.abstract_text
         );
     }
 }
@@ -796,4 +843,165 @@ fn single_csv_shard_produces_original_filenames() {
 
     // Should NOT have numbered files
     assert!(!output_dir.path().join("nodes_000.csv").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Resume tests
+// ---------------------------------------------------------------------------
+
+/// A dump of `n` articles, each linking to the next and filed in one of three
+/// categories, so every chunk writes nodes, edges and category rows.
+fn chain_xml(n: u32) -> String {
+    let pages: String = (1..=n)
+        .map(|id| {
+            let next = id % n + 1;
+            let group = id % 3;
+            format!(
+                "<page><title>Page {id}</title><ns>0</ns><id>{id}</id>\
+                 <revision><id>{rev}</id><text>Links to [[Page {next}]]. \
+                 [[Category:Group {group}]]</text></revision></page>",
+                rev = id * 10
+            )
+        })
+        .collect();
+    format!("<mediawiki>{pages}</mediawiki>")
+}
+
+fn sorted_lines(path: &std::path::Path) -> Vec<String> {
+    let mut lines: Vec<String> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+#[test]
+fn resume_after_a_crash_matches_an_uninterrupted_run() {
+    let tmp = create_bz2_xml(&chain_xml(20));
+    let input = tmp.path().to_str().unwrap();
+    let index = WikiIndex::build(input).unwrap();
+
+    let full_dir = TempDir::new().unwrap();
+    let full_out = full_dir.path().to_str().unwrap();
+    run_extraction(&make_config(input, full_out, &index, 1, None, false)).unwrap();
+
+    // First attempt: checkpoints every 2 pages, stopped by --limit at 9 pages.
+    // Page 9 is written but no checkpoint covers it, as after a crash.
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().to_str().unwrap();
+    let identity = RunIdentity::of(input, out, 1000, 1, false).unwrap();
+    let mgr = CheckpointManager::new(identity.clone());
+    let mut first = make_config(input, out, &index, 1, Some(9), false);
+    first.checkpoint_mgr = Some(&mgr);
+    run_extraction(&first).unwrap();
+
+    // A crash mid-write also leaves a torn last row.
+    for name in ["nodes.csv", "categories.csv"] {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(name))
+            .unwrap();
+        file.write_all(b"99,Torn").unwrap();
+    }
+
+    let cp = checkpoint::load_if_valid(&identity).unwrap().unwrap();
+    assert_eq!(cp.resume_point, ResumePoint::AfterPages(8));
+
+    let mut second = make_config(input, out, &index, 1, None, false);
+    second.resume_from = Some(&cp);
+    second.checkpoint_mgr = Some(&mgr);
+    let stats = run_extraction(&second).unwrap();
+
+    assert_eq!(stats.articles(), 20);
+    for name in [
+        "nodes.csv",
+        "edges.csv",
+        "categories.csv",
+        "article_categories.csv",
+    ] {
+        assert_eq!(
+            sorted_lines(&full_dir.path().join(name)),
+            sorted_lines(&dir.path().join(name)),
+            "{name} differs after resume"
+        );
+    }
+}
+
+#[test]
+fn limit_stops_reading_and_is_exact_across_chunks() {
+    let tmp = create_bz2_xml(&chain_xml(20));
+    let input = tmp.path().to_str().unwrap();
+    let index = WikiIndex::build(input).unwrap();
+    let dir = TempDir::new().unwrap();
+
+    let stats = run_extraction(&make_config(
+        input,
+        dir.path().to_str().unwrap(),
+        &index,
+        1,
+        Some(7),
+        false,
+    ))
+    .unwrap();
+
+    assert_eq!(stats.articles(), 7);
+    let nodes = sorted_lines(&dir.path().join("nodes.csv"));
+    assert_eq!(nodes.len(), 8, "header plus 7 rows");
+    assert!(nodes.contains(&"7,Page 7,Page".to_string()));
+    assert!(!nodes.contains(&"8,Page 8,Page".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// End to end: extract -> merge -> analytics -> load
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sharded_extraction_round_trips_into_duckdb() {
+    let tmp = create_bz2_xml(sample_xml());
+    let input = tmp.path().to_str().unwrap();
+    let index = WikiIndex::build(input).unwrap();
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().to_str().unwrap();
+
+    run_extraction(&make_config(input, out, &index, 2, None, false)).unwrap();
+    merge::merge_csv_shards(out, 2).unwrap();
+    let analytics_stats = analytics::run_analytics(&AnalyticsConfig {
+        output_dir: out.to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    let load_stats = load::run_load(&LoadConfig::new(out)).unwrap();
+
+    assert_eq!(analytics_stats.node_count, 2);
+    assert_eq!(analytics_stats.edge_count, 2, "LINKS_TO only");
+
+    let db = duckdb::Connection::open(&load_stats.db_path).unwrap();
+    let query = |sql: &str| -> Vec<String> {
+        let mut stmt = db.prepare(sql).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(
+        query("SELECT title FROM articles ORDER BY id"),
+        vec![
+            "Rust (programming language)",
+            "Python (programming language)"
+        ]
+    );
+    assert_eq!(
+        query("SELECT src || '->' || dst || ' ' || type FROM links ORDER BY ALL"),
+        vec!["1->2 LINKS_TO", "1->2 SEE_ALSO", "2->1 LINKS_TO"]
+    );
+    assert_eq!(
+        query("SELECT DISTINCT category_id FROM article_categories ORDER BY ALL"),
+        vec!["Programming languages", "Systems programming languages"]
+    );
+    let rank_sum: f64 = db
+        .query_row("SELECT sum(pagerank) FROM analytics", [], |row| row.get(0))
+        .unwrap();
+    assert!((rank_sum - 1.0).abs() < 1e-9, "ranks sum to {rank_sum}");
 }

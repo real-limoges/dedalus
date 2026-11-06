@@ -6,9 +6,18 @@ on:
   pull_request:
     branches: [main]
 
+# The runners have no Homebrew DuckDB, so each job that compiles downloads
+# DuckDB's prebuilt Linux library from its GitHub release. These variables
+# override the Homebrew paths in .cargo/config.toml (a value already set in
+# the environment wins over [env]). DUCKDB_VERSION must match the duckdb crate:
+# crate 1.20000.x wraps DuckDB 2.0.x.
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  DUCKDB_VERSION: 2.0.0
+  DUCKDB_LIB_DIR: /home/runner/libduckdb
+  DUCKDB_INCLUDE_DIR: /home/runner/libduckdb
+  LD_LIBRARY_PATH: /home/runner/libduckdb
 
 jobs:
   fmt:
@@ -30,7 +39,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      - name: Install libduckdb
+        run: |
+          mkdir -p "$DUCKDB_LIB_DIR"
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
+            | tar -xz -C "$DUCKDB_LIB_DIR"
+      - run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
@@ -39,6 +53,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libduckdb
+        run: |
+          mkdir -p "$DUCKDB_LIB_DIR"
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
+            | tar -xz -C "$DUCKDB_LIB_DIR"
       - run: cargo test --verbose
 
   build:
@@ -48,4 +67,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install libduckdb
+        run: |
+          mkdir -p "$DUCKDB_LIB_DIR"
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
+            | tar -xz -C "$DUCKDB_LIB_DIR"
       - run: cargo build --release

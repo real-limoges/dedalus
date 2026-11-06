@@ -1,16 +1,17 @@
-//! Dedalus: Wikipedia dump extraction pipeline with SurrealDB embedded storage
+//! Dedalus: Wikipedia dump extraction pipeline producing graph CSVs, analytics and DuckDB
 //!
 //! This crate provides a multi-pass pipeline for extracting structured graph data from
-//! Wikipedia XML dumps and loading it into an embedded SurrealDB (RocksDB) database:
+//! Wikipedia XML dumps into plain files, then loading them into a DuckDB database file:
 //!
 //! 1. **Indexing Pass** -- Build an in-memory title-to-ID mapping and redirect resolution
 //!    table by streaming through the dump without reading article text
 //! 2. **Extraction Pass** -- Process articles in parallel to extract nodes, edges, categories,
 //!    images, external links, and enriched content; output CSV files and JSON blobs
-//! 3. **Merge Pass** (optional) -- Combine sharded CSV files into single files with
-//!    deduplication for SurrealDB loading
-//! 4. **Load Pass** -- Load article nodes and edges into embedded SurrealDB (RocksDB)
-//! 5. **Analytics Pass** -- Compute PageRank, community detection, and degree metrics
+//! 3. **Merge Pass** (when sharded) -- Combine sharded CSV files into single files with
+//!    deduplication
+//! 4. **Analytics Pass** -- Compute PageRank, label-propagation communities, and degree,
+//!    written to `analytics.csv`
+//! 5. **Load Pass** -- Copy the merged CSVs and `analytics.csv` into one DuckDB file
 //!
 //! # Architecture
 //!
@@ -22,7 +23,6 @@
 //! - **Concurrent deduplication** -- DashSet for thread-safe first-seen category/image tracking
 //! - **Atomic operations** -- Lock-free counters for high-frequency statistics
 //! - **Resumable processing** -- Checkpointing and index caching to skip redundant work
-//! - **Embedded database** -- SurrealDB with RocksDB backend, no external services needed
 //!
 //! # Key Modules
 //!
@@ -30,18 +30,21 @@
 //! - [`index`] -- Title-to-ID mapping with redirect resolution
 //! - [`extract`] -- Parallel extraction with CSV sharding
 //! - [`merge`] -- CSV shard merging with deduplication
-//! - [`surrealdb_writer`] -- SurrealDB embedded loader (reads CSVs, writes to RocksDB)
-//! - [`analytics`] -- Graph analytics (PageRank, Louvain, degree)
-//! - [`csv_util`] -- CSV layout detection and validation utilities
+//! - [`analytics`] -- Graph analytics (PageRank, label propagation, degree)
+//! - [`load`] -- DuckDB loader (one table per CSV)
+//! - [`csv_util`] -- CSV file names and layout detection
+//! - [`title`] -- Canonical title form (MediaWiki rules) and namespace detection
 //! - [`content`] -- Text extraction (abstracts, sections, links, categories)
 //! - [`infobox`] -- Structured infobox parsing with nested template support
 //! - [`models`] -- Core data types (WikiPage, ArticleBlob, PageType)
 //! - [`cache`] -- Index persistence with zero-copy serialization
 //! - [`checkpoint`] -- Extraction progress checkpointing
+//! - [`atomic_file`] -- Crash-safe file replacement
 //! - [`stats`] -- Thread-safe atomic counters for extraction metrics
-//! - [`config`] -- Constants for extraction and loading
+//! - [`config`] -- Constants for extraction, merge and analytics
 
 pub mod analytics;
+pub mod atomic_file;
 pub mod cache;
 pub mod checkpoint;
 pub mod config;
@@ -50,12 +53,13 @@ pub mod csv_util;
 pub mod extract;
 pub mod index;
 pub mod infobox;
+pub mod load;
 pub mod merge;
 pub mod models;
 pub mod multistream;
 pub mod parser;
 pub mod stats;
-pub mod surrealdb_writer;
+pub mod title;
 pub mod tui;
 
 // Re-export primary API types for convenient library use.
@@ -66,4 +70,3 @@ pub use index::WikiIndex;
 pub use models::{ArticleBlob, EdgeType, PageType, WikiPage};
 pub use parser::WikiReader;
 pub use stats::ExtractionStats;
-pub use surrealdb_writer::SurrealWriterConfig;

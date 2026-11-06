@@ -1,13 +1,16 @@
 //! In-memory title-to-ID index with redirect chain resolution.
 //!
 //! `WikiIndex` wraps pre-sized `FxHashMap`s (8M articles, 10M redirects) for
-//! fast lookup of page IDs by title. Follows redirect chains up to 5 hops.
+//! fast lookup of page IDs by title. Titles are stored and looked up in the
+//! canonical form from `title::normalize_title`. Follows redirect chains up to
+//! `REDIRECT_MAX_DEPTH` hops.
 //! Supports both sequential and multistream parallel index building.
 
 use crate::config::{PROGRESS_INTERVAL, REDIRECT_MAX_DEPTH};
 use crate::models::PageType;
 use crate::multistream::StreamRange;
 use crate::parser::WikiReader;
+use crate::title::{into_canonical, normalize_title};
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -41,7 +44,7 @@ impl WikiIndex {
             crate::config::INDEX_INITIAL_REDIRECTS,
             Default::default(),
         );
-        let reader = WikiReader::new(path, true)
+        let mut reader = WikiReader::new(path, true)
             .with_context(|| format!("Failed to open wiki dump at: {}", path))?
             .skip_timestamp(true);
         let pb = ProgressBar::new_spinner();
@@ -55,13 +58,13 @@ impl WikiIndex {
         info!("Building index from: {}", path);
         let mut page_count: u64 = 0;
 
-        for page in reader {
+        for page in reader.by_ref() {
             match page.page_type {
                 PageType::Article => {
-                    title_to_id.insert(page.title, page.id);
+                    title_to_id.insert(into_canonical(page.title), page.id);
                 }
                 PageType::Redirect(target) => {
-                    redirects.insert(page.title, target);
+                    redirects.insert(into_canonical(page.title), into_canonical(target));
                 }
                 _ => {}
             }
@@ -77,6 +80,8 @@ impl WikiIndex {
         }
 
         pb.finish_and_clear();
+        // A truncated or corrupt dump must not produce (and cache) a partial index.
+        reader.finish()?;
 
         info!(
             articles = title_to_id.len(),
@@ -102,19 +107,20 @@ impl WikiIndex {
         pb.set_style(
             indicatif::ProgressStyle::default_spinner()
                 .template("{spinner:.cyan} {msg}")
-                .unwrap(),
+                .expect("valid progress template"),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
         let page_count = AtomicU64::new(0);
 
-        // Parallel fold: each thread collects into local vecs, then reduce merges
+        // Parallel fold: each thread collects into local vecs, then reduce
+        // merges. Any unreadable stream fails the whole build.
         let (articles_vec, redirects_vec) = ranges
             .par_iter()
-            .fold(
+            .try_fold(
                 || (Vec::new(), Vec::new()),
-                |(mut articles, mut redirects), range| {
-                    let pages = crate::multistream::parse_stream_for_index(dump_path, range);
+                |(mut articles, mut redirects), range| -> Result<_> {
+                    let pages = crate::multistream::parse_stream(dump_path, range, true)?;
                     for page in pages {
                         let count = page_count.fetch_add(1, Ordering::Relaxed);
                         if (count + 1).is_multiple_of(PROGRESS_INTERVAL as u64) {
@@ -122,25 +128,26 @@ impl WikiIndex {
                         }
                         match page.page_type {
                             PageType::Article => {
-                                articles.push((page.title, page.id));
+                                articles.push((into_canonical(page.title), page.id));
                             }
                             PageType::Redirect(target) => {
-                                redirects.push((page.title, target));
+                                redirects
+                                    .push((into_canonical(page.title), into_canonical(target)));
                             }
                             _ => {}
                         }
                     }
-                    (articles, redirects)
+                    Ok((articles, redirects))
                 },
             )
-            .reduce(
+            .try_reduce(
                 || (Vec::new(), Vec::new()),
                 |(mut a1, mut r1), (a2, r2)| {
                     a1.extend(a2);
                     r1.extend(r2);
-                    (a1, r1)
+                    Ok((a1, r1))
                 },
-            );
+            )?;
 
         pb.finish_and_clear();
 
@@ -218,23 +225,21 @@ impl WikiIndex {
         (self.title_to_id.len(), self.redirects.len())
     }
 
-    /// Resolves a page title to its numeric ID, following redirect chains.
+    /// Resolves a title, in any spelling MediaWiki accepts, to its page ID,
+    /// following up to `REDIRECT_MAX_DEPTH` redirect hops.
     #[must_use]
     pub fn resolve_id(&self, title: &str) -> Option<u32> {
-        let mut current = title;
-        let mut depth = 0;
+        let normalized = normalize_title(title);
+        let mut current: &str = &normalized;
 
-        while depth < REDIRECT_MAX_DEPTH {
+        // Hop 0 is the title itself; hops 1..=REDIRECT_MAX_DEPTH follow redirects.
+        for _hop in 0..=REDIRECT_MAX_DEPTH {
             if let Some(id) = self.title_to_id.get(current) {
                 return Some(*id);
             }
-            if let Some(target) = self.redirects.get(current) {
-                debug!(from = current, to = target, "Following redirect");
-                current = target;
-                depth += 1;
-            } else {
-                return None;
-            }
+            let target = self.redirects.get(current)?;
+            debug!(from = current, to = target, "Following redirect");
+            current = target;
         }
         debug!(title = title, "Redirect chain too deep");
         None
@@ -282,12 +287,12 @@ mod tests {
 
     #[test]
     fn resolve_redirect_at_max_depth() {
-        // Chain of exactly REDIRECT_MAX_DEPTH hops should still resolve
+        // A chain of exactly REDIRECT_MAX_DEPTH hops: R0 -> R1 -> ... -> R{MAX}, an article.
         let mut redirects = Vec::new();
-        for i in 0..(REDIRECT_MAX_DEPTH - 1) {
+        for i in 0..REDIRECT_MAX_DEPTH {
             redirects.push((format!("R{}", i), format!("R{}", i + 1)));
         }
-        let final_title = format!("R{}", REDIRECT_MAX_DEPTH - 1);
+        let final_title = format!("R{}", REDIRECT_MAX_DEPTH);
         let articles = vec![(final_title.as_str(), 1u32)];
 
         let index = WikiIndex {
@@ -295,7 +300,7 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
-            redirects: redirects.into_iter().map(|(k, v)| (k, v)).collect(),
+            redirects: redirects.into_iter().collect(),
         };
 
         assert_eq!(index.resolve_id("R0"), Some(1));
@@ -349,11 +354,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_case_sensitive() {
+    fn resolve_is_case_insensitive_only_in_first_letter() {
         let index = make_index(vec![("Rust", 1)], vec![]);
         assert_eq!(index.resolve_id("Rust"), Some(1));
-        assert_eq!(index.resolve_id("rust"), None);
+        assert_eq!(index.resolve_id("rust"), Some(1));
         assert_eq!(index.resolve_id("RUST"), None);
+    }
+
+    #[test]
+    fn resolve_accepts_mediawiki_spellings() {
+        let index = make_index(vec![("United States", 7)], vec![]);
+        assert_eq!(index.resolve_id("United_States"), Some(7));
+        assert_eq!(index.resolve_id(" United States "), Some(7));
+        assert_eq!(index.resolve_id("united States#History"), Some(7));
+        assert_eq!(index.resolve_id(":United States"), Some(7));
     }
 
     #[test]

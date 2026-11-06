@@ -1,19 +1,22 @@
 //! CLI entry point for the Dedalus pipeline.
 //!
-//! Uses `clap` subcommands to orchestrate extract, load, analytics, merge-csvs,
+//! Uses `clap` subcommands to orchestrate extract, merge-csvs, analytics, load,
 //! pipeline, stats, and tui operations. Initializes `tracing` logging with
 //! configurable verbosity and uses `mimalloc` as the global allocator.
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use dedalus::cache;
-use dedalus::checkpoint::{self, CheckpointManager};
-use dedalus::surrealdb_writer::SurrealWriterConfig;
+use dedalus::analytics::{AnalyticsConfig, AnalyticsStats};
+use dedalus::extract::{ExtractJob, run_extract_job};
+use dedalus::load::{LoadConfig, LoadStats};
+use dedalus::stats::ExtractionStats;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-use tracing::{Level, error, info, warn};
+use tracing::{Level, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 #[global_allocator]
@@ -21,7 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "dedalus")]
-#[command(about = "Extract Wikipedia dumps into structured graph data with SurrealDB storage")]
+#[command(about = "Extract Wikipedia dumps into graph CSVs, JSON blobs, analytics and DuckDB")]
 struct Cli {
     /// Verbosity level (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -35,13 +38,13 @@ struct Cli {
 enum Commands {
     /// Extract Wikipedia dumps into CSV/JSON format
     Extract(ExtractArgs),
-    /// Load extracted CSV files into SurrealDB
-    Load(LoadArgs),
-    /// Compute graph analytics (PageRank, communities, degree)
+    /// Compute graph analytics (PageRank, communities, degree) into analytics.csv
     Analytics(AnalyticsArgs),
     /// Merge sharded CSV files into single files
     MergeCsvs(MergeCsvsArgs),
-    /// Run the full pipeline: extract -> merge -> load -> analytics
+    /// Load merged CSVs and analytics.csv into a DuckDB database file
+    Load(LoadArgs),
+    /// Run the full pipeline: extract -> merge -> analytics -> load
     Pipeline(PipelineArgs),
     /// Show output directory statistics
     Stats(StatsArgs),
@@ -60,14 +63,14 @@ struct ExtractArgs {
     output: String,
 
     /// Number of shards for blob storage
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = dedalus::config::SHARD_COUNT, value_parser = at_least_one)]
     shard_count: u32,
 
-    /// Number of CSV output shards for parallel import (1 = single file)
-    #[arg(long, default_value_t = 8)]
+    /// Number of CSV output shards for parallel extraction (1 = single file)
+    #[arg(long, default_value_t = dedalus::config::DEFAULT_CSV_SHARDS, value_parser = at_least_one)]
     csv_shards: u32,
 
-    /// Limit number of pages to process (for testing)
+    /// Limit number of pages read from the start of the dump (for testing)
     #[arg(long)]
     limit: Option<u64>,
 
@@ -83,8 +86,8 @@ struct ExtractArgs {
     #[arg(long)]
     no_cache: bool,
 
-    /// Checkpoint interval in articles processed
-    #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL)]
+    /// Pages per extraction chunk; a checkpoint is saved after each chunk
+    #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL, value_parser = at_least_one)]
     checkpoint_interval: u32,
 
     /// Clear existing checkpoint and outputs before starting
@@ -97,41 +100,33 @@ struct ExtractArgs {
 }
 
 #[derive(Args)]
-struct LoadArgs {
-    /// Directory containing Dedalus CSV output files
-    #[arg(short, long)]
-    output: String,
-
-    /// Path for the SurrealDB database directory
-    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
-    db_path: String,
-
-    /// Batch size for SurrealDB inserts
-    #[arg(long, default_value_t = dedalus::config::SURREAL_BATCH_SIZE)]
-    batch_size: usize,
-
-    /// Clear existing database before loading
-    #[arg(long)]
-    clean: bool,
-}
-
-#[derive(Args)]
 struct AnalyticsArgs {
-    /// Directory containing Dedalus CSV output files
+    /// Directory containing merged Dedalus CSV output files
     #[arg(short, long)]
     output: String,
 
-    /// Path for the SurrealDB database directory
-    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
-    db_path: String,
-
-    /// Number of PageRank iterations
+    /// Maximum number of PageRank iterations
     #[arg(long, default_value_t = dedalus::config::PAGERANK_ITERATIONS)]
     pagerank_iterations: u32,
 
     /// PageRank damping factor
     #[arg(long, default_value_t = dedalus::config::PAGERANK_DAMPING)]
     damping: f64,
+}
+
+#[derive(Args)]
+struct LoadArgs {
+    /// Directory containing merged Dedalus CSV output files
+    #[arg(short, long)]
+    output: String,
+
+    /// DuckDB database file (relative paths are inside the output directory)
+    #[arg(long, default_value = dedalus::load::DEFAULT_DB_FILE)]
+    db_path: String,
+
+    /// Replace the database if it already exists
+    #[arg(long)]
+    clean: bool,
 }
 
 #[derive(Args)]
@@ -156,14 +151,14 @@ struct PipelineArgs {
     output: String,
 
     /// Number of shards for blob storage
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = dedalus::config::SHARD_COUNT, value_parser = at_least_one)]
     shard_count: u32,
 
     /// Number of CSV output shards for parallel extraction (1 = single file)
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = dedalus::config::DEFAULT_CSV_SHARDS, value_parser = at_least_one)]
     csv_shards: u32,
 
-    /// Limit number of pages to process (for testing)
+    /// Limit number of pages read from the start of the dump (for testing)
     #[arg(long)]
     limit: Option<u64>,
 
@@ -175,25 +170,25 @@ struct PipelineArgs {
     #[arg(long)]
     no_cache: bool,
 
-    /// Checkpoint interval in articles processed
-    #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL)]
+    /// Pages per extraction chunk; a checkpoint is saved after each chunk
+    #[arg(long, default_value_t = dedalus::config::CHECKPOINT_INTERVAL, value_parser = at_least_one)]
     checkpoint_interval: u32,
 
     /// Clear existing outputs before starting
     #[arg(long)]
     clean: bool,
 
-    /// Path for the SurrealDB database directory
-    #[arg(long, default_value = dedalus::config::DEFAULT_DB_PATH)]
-    db_path: String,
-
-    /// Skip the load + analytics steps (extract + merge only)
-    #[arg(long)]
-    no_load: bool,
-
     /// Skip analytics computation
     #[arg(long)]
     no_analytics: bool,
+
+    /// Skip loading into DuckDB
+    #[arg(long)]
+    no_load: bool,
+
+    /// DuckDB database file, replaced on every run (relative paths are inside the output directory)
+    #[arg(long, default_value = dedalus::load::DEFAULT_DB_FILE)]
+    db_path: String,
 
     /// Don't archive sharded CSVs after merging
     #[arg(long)]
@@ -211,153 +206,40 @@ struct StatsArgs {
     output: String,
 }
 
-fn run_extract(args: ExtractArgs) -> Result<()> {
-    if args.clean {
-        let output_path = Path::new(&args.output);
-        if output_path.exists() {
-            info!("Cleaning output directory: {}", args.output);
-            fs::remove_dir_all(output_path)
-                .with_context(|| format!("Failed to clean output directory: {}", args.output))?;
-        }
+/// Clap value parser for counts that must be at least 1.
+fn at_least_one(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(_) => Err("must be at least 1".to_string()),
+        Err(e) => Err(e.to_string()),
     }
+}
 
-    fs::create_dir_all(&args.output)
-        .with_context(|| format!("Failed to create output directory: {}", args.output))?;
-
-    // Resolve multistream index: explicit flag > auto-detect from filename
-    let multistream_index_path = args
-        .multistream_index
-        .clone()
-        .or_else(|| dedalus::multistream::detect_index_path(&args.input));
-
-    let multistream_ranges = if let Some(ref idx_path) = multistream_index_path {
-        info!(index = %idx_path, "Using multistream parallel parsing");
-        let ranges = dedalus::multistream::parse_multistream_index(idx_path, &args.input)?;
-        info!(streams = ranges.len(), "Multistream index parsed");
-        Some(ranges)
-    } else {
-        None
-    };
-
-    let start_indexing = Instant::now();
-    let cache_path = cache::cache_path(&args.output);
-
-    let index = if args.no_cache {
-        info!("Cache disabled, building fresh index");
-        let idx = if let Some(ref ranges) = multistream_ranges {
-            dedalus::index::WikiIndex::build_multistream(&args.input, ranges)?
-        } else {
-            dedalus::index::WikiIndex::build(&args.input)?
-        };
-        if !args.dry_run
-            && let Err(e) = cache::save_index(&idx, &args.input, &args.output)
-        {
-            warn!(error = %e, "Failed to save index cache");
-        }
-        idx
-    } else if let Some(idx) = cache::try_load_index(&cache_path, &args.input)? {
-        info!("Loaded index from cache");
-        idx
-    } else {
-        info!("Building index (cache miss or invalid)");
-        let idx = if let Some(ref ranges) = multistream_ranges {
-            dedalus::index::WikiIndex::build_multistream(&args.input, ranges)?
-        } else {
-            dedalus::index::WikiIndex::build(&args.input)?
-        };
-        if !args.dry_run
-            && let Err(e) = cache::save_index(&idx, &args.input, &args.output)
-        {
-            warn!(error = %e, "Failed to save index cache");
-        }
-        idx
-    };
-
-    let indexing_duration = start_indexing.elapsed();
-    info!(
-        duration_secs = indexing_duration.as_secs_f64(),
-        "Indexing complete"
-    );
-
-    let checkpoint_mgr = if !args.dry_run {
-        Some(CheckpointManager::new(
-            &args.input,
-            &args.output,
-            args.shard_count,
-            args.csv_shards,
-            args.checkpoint_interval,
-        )?)
-    } else {
-        None
-    };
-
-    let checkpoint = if args.resume && !args.clean {
-        match checkpoint::load_if_valid(
-            &args.input,
-            &args.output,
-            args.shard_count,
-            args.csv_shards,
-        )? {
-            Some(cp) => {
-                info!(
-                    last_id = cp.last_processed_id,
-                    articles = cp.stats.articles_processed,
-                    "Resuming from checkpoint"
-                );
-                if let Some(ref mgr) = checkpoint_mgr {
-                    mgr.set_last_id(cp.last_processed_id);
-                }
-                Some(cp)
-            }
-            None => {
-                info!("No valid checkpoint found, starting fresh");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    info!("Starting extraction pass");
-    let start_extracting = Instant::now();
-    let extraction_config = dedalus::extract::ExtractionConfig {
-        input_path: &args.input,
-        output_dir: &args.output,
-        index: &index,
+fn run_extract(args: ExtractArgs) -> Result<()> {
+    let job = ExtractJob {
+        input: args.input,
+        output: args.output,
         shard_count: args.shard_count,
         csv_shards: args.csv_shards,
         limit: args.limit,
         dry_run: args.dry_run,
-        resume_from: checkpoint.as_ref(),
-        checkpoint_mgr: checkpoint_mgr.as_ref(),
-        multistream_ranges: multistream_ranges.as_deref(),
+        resume: args.resume,
+        no_cache: args.no_cache,
+        clean: args.clean,
+        checkpoint_interval: args.checkpoint_interval,
+        multistream_index: args.multistream_index,
     };
-    let stats = dedalus::extract::run_extraction(&extraction_config)?;
-    let extraction_duration = start_extracting.elapsed();
-    info!(
-        duration_secs = extraction_duration.as_secs_f64(),
-        "Extraction complete"
-    );
-
-    if let Some(ref mgr) = checkpoint_mgr
-        && let Err(e) = mgr.clear()
-    {
-        warn!(error = %e, "Failed to clear checkpoint");
-    }
+    let stats = Arc::new(ExtractionStats::new());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let report = run_extract_job(&job, Arc::clone(&stats), cancel, false)?;
 
     println!();
     println!("=== Summary ===");
-    println!(
-        "Indexing time:      {:.2}s",
-        indexing_duration.as_secs_f64()
-    );
-    println!(
-        "Extraction time:    {:.2}s",
-        extraction_duration.as_secs_f64()
-    );
+    println!("Indexing time:      {:.2}s", report.indexing_secs);
+    println!("Extraction time:    {:.2}s", report.extraction_secs);
     println!(
         "Total time:         {:.2}s",
-        (indexing_duration + extraction_duration).as_secs_f64()
+        report.indexing_secs + report.extraction_secs
     );
     println!();
     println!("Articles processed: {}", stats.articles());
@@ -374,57 +256,54 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_load(args: LoadArgs) -> Result<()> {
-    let config = SurrealWriterConfig {
-        output_dir: args.output,
-        db_path: args.db_path,
-        batch_size: args.batch_size,
-        clean: args.clean,
-    };
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("dedalus-load-worker")
-        .enable_io()
-        .enable_time()
-        .build()?;
-
-    let stats = rt.block_on(dedalus::surrealdb_writer::run_surreal_load(config))?;
-
-    println!();
-    println!("=== Load Summary ===");
-    println!("Articles loaded:  {}", stats.articles_loaded);
-    println!("Edges loaded:     {}", stats.edges_loaded);
-    println!("Elapsed:          {:.2}s", stats.elapsed_secs);
-
-    Ok(())
-}
-
 fn run_analytics(args: AnalyticsArgs) -> Result<()> {
-    let config = dedalus::analytics::AnalyticsConfig {
-        db_path: args.db_path,
+    let config = AnalyticsConfig {
         output_dir: args.output,
         pagerank_iterations: args.pagerank_iterations,
         pagerank_damping: args.damping,
         ..Default::default()
     };
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("dedalus-analytics-worker")
-        .enable_io()
-        .enable_time()
-        .build()?;
-
-    let stats = rt.block_on(dedalus::analytics::run_analytics(config))?;
+    let stats = dedalus::analytics::run_analytics(&config)?;
 
     println!();
     println!("=== Analytics Summary ===");
+    print_analytics_stats(&stats);
+    Ok(())
+}
+
+fn print_analytics_stats(stats: &AnalyticsStats) {
     println!("Nodes:            {}", stats.node_count);
     println!("Edges:            {}", stats.edge_count);
-    println!("PageRank iters:   {}", stats.pagerank_iterations_run);
+    println!("Skipped edges:    {}", stats.skipped_edges);
+    println!("Duplicate nodes:  {}", stats.duplicate_nodes);
+    println!(
+        "PageRank:         {} iterations, residual {:.2e}",
+        stats.pagerank_iterations_run, stats.pagerank_residual
+    );
     println!("Communities:      {}", stats.communities_found);
     println!("Elapsed:          {:.2}s", stats.elapsed_secs);
+}
 
+fn run_load(args: LoadArgs) -> Result<()> {
+    let config = LoadConfig {
+        output_dir: args.output,
+        db_path: args.db_path,
+        replace: args.clean,
+    };
+    let stats = dedalus::load::run_load(&config)?;
+
+    println!();
+    println!("=== Load Summary ===");
+    print_load_stats(&stats);
     Ok(())
+}
+
+fn print_load_stats(stats: &LoadStats) {
+    println!("Database:         {}", stats.db_path.display());
+    for (table, rows) in &stats.tables {
+        println!("  {table:<24}{rows} rows");
+    }
+    println!("Elapsed:          {:.2}s", stats.elapsed_secs);
 }
 
 fn run_pipeline(args: PipelineArgs) -> Result<()> {
@@ -447,14 +326,8 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
     println!("    Size: {}", format_size(dump_size));
     println!();
 
-    // Count steps
-    let mut step_count = 2; // extract + merge
-    if !args.no_load {
-        step_count += 1; // load
-        if !args.no_analytics {
-            step_count += 1; // analytics
-        }
-    }
+    // Extract and merge always run; analytics and load unless skipped.
+    let step_count = 2 + u32::from(!args.no_analytics) + u32::from(!args.no_load);
 
     // Step 1: Extract
     let mut step = 1;
@@ -491,7 +364,8 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
             "==> Step {step}/{step_count}: Merging {} CSV shards...",
             args.csv_shards
         );
-        dedalus::merge::merge_csv_shards(&args.output).context("Merge step failed")?;
+        dedalus::merge::merge_csv_shards(&args.output, args.csv_shards)
+            .context("Merge step failed")?;
 
         if !args.no_archive {
             println!("==> Archiving sharded CSV files...");
@@ -502,59 +376,45 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
         println!("==> Step {step}/{step_count}: Skipping merge (csv-shards=1)");
     }
 
-    // Step 3: Load into SurrealDB
-    if !args.no_load {
+    // Step 3: Analytics
+    if args.no_analytics {
+        println!();
+        println!("==> Skipping analytics (--no-analytics)");
+    } else {
         step += 1;
         println!();
-        println!("==> Step {step}/{step_count}: Loading into SurrealDB...");
-
-        let load_config = SurrealWriterConfig {
+        println!("==> Step {step}/{step_count}: Computing graph analytics...");
+        let config = AnalyticsConfig {
             output_dir: args.output.clone(),
-            db_path: args.db_path.clone(),
-            batch_size: dedalus::config::SURREAL_BATCH_SIZE,
-            clean: args.clean,
+            ..Default::default()
         };
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("dedalus-load-worker")
-            .enable_io()
-            .enable_time()
-            .build()?;
-        let load_stats = rt
-            .block_on(dedalus::surrealdb_writer::run_surreal_load(load_config))
-            .context("Load step failed")?;
-
+        let stats = dedalus::analytics::run_analytics(&config).context("Analytics step failed")?;
         println!(
-            "    Loaded {} articles, {} edges in {:.1}s",
-            load_stats.articles_loaded, load_stats.edges_loaded, load_stats.elapsed_secs
+            "    PageRank ({} iters), {} communities, {:.1}s",
+            stats.pagerank_iterations_run, stats.communities_found, stats.elapsed_secs
         );
+    }
 
-        // Step 4: Analytics
-        if !args.no_analytics {
-            step += 1;
-            println!();
-            println!("==> Step {step}/{step_count}: Computing graph analytics...");
-
-            let analytics_config = dedalus::analytics::AnalyticsConfig {
-                db_path: args.db_path.clone(),
-                output_dir: args.output.clone(),
-                ..Default::default()
-            };
-
-            let analytics_stats = rt
-                .block_on(dedalus::analytics::run_analytics(analytics_config))
-                .context("Analytics step failed")?;
-
-            println!(
-                "    PageRank ({} iters), {} communities, {:.1}s",
-                analytics_stats.pagerank_iterations_run,
-                analytics_stats.communities_found,
-                analytics_stats.elapsed_secs
-            );
-        }
-    } else {
+    // Step 4: Load into DuckDB. The database mirrors the CSVs this run just
+    // wrote, so it is always replaced.
+    let load_config = LoadConfig {
+        output_dir: args.output.clone(),
+        db_path: args.db_path.clone(),
+        replace: true,
+    };
+    if args.no_load {
         println!();
-        println!("==> Skipping load and analytics (--no-load)");
+        println!("==> Skipping DuckDB load (--no-load)");
+    } else {
+        step += 1;
+        println!();
+        println!("==> Step {step}/{step_count}: Loading into DuckDB...");
+        let stats = dedalus::load::run_load(&load_config).context("Load step failed")?;
+        println!(
+            "    {} tables in {:.1}s",
+            stats.tables.len(),
+            stats.elapsed_secs
+        );
     }
 
     let total_duration = overall_start.elapsed();
@@ -565,15 +425,7 @@ fn run_pipeline(args: PipelineArgs) -> Result<()> {
     );
     println!("    Output:   {}", args.output);
     if !args.no_load {
-        let db_display = if Path::new(&args.db_path).is_absolute() {
-            args.db_path.clone()
-        } else {
-            Path::new(&args.output)
-                .join(&args.db_path)
-                .to_string_lossy()
-                .to_string()
-        };
-        println!("    Database: {}", db_display);
+        println!("    Database: {}", load_config.resolved_db_path().display());
     }
     println!();
 
@@ -643,13 +495,12 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
     println!();
 
-    // SurrealDB database
-    let db_dir = output_dir.join(dedalus::config::DEFAULT_DB_PATH);
-    if db_dir.exists() {
-        let db_size = dir_size(&db_dir);
-        println!("SurrealDB:");
-        println!("  Path: {}", db_dir.display());
-        println!("  Size: {}", format_size(db_size));
+    // DuckDB database
+    let db_file = output_dir.join(dedalus::load::DEFAULT_DB_FILE);
+    if let Ok(meta) = fs::metadata(&db_file) {
+        println!("DuckDB:");
+        println!("  Path: {}", db_file.display());
+        println!("  Size: {}", format_size(meta.len()));
         println!();
     }
 
@@ -674,23 +525,20 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Total size of the files under `path`. Entries that cannot be read count
+/// as zero, and symlinks are not followed, so a link cycle cannot recurse.
 fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let ft = entry.file_type().unwrap_or_else(|_| {
-                fs::metadata(entry.path())
-                    .map(|m| m.file_type())
-                    .unwrap_or_else(|_| entry.file_type().unwrap())
-            });
-            if ft.is_file() {
-                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-            } else if ft.is_dir() {
-                total += dir_size(&entry.path());
-            }
-        }
-    }
-    total
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| match entry.metadata() {
+            Ok(meta) if meta.is_dir() => dir_size(&entry.path()),
+            Ok(meta) if meta.is_file() => meta.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn format_size(bytes: u64) -> String {
@@ -735,12 +583,12 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Commands::Extract(args) => run_extract(args),
-        Commands::Load(args) => run_load(args),
         Commands::Analytics(args) => run_analytics(args),
+        Commands::Load(args) => run_load(args),
         Commands::MergeCsvs(args) => {
             let output = args.output.clone();
             let archive = args.archive;
-            dedalus::merge::merge_csv_shards(&output).and_then(|()| {
+            dedalus::merge::merge_detected_shards(&output).and_then(|_shard_count| {
                 if archive {
                     dedalus::merge::archive_shards(&output)
                 } else {

@@ -42,10 +42,6 @@ impl ExtractionStats {
         self.invalid_links.fetch_add(count, Ordering::Relaxed);
     }
 
-    pub fn inc_categories(&self) {
-        self.categories_found.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn add_categories(&self, count: u64) {
         self.categories_found.fetch_add(count, Ordering::Relaxed);
     }
@@ -136,6 +132,33 @@ impl ExtractionStats {
         }
     }
 
+    /// Sets every counter to the value saved in a checkpoint, so a resumed run
+    /// continues counting from where the interrupted one stopped.
+    pub fn restore_from(&self, cp: &CheckpointStats) {
+        let restored = Self::from_checkpoint(cp);
+        let pairs = [
+            (&self.articles_processed, &restored.articles_processed),
+            (&self.edges_extracted, &restored.edges_extracted),
+            (&self.blobs_written, &restored.blobs_written),
+            (&self.invalid_links, &restored.invalid_links),
+            (&self.categories_found, &restored.categories_found),
+            (&self.category_edges, &restored.category_edges),
+            (&self.see_also_edges, &restored.see_also_edges),
+            (&self.infoboxes_extracted, &restored.infoboxes_extracted),
+            (&self.images_found, &restored.images_found),
+            (&self.external_links_found, &restored.external_links_found),
+        ];
+        for (counter, value) in pairs {
+            counter.store(value.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
+    /// An independent copy of the current counter values.
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        Self::from_checkpoint(&self.to_checkpoint())
+    }
+
     pub fn to_checkpoint(&self) -> CheckpointStats {
         CheckpointStats {
             articles_processed: self.articles(),
@@ -192,7 +215,7 @@ mod tests {
         stats.add_edges(25);
         stats.inc_blobs();
         stats.add_invalid_links(5);
-        stats.inc_categories();
+        stats.add_categories(1);
         stats.add_category_edges(10);
         stats.add_see_also_edges(2);
         stats.add_infoboxes(3);
@@ -219,7 +242,7 @@ mod tests {
         original.add_edges(10);
         original.inc_blobs();
         original.add_invalid_links(2);
-        original.inc_categories();
+        original.add_categories(1);
         original.add_category_edges(5);
         original.add_see_also_edges(1);
         original.add_infoboxes(2);

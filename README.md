@@ -1,8 +1,9 @@
 # Dedalus
 
-A high-performance Rust pipeline that transforms Wikipedia XML dumps into a structured graph database. Dedalus extracts articles, links, categories, and metadata from compressed dumps, loads them into an embedded [SurrealDB](https://surrealdb.com) database, and computes graph analytics like PageRank and community detection.
+A Rust pipeline that turns a Wikipedia XML dump into graph data.
+Dedalus extracts articles, links, categories, images and external links from a compressed dump, computes PageRank, communities and degree over the link graph, and loads everything into a single [DuckDB](https://duckdb.org) file.
 
-No external services required -- everything runs as a single binary with a local `wikipedia.db/` directory as output.
+Every stage also leaves plain CSV files behind, so the output is usable without DuckDB.
 
 ## What It Does
 
@@ -10,61 +11,65 @@ No external services required -- everything runs as a single binary with a local
 Wikipedia dump (.xml.bz2)
     |
     v
-[Extract] ---> CSV files + JSON blobs
+[Extract]   ---> CSV files + JSON blobs
     |
     v
-[Merge]   ---> Deduplicated single CSVs
+[Merge]     ---> Deduplicated single CSVs
     |
     v
-[Load]    ---> SurrealDB (RocksDB)
+[Analytics] ---> analytics.csv (PageRank, communities, degree)
     |
     v
-[Analytics] -> PageRank, communities, degree
+[Load]      ---> wikipedia.duckdb
 ```
-
-**Output**: A `wikipedia.db/` directory containing the full article graph with computed analytics, plus CSV/JSON files for use with other tools.
 
 ## Quick Start
 
 ```bash
-# Build
+brew install duckdb            # the build links Homebrew's libduckdb
 cargo build --release
 
-# Run the full pipeline (extract -> merge -> load -> analytics)
+# Run the full pipeline (extract -> merge -> analytics -> load)
 dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ -v
 
-# Test with a small subset first
-dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -vv
-```
+# Try a small slice first
+dedalus pipeline -i enwiki-latest-pages-articles-multistream.xml.bz2 -o output/ --limit 10000 -v
 
-That's it. No Docker, no database setup, no configuration files.
+# Query the result
+duckdb output/wikipedia.duckdb
+```
 
 ## Getting a Wikipedia Dump
 
-Download from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/). Use the **multistream** format for best performance:
+Download from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/), or run `scripts/download_wikipedia.sh`, which picks the fastest mirror.
+Use the **multistream** format and fetch its index too:
 
 ```bash
-# ~22GB dump + ~250MB index
 wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
 wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream-index.txt.bz2
 ```
 
-The multistream format contains ~200K independent bz2 streams, allowing Dedalus to parallelize both decompression and XML parsing across all CPU cores. The standard (non-multistream) format works too, but decompression is single-threaded.
+A multistream dump is a few hundred thousand independent bz2 streams of about 100 pages each, and the index file lists their byte offsets.
+Dedalus uses the index to decompress and parse streams in parallel on every core.
+The index is found automatically when it sits beside the dump with the matching name; otherwise pass `--multistream-index`.
+A standard (single-stream) dump works too, but decompression is then sequential.
+
+Dedalus checks that every offset in the index lies inside the dump, so a dump that is still downloading is refused rather than read partway.
 
 ## Prerequisites
 
-- **Rust 1.87+** -- [install via rustup](https://rustup.rs/)
-- **lbzip2** (optional) -- parallel bzip2 decompression for standard (non-multistream) dumps
-  ```bash
-  brew install lbzip2        # macOS
-  apt install lbzip2         # Debian/Ubuntu
-  ```
+- **Rust 1.94+**: [install via rustup](https://rustup.rs/).
+- **DuckDB 2.0** from Homebrew: `brew install duckdb`.
+  `.cargo/config.toml` points the build at `/opt/homebrew/opt/duckdb`.
+  On a machine without Homebrew, download the prebuilt library from DuckDB's GitHub release (for example `duckdb-shared-libs-linux-amd64.tar.gz`) and set `DUCKDB_LIB_DIR` and `DUCKDB_INCLUDE_DIR` to where it was unpacked, as CI does; on Linux, `LD_LIBRARY_PATH` too.
+  The `duckdb` crate version must match the library: crate `1.20000.x` wraps DuckDB 2.0.x.
+- **lbzip2** (optional): parallel decompression for standard, non-multistream dumps (`brew install lbzip2`).
 
 ## Subcommands
 
-### `pipeline` -- Full Workflow (Recommended)
+### `pipeline`: Full Workflow (Recommended)
 
-Runs everything in sequence: extract, merge, load into SurrealDB, compute analytics.
+Runs extract, merge (when sharded), analytics and load in sequence.
 
 ```bash
 dedalus pipeline -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
@@ -72,46 +77,51 @@ dedalus pipeline -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-i, --input` | Path to Wikipedia dump (`.xml.bz2`) | required |
-| `-o, --output` | Output directory | required |
-| `--csv-shards <N>` | Parallel extraction shards | `8` |
-| `--limit <N>` | Cap pages processed (for testing) | none |
-| `--db-path` | SurrealDB database path | `wikipedia.db` |
-| `--clean` | Clear existing outputs before starting | `false` |
-| `--resume` | Resume from last checkpoint | `false` |
-| `--no-load` | Skip SurrealDB load + analytics | `false` |
-| `--no-analytics` | Skip analytics computation | `false` |
-| `--no-archive` | Keep sharded CSVs after merging | `false` |
-| `--multistream-index` | Path to multistream index file | auto-detected |
+| `-i, --input` | Path to the Wikipedia dump (`.xml.bz2`) | Required |
+| `-o, --output` | Output directory | Required |
+| `--csv-shards <N>` | CSV shards written in parallel during extraction | `8` |
+| `--shard-count <N>` | Directories the JSON blobs are spread across | `1000` |
+| `--limit <N>` | Stop after this many pages (for testing) | None |
+| `--checkpoint-interval <N>` | Pages per extraction chunk; a checkpoint is saved after each | `10000` |
+| `--resume` | Resume extraction from the last checkpoint | Off |
+| `--no-cache` | Rebuild the title index instead of loading `index.cache` | Off |
+| `--clean` | Clear existing checkpoint and outputs before starting | Off |
+| `--no-archive` | Leave shard CSVs in place after merging | Off |
+| `--no-analytics` | Skip analytics | Off |
+| `--no-load` | Skip the DuckDB load | Off |
+| `--db-path` | DuckDB file, relative to the output directory | `wikipedia.duckdb` |
+| `--multistream-index` | Path to the multistream index file | Auto-detected |
 
-### `extract` -- CSV/JSON Extraction
+The pipeline always replaces the DuckDB file, since it has just rewritten the CSVs the file mirrors.
 
-Processes a dump into CSV files and JSON blobs without loading into a database.
+### `extract`: CSV and JSON Extraction
 
 ```bash
 dedalus extract -i <dump.xml.bz2> -o <output-dir> [OPTIONS]
 ```
 
-Key flags: `--csv-shards`, `--limit`, `--dry-run`, `--resume`, `--clean`, `--no-cache`
+Takes the same extraction flags as `pipeline` (`--csv-shards`, `--shard-count`, `--limit`, `--checkpoint-interval`, `--resume`, `--no-cache`, `--clean`, `--multistream-index`), plus `--dry-run`, which writes nothing.
 
-### `load` -- SurrealDB Import
+Extraction reads the dump in chunks of `--checkpoint-interval` pages.
+After each chunk every file is flushed and a checkpoint is saved, recording where reading stopped and how long each CSV was.
+`--resume` cuts each CSV back to that length and continues from the next chunk, so an interrupted run ends with exactly the output of an uninterrupted one.
 
-Loads merged CSVs (articles + edges) into an embedded SurrealDB database.
+### `merge-csvs`: Shard Merging
+
+Combines sharded CSVs (`nodes_000.csv`, ...) into single files, deduplicating category, image and external link nodes across shards.
+Analytics and load need the merged files.
 
 ```bash
-dedalus load -o <output-dir> [OPTIONS]
+dedalus merge-csvs -o <output-dir> [--archive]
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-o, --output` | Directory containing CSV output | required |
-| `--db-path` | SurrealDB database path | `wikipedia.db` |
-| `--batch-size` | Records per insert batch | `10000` |
-| `--clean` | Remove existing database first | `false` |
+The shards must be numbered `0..N` with no gaps.
+`--archive` moves them into `shards/` afterward, replacing any shards archived by an earlier run.
 
-### `analytics` -- Graph Analytics
+### `analytics`: Graph Analytics
 
-Computes PageRank, community detection (label propagation), and degree centrality from CSVs, writing results back to SurrealDB.
+Computes PageRank, communities (label propagation) and in plus out degree over the LINKS_TO edges, and writes them to `analytics.csv`.
+SEE_ALSO edges, and edges to pages that are not in `nodes.csv`, are left out.
 
 ```bash
 dedalus analytics -o <output-dir> [OPTIONS]
@@ -119,43 +129,55 @@ dedalus analytics -o <output-dir> [OPTIONS]
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-o, --output` | Directory containing CSV output | required |
-| `--db-path` | SurrealDB database path | `wikipedia.db` |
-| `--pagerank-iterations` | Max PageRank iterations | `20` |
+| `-o, --output` | Directory holding the merged CSVs | Required |
+| `--pagerank-iterations` | Maximum PageRank iterations | `20` |
 | `--damping` | PageRank damping factor | `0.85` |
 
-### `merge-csvs` -- Shard Merging
+### `load`: DuckDB Load
 
-Combines sharded CSV files into single files with cross-shard deduplication. Required before `load` if you extracted with `--csv-shards > 1`.
+Copies the merged CSVs, and `analytics.csv` when it exists, into one DuckDB file.
 
 ```bash
-dedalus merge-csvs -o <output-dir> [--archive]
+dedalus load -o <output-dir> [OPTIONS]
 ```
 
-### `stats` -- Output Statistics
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-o, --output` | Directory holding the merged CSVs | Required |
+| `--db-path` | DuckDB file, relative to the output directory | `wikipedia.duckdb` |
+| `--clean` | Replace the database if it already exists | Off |
 
-Shows CSV file sizes, blob counts, SurrealDB size, and total disk usage.
+The database is built in a `.tmp` file and renamed into place when every table has loaded, so a failed load keeps the previous database.
+
+### `stats`: Output Statistics
+
+Shows CSV file sizes, blob counts, the DuckDB file size and total disk usage.
 
 ```bash
 dedalus stats -o <output-dir>
 ```
 
-### `tui` -- Interactive Terminal UI
+### `tui`: Interactive Terminal UI
 
-Form-based interface for configuring and monitoring all operations with real-time stats and log streaming.
+A form for each operation (Extract, MergeCsvs, Analytics, Load), with live extraction stats and a scrolling log.
 
 ```bash
 dedalus tui
 ```
 
-| Key | Action |
-|-----|--------|
-| `Tab` | Switch between operation tabs |
-| `Up/Down` | Navigate form fields |
-| `Enter` | Toggle checkbox or start operation |
-| `c` | Cancel running operation |
-| `r` | Return to config (from done screen) |
-| `q` | Quit |
+| Key | Screen | Action |
+|-----|--------|--------|
+| `Tab`, `Shift+Tab` | Config | Switch operation |
+| `Up`, `Down` | Config | Move between fields |
+| `Enter` | Config | Toggle a checkbox, or start the operation |
+| `Space` | Config | Toggle a checkbox |
+| `Esc` | Config | Quit |
+| `q` | Config | Quit, unless a text field is selected |
+| `c`, `Esc` | Progress | Cancel an extraction after the current chunk (resume later with Resume) |
+| `Up`, `Down`, `End` | Progress | Scroll the log; `End` follows new lines again |
+| `r` | Done | Back to the config screen |
+| `q`, `Esc` | Done | Quit |
+| `Ctrl+C` | Any | Quit |
 
 ### Global Flags
 
@@ -168,136 +190,137 @@ dedalus tui
 ## Example Workflows
 
 ```bash
-# Full pipeline (recommended)
+# Full pipeline
 dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ -v
 
-# Extract only, no database
+# CSVs only, no DuckDB
 dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ --no-load -v
 
-# Step-by-step
+# Step by step
 dedalus extract -i enwiki-multistream.xml.bz2 -o out/ --csv-shards 14 -v
 dedalus merge-csvs -o out/ --archive
-dedalus load -o out/ --clean
 dedalus analytics -o out/
+dedalus load -o out/ --clean
 
-# Resume interrupted extraction
+# Resume an interrupted extraction
 dedalus extract -i enwiki-multistream.xml.bz2 -o out/ --resume -v
-
-# Clean start
-dedalus pipeline -i enwiki-multistream.xml.bz2 -o out/ --clean -v
 ```
 
 ## Output Format
 
 ```
 output/
-├── nodes.csv                   # Article nodes (id, title)
-├── edges.csv                   # Article-to-article links
+├── nodes.csv                   # Articles: id, title
+├── edges.csv                   # Article links: source, target, LINKS_TO or SEE_ALSO
 ├── categories.csv              # Category nodes (deduplicated)
-├── article_categories.csv      # Article-to-category edges
+├── article_categories.csv      # Article-to-category rows
 ├── image_nodes.csv             # Image nodes (deduplicated)
-├── article_images.csv          # Article-to-image edges
+├── article_images.csv          # Article-to-image rows
 ├── external_link_nodes.csv     # External link nodes (deduplicated)
-├── article_external_links.csv  # Article-to-external-link edges
-├── wikipedia.db/               # SurrealDB database (RocksDB)
-├── index.cache                 # Cached title-to-ID index
+├── article_external_links.csv  # Article-to-external-link rows
+├── analytics.csv               # id, pagerank, community, degree
+├── wikipedia.duckdb            # All of the above as DuckDB tables
+├── index.cache                 # Cached title-to-id index
+├── checkpoint.bin              # Resume state, removed when extraction completes
 ├── blobs/
-│   ├── 000/{id}.json           # Enriched article content
-│   ├── 001/{id}.json
+│   ├── 000/{id}.json           # Article content
 │   └── ...
-└── shards/                     # Archived sharded CSVs (optional)
+└── shards/                     # Archived shard CSVs (after --archive)
 ```
 
-### SurrealDB Schema
+The CSV headers use a typed-column style (`id:ID`, `:START_ID`, `:TYPE`).
+Titles are stored in MediaWiki's canonical form (first letter uppercase, underscores as spaces), so link targets and category names written either way resolve to the same entry.
+
+### DuckDB Tables
+
+| Table | Columns |
+|-------|---------|
+| `articles` | `id`, `title` |
+| `links` | `src`, `dst`, `type` (`LINKS_TO` or `SEE_ALSO`) |
+| `categories`, `article_categories` | `id`, `name`; `article_id`, `category_id` |
+| `images`, `article_images` | `id`, `filename`; `article_id`, `image_id` |
+| `external_links`, `article_external_links` | `id`, `url`; `article_id`, `link_id` |
+| `analytics` | `id`, `pagerank`, `community`, `degree` |
 
 ```sql
--- Tables
-article { id, title, pagerank, community, degree }
-links_to (relation: article -> article)
+-- The ten highest-ranked articles
+SELECT a.title, x.pagerank
+FROM analytics x JOIN articles a USING (id)
+ORDER BY x.pagerank DESC LIMIT 10;
 
--- Example queries
-SELECT * FROM article ORDER BY pagerank DESC LIMIT 10;
-SELECT count() FROM article;
-SELECT * FROM article WHERE title = "Rust (programming language)";
-SELECT ->links_to->article.title FROM article:12345;
+-- What an article links to
+SELECT t.title
+FROM links l JOIN articles t ON t.id = l.dst
+WHERE l.src = (SELECT id FROM articles WHERE title = 'Rust (programming language)')
+  AND l.type = 'LINKS_TO';
+
+-- The largest communities, named by one member
+SELECT a.title, count(*) AS size
+FROM analytics x JOIN articles a ON a.id = x.community
+GROUP BY a.title ORDER BY size DESC LIMIT 10;
 ```
+
+A community is identified by the page id of one of its articles.
 
 ### JSON Blobs
 
-Each article gets an enriched JSON blob at `blobs/{id % 1000}/{id}.json`:
+Each article gets a JSON blob at `blobs/{id % shard_count}/{id}.json`:
 
 ```json
 {
   "id": 12345,
   "title": "Example Article",
-  "abstract_text": "First paragraph with templates stripped...",
+  "abstract_text": "The lead section as plain text, links shown as their visible text...",
   "categories": ["Category A", "Category B"],
-  "infoboxes": [{"template": "Infobox software", "fields": {...}}],
+  "infoboxes": [{"infobox_type": "Infobox software", "fields": [["name", "Example"]]}],
   "sections": ["History", "Design", "See also"],
   "timestamp": "2024-01-15T10:30:00Z",
   "is_disambiguation": false
 }
 ```
 
-## Performance
+Empty lists and a false `is_disambiguation` are left out of the file.
 
-**Full English Wikipedia** (~22M pages, 87GB compressed):
+## Resources
 
-| Stage | Time | Notes |
-|-------|------|-------|
-| Extract (14 shards) | ~2.8 hours | 1.62x faster than single shard |
-| Extract (1 shard) | ~4.5 hours | Simpler but slower |
-| Merge | <5 minutes | Cross-shard deduplication |
-| SurrealDB Load | ~15-30 minutes | Batch inserts to RocksDB |
-| Analytics | ~5-10 minutes | PageRank + communities + degree |
-
-**Hardware recommendations**:
-- 8+ CPU cores (rayon scales linearly)
-- 16GB+ RAM (32GB recommended for full Wikipedia analytics)
-- SSD storage (CSV writes are I/O intensive)
-- Apple Silicon benefits from automatic NEON SIMD optimizations (~1.6x)
+Timings and peak memory on the full English dump have not been measured since the pipeline was reworked.
+As estimates: the analytics graph takes about 8 bytes per link (around 2 GB for 200 million links), and extraction holds the title index plus the sets of category, image and external link names seen so far, which together can run to several GB.
+Plan for 16 GB of RAM or more and an SSD.
+In earlier benchmarks, 14 CSV shards extracted about 1.6 times faster than one.
 
 ## Architecture
 
-Dedalus uses a multi-pass streaming architecture:
+1. **Index**: streams the dump without article text, building a title-to-id map (`FxHashMap`) and a redirect table; redirect chains are followed up to 5 hops.
+   With a multistream dump, streams are parsed in parallel.
+2. **Extract**: reads the dump again in ordered chunks, processing each chunk's pages in parallel with rayon.
+   Rows go to `page_id % csv_shards`; category, image and external link names are deduplicated with `DashSet`s.
+3. **Merge**: concatenates shards per CSV type, deduplicating shared nodes with `FxHashSet`; each merged file is written to a `.tmp` sibling and renamed.
+4. **Analytics**: builds a compressed sparse row graph from LINKS_TO edges in two passes over `edges.csv`, then runs rayon-parallel PageRank (rank on pages with no outgoing links is spread evenly, so ranks sum to 1), label propagation, and degree.
+5. **Load**: one `CREATE TABLE ... AS SELECT ... FROM read_csv(...)` per CSV, with explicit column types.
 
-1. **Indexing** -- Streams through the dump with text skipped, building a `FxHashMap` title-to-ID index (pre-sized for 8M articles) with redirect resolution (up to 5 hops). With multistream dumps, this is parallelized across bz2 streams.
-
-2. **Extraction** -- Second pass reads article text. `rayon::par_bridge()` parallelizes processing. `ShardedCsvWriter` distributes output across N files. `DashSet` deduplicates categories/images/external links concurrently. Checkpointing every 10K articles enables resume.
-
-3. **Merge** -- Streaming concatenation with `FxHashSet` deduplication across shards. 256KB I/O buffers.
-
-4. **Load** -- Opens embedded SurrealDB (RocksDB backend), creates schema, batch-inserts articles and edges from merged CSVs. Record IDs map directly from Wikipedia page IDs (`article:12345`).
-
-5. **Analytics** -- Builds a CSR (Compressed Sparse Row) graph from CSVs (~1GB for full Wikipedia). Computes PageRank via rayon-parallel power iteration, label propagation communities, and in+out degree. Batch-writes results to SurrealDB.
-
-Key design choices:
-- **Two-pass pipeline** -- Index first (fast, no text), then extract with redirect resolution
-- **FxHashMap** -- Faster than SipHash for trusted input (no DoS risk)
-- **CSV intermediates** -- Debuggable, reusable, decouples extraction from storage
-- **Embedded SurrealDB** -- No Docker, no external services, single directory output
-- **CSR for analytics** -- ~1GB for 7M nodes / 200M edges vs ~3GB+ for adjacency lists
-- **Tokio isolation** -- Only created for async SurrealDB operations; extraction stays on sync rayon
+`docs/reference/internal/architecture.md` has the longer version.
 
 ## Development
 
 ```bash
-cargo build --release          # Build optimized binary
-cargo test --verbose           # Run all tests (177 unit + integration)
-cargo clippy -- -D warnings    # Lint with strict warnings
-cargo fmt -- --check           # Check formatting
+cargo build --release                  # Optimized binary
+cargo test                             # All unit and integration tests
+cargo clippy --all-targets -- -D warnings
+cargo fmt -- --check
+git config core.hooksPath .githooks    # Run fmt, clippy, build and tests before every push
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| Slow extraction | Use `--release`, `--csv-shards 14`, multistream dumps, install `lbzip2` |
+| Build cannot find `libduckdb` | `brew install duckdb`, or point `DUCKDB_LIB_DIR` and `DUCKDB_INCLUDE_DIR` at DuckDB's prebuilt library |
+| Slow extraction | Use `--release`, a multistream dump, and more `--csv-shards`; install `lbzip2` for standard dumps |
+| "Multistream index does not match dump" | The dump is incomplete (often still downloading) or belongs to a different index |
 | Stale index cache | `--no-cache` to rebuild |
 | Interrupted extraction | `--resume` to continue, or `--clean` to restart |
-| Load fails (sharded CSVs) | Run `dedalus merge-csvs` first |
-| OOM during analytics | Ensure 4GB+ free RAM for CSR graph |
-| Existing database conflicts | Use `--clean` on load/pipeline |
+| Analytics or load says it needs merged CSVs | Run `dedalus merge-csvs -o <dir>` first, or extract with `--csv-shards 1` |
+| Load says the database already exists | Pass `--clean` to replace it |
 
 ## License
 
