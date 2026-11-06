@@ -11,9 +11,14 @@ on:
 # override the Homebrew paths in .cargo/config.toml (a value already set in
 # the environment wins over [env]). DUCKDB_VERSION must match the duckdb crate:
 # crate 1.20000.x wraps DuckDB 2.0.x.
+#
+# RUSTFLAGS overrides the target-cpu=native in .cargo/config.toml. Runners vary
+# in CPU, and a proc-macro cached from a newer one dies with SIGILL on an older
+# one. rust-cache hashes RUSTFLAGS into its key, so changing it drops old caches.
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  RUSTFLAGS: -C target-cpu=x86-64-v2
   DUCKDB_VERSION: 2.0.0
   DUCKDB_LIB_DIR: /home/runner/libduckdb
   DUCKDB_INCLUDE_DIR: /home/runner/libduckdb

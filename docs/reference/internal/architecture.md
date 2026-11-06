@@ -37,6 +37,10 @@ With `--archive` the shard files move to `shards/`, replacing any shards archive
 
 **Analytics** (`src/analytics.rs`) builds a compressed sparse row graph from the LINKS_TO edges of the merged CSVs and computes PageRank, label propagation communities and in plus out degree.
 SEE_ALSO edges are left out, as are edges whose endpoints are not in `nodes.csv`.
+PageRank and label propagation both run in parallel with rayon.
+Label propagation is synchronous: each pass computes every node's label from the previous pass's labels, with one vote for the node's own label so two linked nodes cannot swap labels forever, and ties going to the smallest label.
+It stops when no label changes or after `LABEL_PROPAGATION_MAX_ITERATIONS` passes, and logs how many labels changed in each pass at INFO.
+On the full English dump it does not reach zero changes within 50 passes; about 2% of nodes are still changing when it stops.
 Results go to `analytics.csv`, one row per article.
 
 **Load** (`src/load.rs`) copies each merged CSV into one table of `wikipedia.duckdb` with DuckDB's `read_csv` and explicit column types: `articles`, `links` (with its `type` column, LINKS_TO or SEE_ALSO), `categories`, `article_categories`, `images`, `article_images`, `external_links`, `article_external_links`, and `analytics` when `analytics.csv` exists.
