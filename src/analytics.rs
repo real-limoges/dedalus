@@ -4,7 +4,7 @@
 //! Sparse Row) graph over the `LINKS_TO` edges, and writes one row per article
 //! to `analytics.csv`. `SEE_ALSO` edges are left out: they repeat links an
 //! editor chose to list, and counting them would weight those links twice.
-//! PageRank iterations run in parallel with rayon.
+//! PageRank and label propagation run in parallel with rayon.
 
 use crate::atomic_file::write_atomically;
 use crate::config;
@@ -344,42 +344,60 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
 
 // -- Communities and degree ---------------------------------------------------
 
-/// Finds communities by label propagation.
+/// Finds communities by label propagation, in parallel with rayon.
 ///
-/// Every node starts with its own label, then repeatedly adopts the label
-/// most common among its neighbors (both directions), until no label changes
-/// or `max_iterations` passes. Ties go to the smallest label, so the result
-/// does not depend on hash map order.
+/// Every node starts with its own label. Each pass computes every node's new
+/// label from the previous pass's labels: the label most common among its
+/// neighbors (both directions) plus one vote for its own current label. Ties
+/// go to the smallest label, so the result does not depend on thread timing or
+/// hash map order. The self vote stops two linked nodes from swapping labels
+/// forever, which a plain synchronous update would do. Runs until no label
+/// changes or `max_iterations` passes, logging how many changed in each.
 fn compute_label_propagation(graph: &CsrGraph, max_iterations: u32) -> Vec<u32> {
     let mut labels: Vec<u32> = (0..graph.n as u32).collect();
-    let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
 
-    for iteration in 0..max_iterations {
-        let mut changed = false;
-        for i in 0..graph.n {
-            counts.clear();
-            for &neighbor in graph.out_neighbors(i).iter().chain(graph.in_neighbors(i)) {
-                *counts.entry(labels[neighbor as usize]).or_insert(0) += 1;
-            }
-            let best = counts
-                .iter()
-                .max_by(|(label_a, count_a), (label_b, count_b)| {
-                    count_a.cmp(count_b).then(label_b.cmp(label_a))
-                })
-                .map(|(&label, _)| label);
-            if let Some(best) = best
-                && best != labels[i]
-            {
-                labels[i] = best;
-                changed = true;
-            }
-        }
-        if !changed {
-            info!(iteration = iteration + 1, "Label propagation converged");
+    for iteration in 1..=max_iterations {
+        let next: Vec<u32> = (0..graph.n)
+            .into_par_iter()
+            .map_init(FxHashMap::default, |counts, i| {
+                most_common_label(graph, &labels, i, counts)
+            })
+            .collect();
+        let changed = labels
+            .par_iter()
+            .zip(next.par_iter())
+            .filter(|(old, new)| old != new)
+            .count();
+        labels = next;
+        info!(iteration, changed, "Label propagation pass");
+        if changed == 0 {
+            info!(iteration, "Label propagation converged");
             break;
         }
     }
     labels
+}
+
+/// The label node `i` adopts in the next pass: the most common among its
+/// neighbors' labels and its own, ties to the smallest. `counts` is scratch
+/// space reused across calls.
+fn most_common_label(
+    graph: &CsrGraph,
+    labels: &[u32],
+    i: usize,
+    counts: &mut FxHashMap<u32, u32>,
+) -> u32 {
+    counts.clear();
+    counts.insert(labels[i], 1);
+    for &neighbor in graph.out_neighbors(i).iter().chain(graph.in_neighbors(i)) {
+        *counts.entry(labels[neighbor as usize]).or_insert(0) += 1;
+    }
+    counts
+        .iter()
+        .max_by(|(label_a, count_a), (label_b, count_b)| {
+            count_a.cmp(count_b).then(label_b.cmp(label_a))
+        })
+        .map_or(labels[i], |(&label, _)| label)
 }
 
 /// Combined in + out degree of each node.
@@ -557,6 +575,14 @@ mod tests {
         assert!(labels[0] == labels[1] && labels[1] == labels[2]);
         assert!(labels[3] == labels[4] && labels[4] == labels[5]);
         assert_ne!(labels[0], labels[3]);
+    }
+
+    #[test]
+    fn label_propagation_settles_a_linked_pair() {
+        let dir = TempDir::new().unwrap();
+        write_graph(dir.path(), &[1, 2], &[(1, 2, "LINKS_TO")]);
+        let labels = compute_label_propagation(&graph_of(&dir).graph, 50);
+        assert_eq!(labels, vec![0, 0]);
     }
 
     #[test]

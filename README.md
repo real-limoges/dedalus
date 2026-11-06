@@ -295,7 +295,7 @@ In earlier benchmarks, 14 CSV shards extracted about 1.6 times faster than one.
 2. **Extract**: reads the dump again in ordered chunks, processing each chunk's pages in parallel with rayon.
    Rows go to `page_id % csv_shards`; category, image and external link names are deduplicated with `DashSet`s.
 3. **Merge**: concatenates shards per CSV type, deduplicating shared nodes with `FxHashSet`; each merged file is written to a `.tmp` sibling and renamed.
-4. **Analytics**: builds a compressed sparse row graph from LINKS_TO edges in two passes over `edges.csv`, then runs rayon-parallel PageRank (rank on pages with no outgoing links is spread evenly, so ranks sum to 1), label propagation, and degree.
+4. **Analytics**: builds a compressed sparse row graph from LINKS_TO edges in two passes over `edges.csv`, then runs rayon-parallel PageRank (rank on pages with no outgoing links is spread evenly, so ranks sum to 1), rayon-parallel label propagation, and degree.
 5. **Load**: one `CREATE TABLE ... AS SELECT ... FROM read_csv(...)` per CSV, with explicit column types.
 
 `docs/reference/internal/architecture.md` has the longer version.

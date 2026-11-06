@@ -185,7 +185,7 @@ The CSVs are the hand-off between passes; the DuckDB file is a queryable copy of
 - **`atomic_file.rs`**: `write_atomically` writes `<path>.tmp`, flushes, syncs and renames.
 - **`csv_util.rs`**: `CsvType` (names, headers, `shard_index`, `is_shared_node`), `detect_csv_layout` (prefers merged `nodes.csv`), `count_shards` (requires `0..N`), `stale_csv_files`.
 - **`merge.rs`**: `merge_csv_shards(dir, n)`, `merge_detected_shards(dir)`, `archive_shards(dir)`.
-- **`analytics.rs`**: two-pass CSR build over LINKS_TO edges (duplicate node ids and edges to unknown pages are skipped and counted), PageRank in f64 with the rank of pages without outgoing links spread evenly, label propagation with smallest-label tie-breaking, degree, `analytics.csv`.
+- **`analytics.rs`**: two-pass CSR build over LINKS_TO edges (duplicate node ids and edges to unknown pages are skipped and counted), PageRank in f64 with the rank of pages without outgoing links spread evenly, parallel synchronous label propagation (each node also votes for its own label, ties go to the smallest, every pass logs how many labels changed), degree, `analytics.csv`.
 - **`load.rs`**: DuckDB `read_csv` per table with explicit column types; built in `<db>.tmp` and renamed.
 - **`content.rs`**: regex and bracket-matching wikitext extraction: `extract_abstract` (lead section as plain text), `extract_sections`, `see_also_section_range` (ends at the next level-2 heading), `extract_categories`, `extract_images`, `extract_external_links`, `is_disambiguation`, `strip_templates`.
 - **`infobox.rs`**: brace-matching `{{Infobox ...}}` parser; fields split only at template and link depth zero.
@@ -216,7 +216,7 @@ Sharded extraction is faster (about 1.6x with 14 shards in earlier benchmarks), 
 
 - `quick-xml`: streaming XML parsing
 - `bzip2`: in-process bz2 decompression (external `lbzip2`/`pbzip2` preferred for standard dumps)
-- `rayon`: data parallelism for extraction and PageRank
+- `rayon`: data parallelism for extraction, PageRank and label propagation
 - `clap`: CLI
 - `csv`: CSV reading and writing
 - `serde` / `serde_json`: JSON blobs
