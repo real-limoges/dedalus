@@ -1,0 +1,40 @@
+# cargo-deny configuration: `cargo deny check`.
+
+# Only the platforms dedalus is built on: the Mac and CI's Ubuntu runners.
+# Windows and wasm dependencies are left out of every check.
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+
+[advisories]
+# Unmaintained crates are reported only when dedalus depends on them directly.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Every license that some dependency needs on its own (not only as one choice
+# of an OR). Add to this list on purpose, never to silence a new crate.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate are common in this tree and harmless; say so.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

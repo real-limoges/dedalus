@@ -11,6 +11,7 @@ use crate::atomic_file::write_atomically;
 use crate::config::MERGE_BUF_SIZE;
 use crate::csv_util::{self, CsvType};
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -31,8 +32,12 @@ pub fn merge_csv_shards(output_dir: &str, shard_count: u32) -> Result<()> {
             }
         }
     }
-    for &csv_type in CsvType::ALL {
-        let rows = merge_type(output_dir, csv_type, shard_count)?;
+    // The types share no files, so they merge in parallel.
+    let rows: Vec<u64> = CsvType::ALL
+        .par_iter()
+        .map(|&csv_type| merge_type(output_dir, csv_type, shard_count))
+        .collect::<Result<_>>()?;
+    for (csv_type, rows) in CsvType::ALL.iter().zip(rows) {
         info!("  {}: {rows} rows", csv_type.merged_file_name());
     }
     info!("Merge complete");
@@ -52,7 +57,7 @@ pub fn merge_detected_shards(output_dir: &str) -> Result<u32> {
 /// Merges the shards of one CSV type. Returns the number of rows written.
 fn merge_type(output_dir: &str, csv_type: CsvType, shard_count: u32) -> Result<u64> {
     let merged_path = Path::new(output_dir).join(csv_type.merged_file_name());
-    let mut seen_ids = FxHashSet::default();
+    let mut seen_ids: FxHashSet<Box<[u8]>> = FxHashSet::default();
     let mut rows = 0u64;
 
     write_atomically(&merged_path, |out| {
@@ -78,17 +83,21 @@ fn merge_type(output_dir: &str, csv_type: CsvType, shard_count: u32) -> Result<u
                 );
             }
 
-            for record in reader.records() {
-                let record = record.with_context(|| format!("Failed to read {name}"))?;
+            // Rows are copied as bytes: one reused record, no UTF-8 check.
+            let mut record = csv::ByteRecord::new();
+            while reader
+                .read_byte_record(&mut record)
+                .with_context(|| format!("Failed to read {name}"))?
+            {
                 if csv_type.is_shared_node() {
                     let id = record
                         .get(0)
                         .with_context(|| format!("Row without an id in {name}"))?;
-                    if !seen_ids.insert(id.to_string()) {
+                    if !seen_ids.insert(id.into()) {
                         continue;
                     }
                 }
-                writer.write_record(&record)?;
+                writer.write_byte_record(&record)?;
                 rows += 1;
             }
         }

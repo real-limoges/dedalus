@@ -1,0 +1,54 @@
+name: DuckDB
+description: >
+  Installs DuckDB's prebuilt shared library, checked against its SHA-256, and
+  points the duckdb crate's build at it.
+
+# The duckdb crate must match the library's version: crate 1.20000.x wraps
+# DuckDB 2.0.x. A crate bump that changes the DuckDB version changes VERSION
+# and both digests here. The digests are the ones GitHub lists for the assets
+# on DuckDB's release page.
+runs:
+  using: composite
+  steps:
+    - name: Install libduckdb
+      shell: bash
+      env:
+        VERSION: 2.0.1
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64)
+            asset=duckdb-shared-libs-linux-amd64.tar.gz
+            digest=e25502612fed533a243b61f23a2a574daad030e7e88906222a5f0ab30d06769e
+            ;;
+          macOS-ARM64)
+            asset=duckdb-shared-libs-osx-arm64.tar.gz
+            digest=d71e4800350f1135bc3f80a2e5cbcc01e199ca03759edf5a376db308b514b341
+            ;;
+          *)
+            echo "No pinned DuckDB library for $RUNNER_OS-$RUNNER_ARCH" >&2
+            exit 1
+            ;;
+        esac
+        dir="$RUNNER_TEMP/libduckdb"
+        mkdir -p "$dir"
+        curl -fsSL -o "$RUNNER_TEMP/$asset" \
+          "https://github.com/duckdb/duckdb/releases/download/v$VERSION/$asset"
+        echo "$digest  $RUNNER_TEMP/$asset" | shasum -a 256 -c
+        tar -xzf "$RUNNER_TEMP/$asset" -C "$dir"
+
+        # The macOS library names itself @rpath/libduckdb.dylib, and SIP strips
+        # DYLD_* variables whenever bash runs, so a search path cannot reach
+        # the test binaries. Naming the library by its absolute path makes
+        # every binary linked against it find it. The edit voids the
+        # signature, and arm64 refuses an unsigned library, so re-sign it.
+        if [ "$RUNNER_OS" = macOS ]; then
+          install_name_tool -id "$dir/libduckdb.dylib" "$dir/libduckdb.dylib"
+          codesign --force --sign - "$dir/libduckdb.dylib"
+        fi
+
+        # These win over the Homebrew paths in .cargo/config.toml's [env].
+        {
+          echo "DUCKDB_LIB_DIR=$dir"
+          echo "DUCKDB_INCLUDE_DIR=$dir"
+          echo "LD_LIBRARY_PATH=$dir"
+        } >> "$GITHUB_ENV"

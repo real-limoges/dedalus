@@ -189,6 +189,9 @@ fn build_database(
     specs: &[TableSpec],
 ) -> Result<Vec<(&'static str, u64)>> {
     let conn = Connection::open(path)?;
+    // Row order inside a table carries no meaning here, and keeping it would
+    // stop DuckDB from reading each CSV in parallel and cost memory.
+    conn.execute_batch("SET preserve_insertion_order = false;")?;
     let mut tables = Vec::with_capacity(specs.len());
     for spec in specs {
         let csv_path = Path::new(output_dir).join(&spec.file);

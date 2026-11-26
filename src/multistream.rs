@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use bzip2::read::{BzDecoder, MultiBzDecoder};
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read};
+use std::os::unix::fs::FileExt;
 use tracing::info;
 
 /// A contiguous bz2 stream within the multistream dump.
@@ -103,18 +104,27 @@ fn ranges_from_offsets(offsets: &[u64], dump_size: u64) -> Result<Vec<StreamRang
         .collect()
 }
 
+/// Opens the dump once, for every `parse_stream` call of a pass to share.
+pub fn open_dump(dump_path: &str) -> Result<File> {
+    File::open(dump_path).with_context(|| format!("Failed to open dump: {dump_path}"))
+}
+
 /// Parses every page in one bz2 stream of the dump. A stream that fails to
 /// decompress or parse is an error: skipping it would silently drop pages.
-pub fn parse_stream(
-    dump_path: &str,
-    range: &StreamRange,
-    skip_text: bool,
-) -> Result<Vec<WikiPage>> {
-    let mut file =
-        File::open(dump_path).with_context(|| format!("Failed to open dump: {dump_path}"))?;
-    file.seek(SeekFrom::Start(range.offset))?;
-    let limited = file.take(range.length);
-    let decoder = BzDecoder::new(limited);
+///
+/// Reads the compressed stream with one positioned read, so any number of
+/// threads can share one handle without seeking it.
+pub fn parse_stream(dump: &File, range: &StreamRange, skip_text: bool) -> Result<Vec<WikiPage>> {
+    let length = usize::try_from(range.length).context("Stream too large for memory")?;
+    let mut compressed = vec![0u8; length];
+    dump.read_exact_at(&mut compressed, range.offset)
+        .with_context(|| {
+            format!(
+                "Failed to read stream at byte {} ({} bytes)",
+                range.offset, range.length
+            )
+        })?;
+    let decoder = BzDecoder::new(compressed.as_slice());
 
     // Wrap decompressed XML in <mediawiki> tags since individual streams
     // contain bare <page> elements without a root wrapper.
@@ -141,9 +151,10 @@ pub fn parse_streams(
     ranges: &[StreamRange],
     skip_text: bool,
 ) -> Result<Vec<WikiPage>> {
+    let dump = open_dump(dump_path)?;
     let per_stream: Vec<Vec<WikiPage>> = ranges
         .par_iter()
-        .map(|range| parse_stream(dump_path, range, skip_text))
+        .map(|range| parse_stream(&dump, range, skip_text))
         .collect::<Result<_>>()?;
     Ok(per_stream.into_iter().flatten().collect())
 }
@@ -259,12 +270,13 @@ mod tests {
         )
         .unwrap();
 
-        let pages1 = parse_stream(dump.path().to_str().unwrap(), &ranges[0], false).unwrap();
+        let file = open_dump(dump.path().to_str().unwrap()).unwrap();
+        let pages1 = parse_stream(&file, &ranges[0], false).unwrap();
         assert_eq!(pages1.len(), 2);
         assert_eq!(pages1[0].title, "Article One");
         assert_eq!(pages1[1].title, "Article Two");
 
-        let pages2 = parse_stream(dump.path().to_str().unwrap(), &ranges[1], false).unwrap();
+        let pages2 = parse_stream(&file, &ranges[1], false).unwrap();
         assert_eq!(pages2.len(), 1);
         assert_eq!(pages2[0].title, "Article Three");
     }
@@ -294,7 +306,14 @@ mod tests {
             offset: 1,
             length: 20,
         };
-        assert!(parse_stream(dump_path, &bad, false).is_err());
+        let file = open_dump(dump_path).unwrap();
+        assert!(parse_stream(&file, &bad, false).is_err());
+        // A range running past the end of the dump fails rather than reading short.
+        let past_end = StreamRange {
+            offset: 0,
+            length: file.metadata().unwrap().len() + 1,
+        };
+        assert!(parse_stream(&file, &past_end, false).is_err());
     }
 
     #[test]

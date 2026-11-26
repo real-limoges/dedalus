@@ -18,8 +18,8 @@ flowchart TB
 
 ## The Passes
 
-**Index** (`src/index.rs`) reads every page without its text and builds `WikiIndex`: a map from normalized title to page id, and a redirect table.
-Lookups follow redirect chains up to `REDIRECT_MAX_DEPTH` hops.
+**Index** (`src/index.rs`) reads every page without its text and builds `WikiIndex`: a map from normalized title to page id, and a map from redirect title to page id.
+Each redirect chain is followed once, up to `REDIRECT_MAX_DEPTH` hops, while the index is built; redirects that lead nowhere are dropped.
 The index is cached as `index.cache` in the output directory, keyed on the dump's size and modification time and on `CACHE_VERSION`.
 
 **Extract** (`src/extract.rs`) reads every article again, with text, and writes rows through `ShardedCsvWriter`, which assigns each page to shard `page_id % csv_shards`.

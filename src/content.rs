@@ -42,6 +42,33 @@ static LEVEL_TWO_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^==[^=]").
 pub static LINK_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[\[([^|\[\]]+?)(?:\|[^\[\]]*)?\]\]").unwrap());
 
+// In LINK_REGEX, CATEGORY_REGEX and IMAGE_REGEX, group 1 starts at a fixed
+// point in the match (after `[[`, or after the first `:`) and cannot contain
+// `|` or `]`, so it ends at the first of them. Slicing it out of a plain match
+// gives the same text as the capture, without the slower capture engine.
+
+/// The text of `matched` from `start` up to its first `|` or `]`.
+fn up_to_pipe_or_bracket(matched: &str, start: usize) -> &str {
+    let rest = &matched[start..];
+    let end = memchr2(b'|', b']', rest.as_bytes()).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The name in a `[[Category:Name]]` or `[[File:Name]]` match: from just after
+/// the first `:` to the first `|` or `]`.
+fn name_after_colon(matched: &str) -> &str {
+    let colon = matched.find(':').map_or(matched.len(), |i| i + 1);
+    up_to_pipe_or_bracket(matched, colon)
+}
+
+/// Every `[[Target]]` or `[[Target|label]]` link: the byte offset of its `[[`
+/// and its raw target, the same text as `LINK_REGEX`'s group 1.
+pub fn link_targets(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    LINK_REGEX
+        .find_iter(text)
+        .map(|m| (m.start(), up_to_pipe_or_bracket(m.as_str(), 2)))
+}
+
 static HTML_COMMENT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<!--.*?-->").unwrap());
 
 /// A footnote: self-closing `<ref name="a"/>` first, so it is never read as
@@ -177,8 +204,8 @@ pub fn extract_sections(text: &str) -> Vec<String> {
 #[must_use]
 pub fn extract_categories(text: &str) -> Vec<Cow<'_, str>> {
     let names = CATEGORY_REGEX
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| normalize_title(m.as_str())));
+        .find_iter(text)
+        .map(|m| normalize_title(name_after_colon(m.as_str())));
     unique_nonempty(names)
 }
 
@@ -223,8 +250,8 @@ fn sanitize_field(s: &str) -> Cow<'_, str> {
 #[must_use]
 pub fn extract_images(text: &str) -> Vec<Cow<'_, str>> {
     let names = IMAGE_REGEX
-        .captures_iter(text)
-        .filter_map(|c| c.get(1).map(|m| normalize_title(m.as_str())));
+        .find_iter(text)
+        .map(|m| normalize_title(name_after_colon(m.as_str())));
     unique_nonempty(names)
 }
 
@@ -603,5 +630,35 @@ mod tests {
             extract_abstract("Lead text.\n{{Infobox|name=Zoë"),
             "Lead text."
         );
+    }
+
+    /// Text full of the link shapes that make slicing a match risky.
+    const TRICKY_LINKS: &str = "[[Rust]] [[Rust|the language]] [[Paris (band)|]] \
+        [[[[Nested]]]] [[File:X.jpg|thumb|See [[Rust]] here]] [[Image:Y.png]] \
+        [[ Category : Física |sort]] [[category:lower]] [[Category:A|]] \
+        [[Category:Has [bracket]]] [[file:Z [1].svg|caption]] [[]] [[|x]] \
+        [[Zoë#Life|Zoë]] [[:Category:Visible]] [[Unclosed [[Rust]]";
+
+    fn group_one<'a>(re: &Regex, text: &'a str) -> Vec<(usize, &'a str)> {
+        re.captures_iter(text)
+            .map(|c| (c.get(0).unwrap().start(), c.get(1).unwrap().as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn link_targets_match_link_regex_group_one() {
+        let sliced: Vec<_> = link_targets(TRICKY_LINKS).collect();
+        assert_eq!(sliced, group_one(&LINK_REGEX, TRICKY_LINKS));
+    }
+
+    #[test]
+    fn category_and_image_names_match_regex_group_one() {
+        for re in [&*CATEGORY_REGEX, &*IMAGE_REGEX] {
+            let sliced: Vec<_> = re
+                .find_iter(TRICKY_LINKS)
+                .map(|m| (m.start(), name_after_colon(m.as_str())))
+                .collect();
+            assert_eq!(sliced, group_one(re, TRICKY_LINKS));
+        }
     }
 }

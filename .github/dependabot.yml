@@ -1,0 +1,24 @@
+# Weekly pull requests that keep the pinned action SHAs and Cargo.lock current.
+# Each one runs through CI like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # Patch and minor bumps arrive together; a major bump gets its own PR.
+      cargo-compatible:
+        update-types: [minor, patch]
+    ignore:
+      # The crate must match the DuckDB library pinned in
+      # .github/actions/duckdb; bump the two together by hand.
+      - dependency-name: duckdb
