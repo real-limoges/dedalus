@@ -42,19 +42,32 @@ Always build with `cargo build --release` for real runs.
 
 The `duckdb` crate links Homebrew's `libduckdb.dylib` (`brew install duckdb`), which keeps builds fast.
 The crate version must match the library: crate `1.20000.x` wraps DuckDB 2.0.x, so a `brew upgrade` to a new DuckDB minor version needs a matching crate bump.
-CI's Ubuntu runners have no Homebrew, so each job downloads DuckDB's prebuilt `duckdb-shared-libs-linux-amd64.tar.gz` from its GitHub release and sets `DUCKDB_LIB_DIR`, `DUCKDB_INCLUDE_DIR` and `LD_LIBRARY_PATH`, which override `[env]`.
-`DUCKDB_VERSION` in `.github/workflows/ci.yml` must move with the crate.
+CI does not use Homebrew.
+The `.github/actions/duckdb` action downloads DuckDB's prebuilt library for the runner (macOS arm64 or Linux x86-64), checks its SHA-256, and sets `DUCKDB_LIB_DIR`, `DUCKDB_INCLUDE_DIR` and `LD_LIBRARY_PATH`, which override `[env]`.
+On macOS it also rewrites the library's install name to an absolute path and re-signs it, since SIP strips `DYLD_*` variables before they reach the test binaries.
+Its `VERSION` and digests move with the crate; Dependabot is told to leave `duckdb` alone for that reason.
 Nothing compiles DuckDB from source.
 
 ### Build Commands
 
+Every check is a recipe in the `justfile`; the pre-push hook and CI call the recipes, so the commands are written once.
+
 ```bash
-cargo build --release                       # Optimized binary
-cargo test                                  # Unit and integration tests
-cargo clippy --all-targets -- -D warnings   # Lint, tests included
-cargo fmt -- --check                        # Formatting (rustfmt edition 2024)
-git config core.hooksPath .githooks         # Pre-push hook runs all of the above
+cargo build --release                 # Optimized binary
+just lint                             # fmt --check, clippy -D warnings, cargo machete
+just test                             # nextest, then doc tests
+just deny                             # Advisories, licenses, bans, sources (deny.toml)
+just msrv                             # Builds on rust-version from Cargo.toml
+just smoke                            # Release binary through the whole pipeline on tests/fixtures/smoke.xml
+just pre-push                         # lint, deny, test
+git config core.hooksPath .githooks   # Run `just pre-push` before every push
 ```
+
+The tools: `brew install just` and `cargo install --locked cargo-nextest cargo-deny cargo-machete`.
+
+CI (`.github/workflows/ci.yml`) runs lint, deny and MSRV on Linux, tests on both macOS arm64 and Linux x86-64, and the smoke run on macOS.
+It also runs every Monday, since advisories, stable Rust and runner images change without a commit.
+Dependabot (`.github/dependabot.yml`) keeps the SHA-pinned actions and `Cargo.lock` current.
 
 The binary uses `mimalloc` as the global allocator.
 
@@ -173,10 +186,11 @@ The CSVs are the hand-off between passes; the DuckDB file is a queryable copy of
 - **`main.rs`**: CLI entry point (`clap` subcommands), `tracing` setup, `mimalloc` allocator.
 - **`parser.rs`**: `PageParser<R>`, a streaming `quick-xml` state machine implementing `Iterator<Item = WikiPage>`; per-page state is reset on every `<page>`, and a parse error is recorded rather than ending the stream silently.
   `WikiReader` wraps it with bz2 decompression, using `lbzip2` or `pbzip2` from `PATH` when present; `WikiReader::finish` fails on a parser error or a nonzero decompressor exit, and kills the child if reading stopped early.
-- **`multistream.rs`**: parses the multistream index into `StreamRange`s (offsets must increase and lie inside the dump), parses one stream (`parse_stream`) or a run of streams in dump order (`parse_streams`), and finds the index from the dump's name (`detect_index_path`).
+- **`multistream.rs`**: parses the multistream index into `StreamRange`s (offsets must increase and lie inside the dump), parses one stream (`parse_stream`, a positioned read on a dump handle shared by every thread, from `open_dump`) or a run of streams in dump order (`parse_streams`), and finds the index from the dump's name (`detect_index_path`).
 - **`title.rs`**: `normalize_title` (MediaWiki canonical form: drop the `#anchor` and a leading `:`, `_` to space, collapse whitespace, uppercase the first character) and `is_namespace_link` (case-insensitive).
   The index stores and looks up titles in this form.
-- **`index.rs`**: `WikiIndex`; `resolve_id` normalizes the title and follows redirects up to `REDIRECT_MAX_DEPTH` (5) hops.
+- **`index.rs`**: `WikiIndex`; `WikiIndex::new` follows every redirect chain once, up to `REDIRECT_MAX_DEPTH` (5) hops, and keeps each redirect's final page id (unresolvable redirects are dropped).
+  `resolve_id` normalizes the title and makes at most two hash lookups; `resolve_canonical` skips the normalizing for a title already in canonical form.
 - **`extract.rs`**: `ShardedCsvWriter` (rows to `page_id % csv_shards`), `CsvOutputs`, the `Extractor` that turns one page into rows and a blob, `PageSource` (sequential or multistream chunks), `run_extraction_with_stats` (returns `ExtractionEnd::Completed` or `Cancelled`), and `run_extract_job`, the shared entry point for the CLI and the TUI.
   Outputs `nodes`, `edges` (LINKS_TO or SEE_ALSO), `categories`, `article_categories`, `image_nodes`, `article_images`, `external_link_nodes`, `article_external_links` (each `[_NNN].csv`) and `blobs/{shard:03}/{id}.json`.
   A fresh run removes CSVs from an earlier run that it will not overwrite.
@@ -191,8 +205,8 @@ The CSVs are the hand-off between passes; the DuckDB file is a queryable copy of
 - **`infobox.rs`**: brace-matching `{{Infobox ...}}` parser; fields split only at template and link depth zero.
 - **`models.rs`**: `WikiPage`, `PageType`, `EdgeType`, `ArticleBlob` (empty fields skipped in JSON).
 - **`stats.rs`**: `ExtractionStats`, atomic counters with checkpoint round-tripping.
-- **`cache.rs`**: `index.cache` via `bincode`, validated against the input's mtime and size and `CACHE_VERSION`.
-- **`config.rs`**: constants: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `DEFAULT_CSV_SHARDS` (8), `CHECKPOINT_INTERVAL` (10000), `PAGES_PER_STREAM` (100), `CACHE_VERSION` (3), `CHECKPOINT_VERSION` (4), buffer sizes, `PAGERANK_ITERATIONS` (20), `PAGERANK_DAMPING` (0.85), `PAGERANK_EPSILON` (1e-6), `LABEL_PROPAGATION_MAX_ITERATIONS` (50).
+- **`cache.rs`**: `index.cache` via `postcard`, validated against the input's mtime and size and `CACHE_VERSION`.
+- **`config.rs`**: constants: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `DEFAULT_CSV_SHARDS` (8), `CHECKPOINT_INTERVAL` (10000), `PAGES_PER_STREAM` (100), `CACHE_VERSION` (4), `CHECKPOINT_VERSION` (4), buffer sizes, `PAGERANK_ITERATIONS` (20), `PAGERANK_DAMPING` (0.85), `PAGERANK_EPSILON` (1e-6), `LABEL_PROPAGATION_MAX_ITERATIONS` (50).
 - **`tui/`**: `ratatui` + `crossterm`.
   `mod.rs` runs the event loop and restores the terminal on exit and on panic; `app.rs` holds state and validation; `runner.rs` runs each operation on a worker thread that always reports completion, even after a panic; `ui.rs` draws forms, stats, the log and the done screen; `logging.rs` captures `tracing` output; `event.rs` polls input.
 
@@ -225,7 +239,7 @@ Sharded extraction is faster (about 1.6x with 14 shards in earlier benchmarks), 
 - `indicatif`: progress spinners
 - `tracing` / `tracing-subscriber`: logging
 - `anyhow`: errors with context
-- `bincode`: index cache and checkpoints
+- `postcard`: index cache and checkpoints
 - `dashmap`: concurrent deduplication sets
 - `rustc-hash`: `FxHashMap` / `FxHashSet`
 - `duckdb`: DuckDB client (links Homebrew's library locally, DuckDB's prebuilt release in CI)
@@ -234,13 +248,7 @@ Sharded extraction is faster (about 1.6x with 14 shards in earlier benchmarks), 
 
 ## Testing
 
-All of these must pass before committing:
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt -- --check
-```
+`just pre-push` must pass before committing; CI adds `just msrv` and `just smoke`.
 
 - **Unit tests**: inline in most modules (parser, multistream, title, index, extract, checkpoint, cache, atomic_file, stats, csv_util, merge, analytics, load, content, infobox, models, tui/ui).
 - **`tests/integration_test.rs`**: parsing, indexing, exact edges, blobs and abstracts, sharding, crash-and-resume equivalence, exact limits, and a round trip from extract through merge, analytics and load into DuckDB.

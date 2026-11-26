@@ -14,7 +14,6 @@ use crate::cache;
 use crate::checkpoint::{self, Checkpoint, CheckpointManager, ResumePoint, RunIdentity};
 use crate::config::{CSV_WRITER_BUF_SIZE, PAGES_PER_STREAM};
 use crate::content;
-use crate::content::LINK_REGEX;
 use crate::csv_util::CsvType;
 use crate::index::WikiIndex;
 use crate::infobox;
@@ -236,13 +235,12 @@ fn process_article_edges(
     let mut local_edges: Vec<(u32, EdgeType)> = Vec::with_capacity(16);
     let mut invalid_count = 0u64;
 
-    for caps in LINK_REGEX.captures_iter(text) {
-        let target_title = normalize_title(&caps[1]);
+    for (link_start, raw_target) in content::link_targets(text) {
+        let target_title = normalize_title(raw_target);
         if target_title.is_empty() || is_namespace_link(&target_title) {
             continue;
         }
-        if let Some(target_id) = index.resolve_id(&target_title) {
-            let link_start = caps.get(0).map_or(0, |m| m.start());
+        if let Some(target_id) = index.resolve_canonical(&target_title) {
             let edge_type = match &see_also {
                 Some(section) if section.contains(&link_start) => EdgeType::SeeAlso,
                 _ => EdgeType::LinksTo,
@@ -388,8 +386,7 @@ impl Extractor<'_> {
             let mut end_buf = itoa::Buffer::new();
             let mut writer = self.csv.edges.shard_for(page.id)?;
             for (end_id, edge_type) in &edges {
-                let type_str = edge_type.to_string();
-                writer.write_record([id_str, end_buf.format(*end_id), &type_str])?;
+                writer.write_record([id_str, end_buf.format(*end_id), edge_type.as_str()])?;
             }
         }
 
@@ -924,6 +921,7 @@ fn load_or_build_index(job: &ExtractJob, ranges: Option<&[StreamRange]>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::LINK_REGEX;
 
     #[test]
     fn link_regex_simple_link() {
@@ -1000,7 +998,7 @@ mod tests {
             .into_iter()
             .map(|(t, id)| (t.to_string(), id))
             .collect();
-        WikiIndex::from_maps(articles, Default::default())
+        WikiIndex::new(articles, Default::default())
     }
 
     fn edges_of(text: &str) -> (Vec<(u32, EdgeType)>, u64) {

@@ -13,7 +13,6 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.102"
-bincode = "1.3.3"
 bzip2 = "0.6.1"
 clap = { version = "4.6.0", features = ["derive"] }
 crossterm = "0.29.0"
@@ -25,7 +24,8 @@ itoa = "1"
 memchr = "2"
 mimalloc = "0.1"
 once_cell = "1.21.4"
-quick-xml = { version = "0.31", features = ["serialize"] }
+postcard = { version = "1.2.0", default-features = false, features = ["use-std"] }
+quick-xml = "0.42"
 ratatui = "0.30.0"
 rayon = "1.11.0"
 regex = "1.12.3"
@@ -45,3 +45,11 @@ lto = true
 panic = 'abort'
 overflow-checks = false
 strip = true
+
+# The release build plus symbols, for samply:
+#   cargo build --profile profiling
+#   samply record target/profiling/dedalus analytics -o output/
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false

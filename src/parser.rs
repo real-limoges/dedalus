@@ -7,8 +7,11 @@
 use crate::models::{PageType, WikiPage};
 use anyhow::{Context, Result};
 use bzip2::read::MultiBzDecoder;
+use quick_xml::XmlVersion;
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -45,6 +48,10 @@ impl Read for DecompressSource {
 pub struct PageParser<R: Read> {
     reader: Reader<BufReader<R>>,
     buf: Vec<u8>,
+    /// The escaped text of the field being read. quick-xml reports an entity
+    /// such as `&amp;` as its own event between pieces of text, so a field's
+    /// text is gathered here and decoded once, at its closing tag.
+    field_text: String,
     skip_text: bool,
     pub(crate) skip_timestamp: bool,
     reached_eof: bool,
@@ -75,6 +82,13 @@ struct PageFields {
 }
 
 impl PageFields {
+    /// False once the page has shown it will not be an article: a namespace
+    /// other than 0, or a `<redirect>`. Both come before `<text>` in a dump,
+    /// so the text of such a page need not be decoded at all.
+    fn may_be_article(&self) -> bool {
+        self.redirect_target.is_none() && matches!(self.ns, None | Some(0))
+    }
+
     /// Builds the page, or `None` if the id or title is missing.
     fn into_page(self) -> Option<WikiPage> {
         let id = self.id?;
@@ -107,11 +121,14 @@ impl<R: Read> PageParser<R> {
     pub fn new(source: R, skip_text: bool) -> Self {
         let buf_reader = BufReader::with_capacity(256 * 1024, source);
         let mut xml_reader = Reader::from_reader(buf_reader);
-        xml_reader.check_end_names(false);
-        xml_reader.trim_text(true);
+        // Text is trimmed per field in `store_field`, not here: the reader
+        // trims each piece of text on its own, which would drop the spaces
+        // around an entity (`a &amp; b`).
+        xml_reader.config_mut().check_end_names = false;
         Self {
             reader: xml_reader,
             buf: Vec::with_capacity(crate::config::BUFREADER_CAPACITY),
+            field_text: String::new(),
             skip_text,
             skip_timestamp: false,
             reached_eof: false,
@@ -139,20 +156,41 @@ impl<R: Read> PageParser<R> {
 
 /// Which element's text to capture, given the parser's skip settings.
 fn field_for(
-    name: &[u8],
+    name: &str,
     fields: &PageFields,
     skip_text: bool,
     skip_timestamp: bool,
 ) -> Option<Field> {
     match name {
-        b"title" => Some(Field::Title),
+        "title" => Some(Field::Title),
         // The first <id> in a page is the page id; later ones belong to
         // the revision and contributor.
-        b"id" if fields.id.is_none() => Some(Field::Id),
-        b"ns" => Some(Field::Ns),
-        b"timestamp" if !skip_timestamp => Some(Field::Timestamp),
-        b"text" if !skip_text => Some(Field::Text),
+        "id" if fields.id.is_none() => Some(Field::Id),
+        "ns" => Some(Field::Ns),
+        "timestamp" if !skip_timestamp => Some(Field::Timestamp),
+        "text" if !skip_text && fields.may_be_article() => Some(Field::Text),
         _ => None,
+    }
+}
+
+fn is_xml_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Stores one field's gathered text, still escaped, into `fields`. Text that
+/// is empty after trimming leaves the field unset, and so does text with an
+/// entity that cannot be decoded.
+fn store_field(field: Field, escaped: &str, fields: &mut PageFields) {
+    let escaped = escaped.trim_matches(is_xml_whitespace);
+    if escaped.is_empty() {
+        return;
+    }
+    match field {
+        Field::Title => fields.title = unescape(escaped).ok().map(Cow::into_owned),
+        Field::Id => fields.id = escaped.parse().ok(),
+        Field::Ns => fields.ns = escaped.parse().ok(),
+        Field::Timestamp => fields.timestamp = Some(escaped.to_string()),
+        Field::Text => fields.text = unescape(escaped).ok().map(Cow::into_owned),
     }
 }
 
@@ -160,9 +198,9 @@ fn field_for(
 /// (`AT&amp;T` becomes `AT&T`).
 fn redirect_title(e: &quick_xml::events::BytesStart<'_>) -> Option<String> {
     let attr = e.try_get_attribute("title").ok()??;
-    let title = match attr.unescape_value() {
+    let title = match attr.normalized_value(XmlVersion::Implicit1_0) {
         Ok(value) => value.into_owned(),
-        Err(_) => String::from_utf8_lossy(&attr.value).into_owned(),
+        Err(_) => attr.value.into_owned(),
     };
     Some(title)
 }
@@ -184,46 +222,47 @@ impl<R: Read> Iterator for PageParser<R> {
             self.buf.clear();
             match self.reader.read_event_into(&mut self.buf) {
                 Ok(Event::Start(e)) => match e.name().as_ref() {
-                    b"page" => {
+                    "page" => {
                         fields = PageFields::default();
                         reading = None;
                     }
-                    b"redirect" => fields.redirect_target = redirect_title(&e),
+                    "redirect" => fields.redirect_target = redirect_title(&e),
                     name => {
                         reading = field_for(name, &fields, self.skip_text, self.skip_timestamp);
+                        self.field_text.clear();
                     }
                 },
 
                 Ok(Event::Empty(e)) => {
-                    if e.name().as_ref() == b"redirect" {
+                    if e.name().as_ref() == "redirect" {
                         fields.redirect_target = redirect_title(&e);
                     }
                 }
 
-                Ok(Event::Text(e)) => match reading {
-                    Some(Field::Title) => fields.title = e.unescape().ok().map(|s| s.into_owned()),
-                    Some(Field::Id) => {
-                        fields.id = str::from_utf8(&e).ok().and_then(|s| s.trim().parse().ok());
+                Ok(Event::Text(e)) => {
+                    if reading.is_some() {
+                        self.field_text.push_str(&e);
                     }
-                    Some(Field::Ns) => {
-                        fields.ns = str::from_utf8(&e).ok().and_then(|s| s.trim().parse().ok());
+                }
+
+                // Kept in escaped form so the whole field decodes in one pass.
+                Ok(Event::GeneralRef(e)) => {
+                    if reading.is_some() {
+                        self.field_text.push('&');
+                        self.field_text.push_str(&e);
+                        self.field_text.push(';');
                     }
-                    Some(Field::Timestamp) => {
-                        fields.timestamp = str::from_utf8(&e).ok().map(str::to_string);
-                    }
-                    Some(Field::Text) => fields.text = e.unescape().ok().map(|s| s.into_owned()),
-                    None => {}
-                },
+                }
 
                 Ok(Event::End(e)) => {
-                    if e.name().as_ref() == b"page" {
+                    if let Some(field) = reading.take() {
+                        store_field(field, &self.field_text, &mut fields);
+                    }
+                    if e.name().as_ref() == "page" {
                         let page = std::mem::take(&mut fields).into_page();
-                        reading = None;
                         if page.is_some() {
                             return page;
                         }
-                    } else {
-                        reading = None;
                     }
                 }
 
@@ -603,6 +642,39 @@ mod tests {
     }
 
     #[test]
+    fn text_is_kept_only_for_pages_that_may_be_articles() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Article</title><ns>0</ns><id>1</id>
+                <revision><id>100</id><text>Body</text></revision>
+            </page>
+            <page>
+                <title>Old Name</title><ns>0</ns><id>2</id>
+                <redirect title="Article" />
+                <revision><id>200</id><text>#REDIRECT [[Article]]</text></revision>
+            </page>
+            <page>
+                <title>Template:Box</title><ns>10</ns><id>3</id>
+                <revision><id>300</id><text>{{{1}}}</text></revision>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 3);
+        assert_eq!(pages[0].text.as_deref(), Some("Body"));
+        assert_eq!(
+            pages[1].page_type,
+            PageType::Redirect("Article".to_string())
+        );
+        assert_eq!(pages[1].text, None);
+        assert_eq!(pages[2].page_type, PageType::Special);
+        assert_eq!(pages[2].text, None);
+    }
+
+    #[test]
     fn parse_unicode_content() {
         let xml = r#"<mediawiki>
             <page>
@@ -636,6 +708,31 @@ mod tests {
 
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].title, "AT&T");
+    }
+
+    #[test]
+    fn entities_in_text_keep_surrounding_spaces() {
+        let xml = r#"<mediawiki>
+            <page>
+                <title>Rock &amp; roll</title>
+                <ns>0</ns>
+                <id>1</id>
+                <text>
+                  Tom &amp; Jerry &lt;b&gt; caf&#233; &#x2014; end
+                </text>
+            </page>
+        </mediawiki>"#;
+
+        let tmp = create_bz2_xml(xml);
+        let reader = WikiReader::new(tmp.path().to_str().unwrap(), false).unwrap();
+        let pages: Vec<_> = reader.collect();
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].title, "Rock & roll");
+        assert_eq!(
+            pages[0].text.as_deref(),
+            Some("Tom & Jerry <b> café \u{2014} end")
+        );
     }
 
     #[test]

@@ -15,12 +15,15 @@ pub const SHARD_COUNT: u32 = 1000;
 pub const PROGRESS_INTERVAL: u32 = 1000;
 
 /// Index cache format version. Bump when the format or the key form changes
-/// (version 3: titles are stored in `title::normalize_title` form).
-pub const CACHE_VERSION: u32 = 3;
+/// (version 3: titles are stored in `title::normalize_title` form; version 4:
+/// redirects are stored resolved to page ids; version 5: postcard replaces
+/// bincode).
+pub const CACHE_VERSION: u32 = 5;
 
 /// Checkpoint format version. Bump when the format changes
-/// (version 4: resume points, CSV lengths and run identity).
-pub const CHECKPOINT_VERSION: u32 = 4;
+/// (version 4: resume points, CSV lengths and run identity; version 5:
+/// postcard replaces bincode).
+pub const CHECKPOINT_VERSION: u32 = 5;
 
 /// Pages per extraction chunk. A checkpoint is saved after every chunk.
 pub const CHECKPOINT_INTERVAL: u32 = 10_000;

@@ -1,0 +1,8 @@
+# nextest profiles. `just test` uses default; CI runs `just test ci`.
+
+[profile.ci]
+# Report every failing test, not only the first.
+fail-fast = false
+# Flag a test as slow after a minute and kill it after five, so a hang fails
+# the run with a name attached instead of running into the job timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }

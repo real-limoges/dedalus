@@ -42,13 +42,33 @@ pub fn normalize_title(raw: &str) -> Cow<'_, str> {
         return Cow::Borrowed(without_anchor);
     }
 
-    let spaced = without_anchor.replace('_', " ");
-    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let without_colon = collapsed
+    Cow::Owned(canonicalize(without_anchor))
+}
+
+/// The slow path of `normalize_title`, built in one `String`: words split at
+/// `_` and whitespace, joined by single spaces, one leading `:` dropped, and
+/// the first character uppercased.
+fn canonicalize(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let words = title
+        .split(|c: char| c == '_' || c.is_whitespace())
+        .filter(|word| !word.is_empty());
+    for word in words {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    let colon_and_space = out
         .strip_prefix(':')
-        .unwrap_or(&collapsed)
-        .trim_start();
-    Cow::Owned(uppercase_first(without_colon))
+        .map(|rest| out.len() - rest.trim_start().len());
+    if let Some(len) = colon_and_space {
+        out.drain(..len);
+    }
+    if let Some(first) = out.chars().next() {
+        out.replace_range(..first.len_utf8(), &first.to_uppercase().to_string());
+    }
+    out
 }
 
 /// `normalize_title` for an owned title, reusing its allocation when the
@@ -83,25 +103,26 @@ pub fn is_namespace_link(title: &str) -> bool {
     }
 }
 
-/// True if `normalize_title` would leave this (anchor-free) title unchanged.
+/// True if `normalize_title` would leave this (anchor-free) title unchanged:
+/// it does not start with a lowercase letter, whitespace or `:`, and has no
+/// `_`, no whitespace other than single spaces, and no trailing space.
+/// One pass over the title, since nearly every title from the dump is canonical.
 fn is_canonical(title: &str) -> bool {
-    let starts_cleanly = match title.chars().next() {
-        None => true,
-        Some(first) => !first.is_lowercase() && !first.is_whitespace() && first != ':',
+    let mut chars = title.chars();
+    let Some(first) = chars.next() else {
+        return true;
     };
-    starts_cleanly
-        && !title.ends_with(char::is_whitespace)
-        && !title.contains('_')
-        && !title.contains("  ")
-        && !title.contains(|c: char| c.is_whitespace() && c != ' ')
-}
-
-fn uppercase_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
+    if first.is_lowercase() || first.is_whitespace() || first == ':' || first == '_' {
+        return false;
     }
+    let mut after_space = false;
+    for c in chars {
+        if c == '_' || (c.is_whitespace() && (c != ' ' || after_space)) {
+            return false;
+        }
+        after_space = c == ' ';
+    }
+    !after_space
 }
 
 #[cfg(test)]
@@ -176,5 +197,76 @@ mod tests {
         assert!(!is_namespace_link("Rust"));
         assert!(!is_namespace_link("Star Wars: A New Hope"));
         assert!(!is_namespace_link("Mission: Impossible"));
+    }
+
+    /// The earlier, multi-allocation `normalize_title`, kept as the reference
+    /// the single-pass version must agree with.
+    fn reference_normalize(raw: &str) -> String {
+        let without_anchor = raw.split('#').next().unwrap_or(raw);
+        let starts_cleanly = match without_anchor.chars().next() {
+            None => true,
+            Some(first) => !first.is_lowercase() && !first.is_whitespace() && first != ':',
+        };
+        if starts_cleanly
+            && !without_anchor.ends_with(char::is_whitespace)
+            && !without_anchor.contains('_')
+            && !without_anchor.contains("  ")
+            && !without_anchor.contains(|c: char| c.is_whitespace() && c != ' ')
+        {
+            return without_anchor.to_string();
+        }
+        let spaced = without_anchor.replace('_', " ");
+        let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+        let without_colon = collapsed
+            .strip_prefix(':')
+            .unwrap_or(&collapsed)
+            .trim_start();
+        let mut chars = without_colon.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect(),
+            None => String::new(),
+        }
+    }
+
+    #[test]
+    fn normalize_title_agrees_with_the_reference() {
+        let inputs = [
+            "",
+            " ",
+            "_",
+            ":",
+            "::Foo",
+            ": foo",
+            " :foo",
+            "foo",
+            "Foo",
+            "foo_bar  baz ",
+            "\tfoo\nbar",
+            "Foo\u{a0}Bar",
+            "Foo  Bar",
+            "Foo ",
+            " Foo",
+            "_Foo",
+            "Foo_",
+            "ß-Bahn",
+            "ǆungla",
+            "ÿ",
+            "élan vital",
+            "Rust#History",
+            "#Anchor",
+            "Foo:bar",
+            "Category:physics",
+            "a",
+            "1st",
+            "İstanbul",
+            "ǅ",
+        ];
+        for raw in inputs {
+            assert_eq!(
+                normalize_title(raw),
+                reference_normalize(raw),
+                "input {raw:?}"
+            );
+        }
     }
 }

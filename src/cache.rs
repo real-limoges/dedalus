@@ -1,4 +1,4 @@
-//! Index persistence using `bincode` serialization.
+//! Index persistence using `postcard` serialization.
 //!
 //! Saves and loads `WikiIndex` as `index.cache`, validating against input file
 //! mtime and size. Uses zero-copy serialization via `IndexCacheSer` to avoid
@@ -8,11 +8,9 @@ use crate::atomic_file::write_atomically;
 use crate::config::CACHE_VERSION;
 use crate::index::WikiIndex;
 use anyhow::{Context, Result};
-use bincode::Options;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{info, warn};
@@ -28,11 +26,14 @@ pub struct CacheMetadata {
     pub redirect_count: usize,
 }
 
+/// The cache as read back. postcard writes a map exactly as it writes a
+/// sequence of pairs, so the maps are read as `Vec`s and then built with
+/// their exact capacity, rather than grown (and rehashed) one entry at a time.
 #[derive(Deserialize)]
 struct IndexCacheDe {
     metadata: CacheMetadata,
-    articles: FxHashMap<String, u32>,
-    redirects: FxHashMap<String, String>,
+    articles: Vec<(String, u32)>,
+    redirects: Vec<(String, u32)>,
 }
 
 /// Borrows the index data to avoid cloning ~17M strings during serialization.
@@ -40,7 +41,13 @@ struct IndexCacheDe {
 struct IndexCacheSer<'a> {
     metadata: CacheMetadata,
     articles: &'a FxHashMap<String, u32>,
-    redirects: &'a FxHashMap<String, String>,
+    redirects: &'a FxHashMap<String, u32>,
+}
+
+fn to_map(pairs: Vec<(String, u32)>) -> FxHashMap<String, u32> {
+    let mut map = FxHashMap::with_capacity_and_hasher(pairs.len(), Default::default());
+    map.extend(pairs);
+    map
 }
 
 /// Returns the path to the index cache file for a given output directory.
@@ -68,15 +75,19 @@ pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<Wiki
         return Ok(None);
     }
 
-    let file_size = fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+    // Decoding from the whole file bounds every length prefix by the file's
+    // size, so a corrupt cache cannot ask for an outsized allocation.
+    let bytes = fs::read(cache_path).context("Failed to read cache file")?;
 
-    let file = File::open(cache_path).context("Failed to open cache file")?;
-    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
-
-    let options = bincode::options().with_limit(file_size.saturating_add(1024));
-
-    let cache: IndexCacheDe = match options.deserialize_from(reader) {
-        Ok(c) => c,
+    let cache: IndexCacheDe = match postcard::take_from_bytes(&bytes) {
+        Ok((c, [])) => c,
+        Ok((_, rest)) => {
+            warn!(
+                trailing_bytes = rest.len(),
+                "Cache file has bytes after the index"
+            );
+            return Ok(None);
+        }
         Err(e) => {
             warn!(error = %e, "Cache file is corrupt or unreadable");
             return Ok(None);
@@ -119,7 +130,10 @@ pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<Wiki
         "Index loaded from cache"
     );
 
-    Ok(Some(WikiIndex::from_maps(cache.articles, cache.redirects)))
+    Ok(Some(WikiIndex::from_resolved(
+        to_map(cache.articles),
+        to_map(cache.redirects),
+    )))
 }
 
 /// Serializes the index by reference (no cloning) and writes atomically via rename.
@@ -149,8 +163,8 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
     };
 
     write_atomically(&path, |writer| {
-        bincode::DefaultOptions::new()
-            .serialize_into(writer, &cache)
+        postcard::to_io(&cache, writer)
+            .map(|_| ())
             .context("Failed to serialize index cache")
     })?;
 
@@ -167,6 +181,7 @@ pub fn save_index(index: &WikiIndex, input_path: &str, output_dir: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -182,9 +197,13 @@ mod tests {
     }
 
     fn create_test_index() -> WikiIndex {
-        WikiIndex::from_serializable(
-            vec![("Article1".to_string(), 1), ("Article2".to_string(), 2)],
-            vec![("Redirect1".to_string(), "Article1".to_string())],
+        WikiIndex::new(
+            [("Article1".to_string(), 1), ("Article2".to_string(), 2)]
+                .into_iter()
+                .collect(),
+            [("Redirect1".to_string(), "Article1".to_string())]
+                .into_iter()
+                .collect(),
         )
     }
 
@@ -288,9 +307,27 @@ mod tests {
         let cache_file = dir.path().join("index.cache");
 
         let mut file = File::create(&cache_file).unwrap();
-        file.write_all(b"not valid bincode data").unwrap();
+        file.write_all(b"not valid postcard data").unwrap();
 
         assert!(!is_cache_valid(&cache_file, "/some/input"));
+    }
+
+    #[test]
+    fn is_cache_valid_returns_false_for_trailing_bytes() {
+        let dir = TempDir::new().unwrap();
+        let input_path = create_test_input(&dir);
+        let input_str = input_path.to_str().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        save_index(&create_test_index(), input_str, output_dir).unwrap();
+        let cache_file = cache_path(output_dir);
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&cache_file)
+            .unwrap();
+        file.write_all(b"extra").unwrap();
+
+        assert!(!is_cache_valid(&cache_file, input_str));
     }
 
     #[test]

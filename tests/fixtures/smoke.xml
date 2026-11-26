@@ -1,0 +1,50 @@
+<mediawiki>
+  <page>
+    <title>Rust (programming language)</title>
+    <ns>0</ns>
+    <id>1</id>
+    <revision>
+      <id>101</id>
+      <timestamp>2024-01-15T10:30:00Z</timestamp>
+      <text>Rust is a systems programming language developed by [[Mozilla]], often compared with [[Python (programming language)|Python]].
+
+== See also ==
+* [[Python (programming language)]]
+
+[[Category:Programming languages]]</text>
+    </revision>
+  </page>
+  <page>
+    <title>Python (programming language)</title>
+    <ns>0</ns>
+    <id>2</id>
+    <revision>
+      <id>102</id>
+      <timestamp>2024-01-15T10:31:00Z</timestamp>
+      <text>Python is a high-level language. Its interpreter has parts written in [[Rust lang]].
+
+[[Category:Programming languages]]</text>
+    </revision>
+  </page>
+  <page>
+    <title>Mozilla</title>
+    <ns>0</ns>
+    <id>3</id>
+    <revision>
+      <id>103</id>
+      <timestamp>2024-01-15T10:32:00Z</timestamp>
+      <text>Mozilla sponsored the early development of [[Rust (programming language)|Rust]] &amp; Firefox.</text>
+    </revision>
+  </page>
+  <page>
+    <title>Rust lang</title>
+    <ns>0</ns>
+    <id>4</id>
+    <redirect title="Rust (programming language)" />
+    <revision>
+      <id>104</id>
+      <timestamp>2024-01-15T10:33:00Z</timestamp>
+      <text>#REDIRECT [[Rust (programming language)]]</text>
+    </revision>
+  </page>
+</mediawiki>

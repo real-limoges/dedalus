@@ -32,7 +32,8 @@ pub struct WikiPage {
     pub id: u32,
     pub title: String,
     pub page_type: PageType,
-    /// `None` during the indexing pass (skip_text mode).
+    /// `None` during the indexing pass (skip_text mode), and for redirects and
+    /// pages outside namespace 0, whose text is never used.
     pub text: Option<String>,
     /// Namespace number from `<ns>` tag.
     pub ns: Option<i32>,
@@ -47,12 +48,20 @@ pub enum EdgeType {
     SeeAlso,
 }
 
+impl EdgeType {
+    /// The `:TYPE` value written to `edges.csv`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EdgeType::LinksTo => "LINKS_TO",
+            EdgeType::SeeAlso => "SEE_ALSO",
+        }
+    }
+}
+
 impl fmt::Display for EdgeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EdgeType::LinksTo => f.write_str("LINKS_TO"),
-            EdgeType::SeeAlso => f.write_str("SEE_ALSO"),
-        }
+        f.write_str(self.as_str())
     }
 }
 

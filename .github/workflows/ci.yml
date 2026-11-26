@@ -1,80 +1,141 @@
 name: CI
 
+# Every job runs a recipe from the justfile, so the commands live there and
+# the pre-push hook runs the same ones.
+#
+# The weekly run catches what changes without a commit: new RustSec
+# advisories, a new stable Rust with new clippy lints, a runner image update.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
 
-# The runners have no Homebrew DuckDB, so each job that compiles downloads
-# DuckDB's prebuilt Linux library from its GitHub release. These variables
-# override the Homebrew paths in .cargo/config.toml (a value already set in
-# the environment wins over [env]). DUCKDB_VERSION must match the duckdb crate:
-# crate 1.20000.x wraps DuckDB 2.0.x.
-#
-# RUSTFLAGS overrides the target-cpu=native in .cargo/config.toml. Runners vary
-# in CPU, and a proc-macro cached from a newer one dies with SIGILL on an older
-# one. rust-cache hashes RUSTFLAGS into its key, so changing it drops old caches.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run; runs on main finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Overrides target-cpu=native from .cargo/config.toml. A runner pool mixes
+  # CPU generations, and a build script or proc-macro cached from a newer one
+  # dies with SIGILL on an older one. The macOS jobs set their own baseline.
   RUSTFLAGS: -C target-cpu=x86-64-v2
-  DUCKDB_VERSION: 2.0.0
-  DUCKDB_LIB_DIR: /home/runner/libduckdb
-  DUCKDB_INCLUDE_DIR: /home/runner/libduckdb
-  LD_LIBRARY_PATH: /home/runner/libduckdb
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt
-      - run: cargo fmt -- --check
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: ./.github/actions/duckdb
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just,cargo-machete
+      - run: just lint
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libduckdb
-        run: |
-          mkdir -p "$DUCKDB_LIB_DIR"
-          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
-            | tar -xz -C "$DUCKDB_LIB_DIR"
-      - run: cargo clippy --all-targets -- -D warnings
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just,cargo-deny
+      - run: just deny
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Where dedalus runs. apple-m1 is the baseline every Apple Silicon
+          # runner meets, for the same reason as the x86-64-v2 above.
+          - name: macOS arm64
+            os: macos-15
+            rustflags: -C target-cpu=apple-m1
+            lbzip2: brew install lbzip2
+          - name: Linux x86-64
+            os: ubuntu-24.04
+            rustflags: -C target-cpu=x86-64-v2
+            lbzip2: sudo apt-get install --yes lbzip2
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libduckdb
-        run: |
-          mkdir -p "$DUCKDB_LIB_DIR"
-          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
-            | tar -xz -C "$DUCKDB_LIB_DIR"
-      - run: cargo test --verbose
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/duckdb
+      # Real runs decompress with lbzip2 when it is on PATH, so the tests do too.
+      - name: Install lbzip2
+        run: ${{ matrix.lbzip2 }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just,cargo-nextest
+      - run: just test ci
 
-  build:
-    name: Build (release)
-    runs-on: ubuntu-latest
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libduckdb
-        run: |
-          mkdir -p "$DUCKDB_LIB_DIR"
-          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb-shared-libs-linux-amd64.tar.gz" \
-            | tar -xz -C "$DUCKDB_LIB_DIR"
-      - run: cargo build --release
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/duckdb
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just
+      # The recipe installs the toolchain named by rust-version in Cargo.toml.
+      - run: just msrv
+
+  smoke:
+    name: Release smoke run
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -C target-cpu=apple-m1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/duckdb
+      - name: Install lbzip2
+        run: brew install lbzip2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just
+      - run: just smoke

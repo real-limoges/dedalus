@@ -1,22 +1,12 @@
 #!/usr/bin/env bash
+# Lint, dependency check and tests before every push: `just pre-push`.
+# CI runs the same recipes, plus macOS and Linux, the minimum Rust version
+# and a release smoke run. Enable with: git config core.hooksPath .githooks
 set -euo pipefail
 
-echo "Running pre-push checks..."
+if ! command -v just > /dev/null; then
+    echo "pre-push: needs just (brew install just)" >&2
+    exit 1
+fi
 
-echo "1/4 Checking formatting..."
-cargo fmt -- --check
-echo "     Formatting OK"
-
-echo "2/4 Running clippy..."
-cargo clippy --all-targets -- -D warnings
-echo "     Clippy OK"
-
-echo "3/4 Building..."
-cargo build --release
-echo "     Build OK"
-
-echo "4/4 Running tests..."
-cargo test --verbose
-echo "     Tests OK"
-
-echo "All checks passed. Pushing."
+exec just pre-push

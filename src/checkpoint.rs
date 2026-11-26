@@ -13,10 +13,8 @@ use crate::atomic_file::write_atomically;
 use crate::config::CHECKPOINT_VERSION;
 use crate::stats::ExtractionStats;
 use anyhow::{Context, Result};
-use bincode::Options;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
@@ -114,13 +112,19 @@ pub fn load_if_valid(identity: &RunIdentity) -> Result<Option<Checkpoint>> {
         return Ok(None);
     }
 
-    let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let file = File::open(&path).context("Failed to open checkpoint file")?;
-    let reader = BufReader::with_capacity(crate::config::BUFREADER_CAPACITY, file);
-    let options = bincode::options().with_limit(file_size.saturating_add(1024));
+    // Decoding from the whole file bounds every length prefix by the file's
+    // size, so a corrupt checkpoint cannot ask for an outsized allocation.
+    let bytes = fs::read(&path).context("Failed to read checkpoint file")?;
 
-    let checkpoint: Checkpoint = match options.deserialize_from(reader) {
-        Ok(c) => c,
+    let checkpoint: Checkpoint = match postcard::take_from_bytes(&bytes) {
+        Ok((c, [])) => c,
+        Ok((_, rest)) => {
+            warn!(
+                trailing_bytes = rest.len(),
+                "Checkpoint file has bytes after the checkpoint"
+            );
+            return Ok(None);
+        }
         Err(e) => {
             warn!(error = %e, "Checkpoint file is corrupt or from an older version");
             return Ok(None);
@@ -195,8 +199,8 @@ impl CheckpointManager {
         };
 
         write_atomically(&checkpoint_path(&self.identity.output_dir), |writer| {
-            bincode::DefaultOptions::new()
-                .serialize_into(writer, &checkpoint)
+            postcard::to_io(&checkpoint, writer)
+                .map(|_| ())
                 .context("Failed to serialize checkpoint")
         })?;
 
@@ -213,6 +217,7 @@ impl CheckpointManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -351,7 +356,7 @@ mod tests {
         let checkpoint_file = checkpoint_path(output_dir);
 
         let mut file = File::create(&checkpoint_file).unwrap();
-        file.write_all(b"not valid bincode").unwrap();
+        file.write_all(b"not valid postcard").unwrap();
 
         let id = identity(&input_path, output_dir, 1000);
         assert!(load_if_valid(&id).unwrap().is_none());

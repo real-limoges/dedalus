@@ -12,7 +12,6 @@ use crate::csv_util::{self, CsvLayout, CsvType};
 use crate::models::EdgeType;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 use std::path::Path;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -212,61 +211,114 @@ fn build_graph(output_dir: &str) -> Result<GraphBuild> {
     })
 }
 
+/// Wiki page id to dense node index, as a `Vec` indexed by wiki id.
+///
+/// Page ids are dense enough (about 80M at most for 7M articles) that an
+/// array lookup beats hashing on the hundreds of millions of lookups the
+/// graph build makes. Only `insert` and `get` touch the array, so the marker
+/// for "no node" never leaves this type.
+struct DenseIds {
+    dense_by_wiki: Vec<u32>,
+}
+
+impl DenseIds {
+    const ABSENT: u32 = u32::MAX;
+
+    fn new() -> Self {
+        Self {
+            dense_by_wiki: Vec::new(),
+        }
+    }
+
+    /// Records `wiki_id` as node `dense`. Returns `false`, changing nothing,
+    /// if `wiki_id` already has a node.
+    fn insert(&mut self, wiki_id: u32, dense: u32) -> bool {
+        let slot = wiki_id as usize;
+        if slot >= self.dense_by_wiki.len() {
+            self.dense_by_wiki.resize(slot + 1, Self::ABSENT);
+        }
+        if self.dense_by_wiki[slot] != Self::ABSENT {
+            return false;
+        }
+        self.dense_by_wiki[slot] = dense;
+        true
+    }
+
+    fn get(&self, wiki_id: u32) -> Option<u32> {
+        self.dense_by_wiki
+            .get(wiki_id as usize)
+            .copied()
+            .filter(|&dense| dense != Self::ABSENT)
+    }
+}
+
+/// A CSV reader with a large buffer, for files read front to back once.
+fn open_csv(path: &Path) -> Result<csv::Reader<std::fs::File>> {
+    csv::ReaderBuilder::new()
+        .buffer_capacity(config::MERGE_BUF_SIZE)
+        .from_path(path)
+        .with_context(|| format!("Failed to open {}", path.display()))
+}
+
 /// Reads the ids of `nodes.csv` in file order. Returns the dense-to-wiki
 /// list, the wiki-to-dense map, and how many repeated ids were skipped.
-fn read_node_ids(path: &Path) -> Result<(Vec<u32>, FxHashMap<u32, u32>, u64)> {
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+fn read_node_ids(path: &Path) -> Result<(Vec<u32>, DenseIds, u64)> {
+    let mut reader = open_csv(path)?;
+    let mut record = csv::ByteRecord::new();
     let mut dense_to_wiki = Vec::new();
-    let mut id_map = FxHashMap::default();
+    let mut id_map = DenseIds::new();
     let mut duplicates = 0u64;
-    for record in reader.records() {
-        let record = record.with_context(|| format!("Failed to read {}", path.display()))?;
+    while reader
+        .read_byte_record(&mut record)
+        .with_context(|| format!("Failed to read {}", path.display()))?
+    {
         let wiki_id = parse_id(&record, 0, "node id")?;
-        if id_map.contains_key(&wiki_id) {
+        let dense = u32::try_from(dense_to_wiki.len())
+            .ok()
+            .filter(|&d| d != DenseIds::ABSENT)
+            .context("nodes.csv has too many articles for u32 node indices")?;
+        if id_map.insert(wiki_id, dense) {
+            dense_to_wiki.push(wiki_id);
+        } else {
             duplicates += 1;
-            continue;
         }
-        id_map.insert(wiki_id, dense_to_wiki.len() as u32);
-        dense_to_wiki.push(wiki_id);
     }
     Ok((dense_to_wiki, id_map, duplicates))
 }
 
 /// Calls `visit(src, dst)` with dense indices for every `LINKS_TO` row whose
 /// endpoints are both known. Returns how many `LINKS_TO` rows were skipped.
-fn for_each_link(
-    path: &Path,
-    id_map: &FxHashMap<u32, u32>,
-    mut visit: impl FnMut(u32, u32),
-) -> Result<u64> {
-    let links_to = EdgeType::LinksTo.to_string();
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+fn for_each_link(path: &Path, id_map: &DenseIds, mut visit: impl FnMut(u32, u32)) -> Result<u64> {
+    let links_to = EdgeType::LinksTo.as_str().as_bytes();
+    let mut reader = open_csv(path)?;
+    let mut record = csv::ByteRecord::new();
     let mut skipped = 0u64;
-    for record in reader.records() {
-        let record = record.with_context(|| format!("Failed to read {}", path.display()))?;
+    while reader
+        .read_byte_record(&mut record)
+        .with_context(|| format!("Failed to read {}", path.display()))?
+    {
         let edge_type = record.get(2).context("Edge row without a :TYPE")?;
         if edge_type != links_to {
             continue;
         }
         let src = parse_id(&record, 0, "edge source")?;
         let dst = parse_id(&record, 1, "edge target")?;
-        match (id_map.get(&src), id_map.get(&dst)) {
-            (Some(&s), Some(&d)) => visit(s, d),
+        match (id_map.get(src), id_map.get(dst)) {
+            (Some(s), Some(d)) => visit(s, d),
             _ => skipped += 1,
         }
     }
     Ok(skipped)
 }
 
-fn parse_id(record: &csv::StringRecord, column: usize, what: &str) -> Result<u32> {
+fn parse_id(record: &csv::ByteRecord, column: usize, what: &str) -> Result<u32> {
     let field = record
         .get(column)
         .with_context(|| format!("Row without a {what}: {record:?}"))?;
-    field
-        .parse()
-        .with_context(|| format!("Invalid {what} {field:?}"))
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("Invalid {what} {:?}", String::from_utf8_lossy(field)))
 }
 
 /// `[0, d0, d0 + d1, ...]`: the CSR row pointers for the given degrees.
@@ -305,6 +357,11 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
     let out_degree: Vec<usize> = (0..n).map(|i| graph.out_neighbors(i).len()).collect();
     let mut rank = vec![1.0 / n as f64; n];
     let mut new_rank = vec![0.0f64; n];
+    // What each node sends along each of its links this iteration. Computing
+    // it once per node, not once per link, is the same arithmetic in the same
+    // order, so the ranks do not change. A dangling node sends nothing along
+    // links (it has none); its rank goes through `dangling_mass` instead.
+    let mut contrib = vec![0.0f64; n];
     let mut iterations = 0u32;
     let mut residual = f64::INFINITY;
 
@@ -316,11 +373,17 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
             .sum();
         let base = (1.0 - damping) / n as f64 + damping * dangling_mass / n as f64;
 
+        contrib.par_iter_mut().enumerate().for_each(|(i, c)| {
+            *c = match out_degree[i] {
+                0 => 0.0,
+                d => rank[i] / d as f64,
+            };
+        });
         new_rank.par_iter_mut().enumerate().for_each(|(i, r)| {
             let inflow: f64 = graph
                 .in_neighbors(i)
                 .iter()
-                .map(|&src| rank[src as usize] / out_degree[src as usize] as f64)
+                .map(|&src| contrib[src as usize])
                 .sum();
             *r = base + damping * inflow;
         });
@@ -355,20 +418,20 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
 /// changes or `max_iterations` passes, logging how many changed in each.
 fn compute_label_propagation(graph: &CsrGraph, max_iterations: u32) -> Vec<u32> {
     let mut labels: Vec<u32> = (0..graph.n as u32).collect();
+    let mut next: Vec<u32> = vec![0; graph.n];
 
     for iteration in 1..=max_iterations {
-        let next: Vec<u32> = (0..graph.n)
-            .into_par_iter()
-            .map_init(FxHashMap::default, |counts, i| {
-                most_common_label(graph, &labels, i, counts)
-            })
-            .collect();
+        next.par_iter_mut()
+            .enumerate()
+            .for_each_init(Vec::new, |votes, (i, label)| {
+                *label = most_common_label(graph, &labels, i, votes);
+            });
         let changed = labels
             .par_iter()
             .zip(next.par_iter())
             .filter(|(old, new)| old != new)
             .count();
-        labels = next;
+        std::mem::swap(&mut labels, &mut next);
         info!(iteration, changed, "Label propagation pass");
         if changed == 0 {
             info!(iteration, "Label propagation converged");
@@ -379,25 +442,26 @@ fn compute_label_propagation(graph: &CsrGraph, max_iterations: u32) -> Vec<u32> 
 }
 
 /// The label node `i` adopts in the next pass: the most common among its
-/// neighbors' labels and its own, ties to the smallest. `counts` is scratch
+/// neighbors' labels and its own, ties to the smallest. `votes` is scratch
 /// space reused across calls.
-fn most_common_label(
-    graph: &CsrGraph,
-    labels: &[u32],
-    i: usize,
-    counts: &mut FxHashMap<u32, u32>,
-) -> u32 {
-    counts.clear();
-    counts.insert(labels[i], 1);
-    for &neighbor in graph.out_neighbors(i).iter().chain(graph.in_neighbors(i)) {
-        *counts.entry(labels[neighbor as usize]).or_insert(0) += 1;
+///
+/// The votes are sorted and counted in runs, which is cheaper than a hash map
+/// per node. Runs are visited smallest label first, and only a strictly larger
+/// count replaces the best, so a tie keeps the smaller label.
+fn most_common_label(graph: &CsrGraph, labels: &[u32], i: usize, votes: &mut Vec<u32>) -> u32 {
+    votes.clear();
+    votes.push(labels[i]);
+    let neighbors = graph.out_neighbors(i).iter().chain(graph.in_neighbors(i));
+    votes.extend(neighbors.map(|&neighbor| labels[neighbor as usize]));
+    votes.sort_unstable();
+
+    let mut best = (votes[0], 0usize);
+    for run in votes.chunk_by(|a, b| a == b) {
+        if run.len() > best.1 {
+            best = (run[0], run.len());
+        }
     }
-    counts
-        .iter()
-        .max_by(|(label_a, count_a), (label_b, count_b)| {
-            count_a.cmp(count_b).then(label_b.cmp(label_a))
-        })
-        .map_or(labels[i], |(&label, _)| label)
+    best.0
 }
 
 /// Combined in + out degree of each node.
@@ -438,6 +502,7 @@ fn write_analytics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustc_hash::FxHashMap;
     use tempfile::TempDir;
 
     fn write_graph(dir: &Path, nodes: &[u32], edges: &[(u32, u32, &str)]) {
@@ -575,6 +640,80 @@ mod tests {
         assert!(labels[0] == labels[1] && labels[1] == labels[2]);
         assert!(labels[3] == labels[4] && labels[4] == labels[5]);
         assert_ne!(labels[0], labels[3]);
+    }
+
+    /// The hash-map vote count `most_common_label` replaced, kept as the
+    /// reference it must agree with.
+    fn reference_label(graph: &CsrGraph, labels: &[u32], i: usize) -> u32 {
+        let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
+        counts.insert(labels[i], 1);
+        for &neighbor in graph.out_neighbors(i).iter().chain(graph.in_neighbors(i)) {
+            *counts.entry(labels[neighbor as usize]).or_insert(0) += 1;
+        }
+        counts
+            .iter()
+            .max_by(|(label_a, count_a), (label_b, count_b)| {
+                count_a.cmp(count_b).then(label_b.cmp(label_a))
+            })
+            .map_or(labels[i], |(&label, _)| label)
+    }
+
+    #[test]
+    fn most_common_label_agrees_with_the_hash_map_count() {
+        // Node 0 links to every other node, so its vote is over all labels.
+        let dir = TempDir::new().unwrap();
+        let nodes: Vec<u32> = (1..=9).collect();
+        let edges: Vec<(u32, u32, &str)> = (2..=9).map(|d| (1, d, "LINKS_TO")).collect();
+        write_graph(dir.path(), &nodes, &edges);
+        let graph = graph_of(&dir).graph;
+
+        let label_sets: [&[u32]; 4] = [
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8], // all distinct: the smallest label wins
+            &[8, 3, 3, 5, 5, 1, 1, 7, 7], // a three-way tie at two votes
+            &[4, 4, 4, 2, 2, 2, 9, 9, 9], // own label in a tie
+            &[6, 6, 6, 6, 0, 0, 0, 0, 0], // a clear winner
+        ];
+        let mut votes = Vec::new();
+        for labels in label_sets {
+            for i in 0..graph.n {
+                assert_eq!(
+                    most_common_label(&graph, labels, i, &mut votes),
+                    reference_label(&graph, labels, i),
+                    "labels {labels:?}, node {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pagerank_matches_the_per_link_division_bit_for_bit() {
+        let dir = TempDir::new().unwrap();
+        write_chain(dir.path());
+        let graph = graph_of(&dir).graph;
+        let (n, damping) = (graph.n, 0.85);
+
+        let out_degree: Vec<usize> = (0..n).map(|i| graph.out_neighbors(i).len()).collect();
+        let mut rank = vec![1.0 / n as f64; n];
+        for _ in 0..20 {
+            let dangling: f64 = (0..n)
+                .filter(|&i| out_degree[i] == 0)
+                .map(|i| rank[i])
+                .sum();
+            let base = (1.0 - damping) / n as f64 + damping * dangling / n as f64;
+            rank = (0..n)
+                .map(|i| {
+                    let inflow: f64 = graph
+                        .in_neighbors(i)
+                        .iter()
+                        .map(|&s| rank[s as usize] / out_degree[s as usize] as f64)
+                        .sum();
+                    base + damping * inflow
+                })
+                .collect();
+        }
+
+        let pr = compute_pagerank(&graph, damping, 20, 0.0);
+        assert_eq!(pr.ranks, rank);
     }
 
     #[test]
