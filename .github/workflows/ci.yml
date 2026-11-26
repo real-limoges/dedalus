@@ -76,11 +76,12 @@ jobs:
           - name: macOS arm64
             os: macos-15
             rustflags: -C target-cpu=apple-m1
-            lbzip2: brew install lbzip2
+            # Homebrew has no lbzip2; pbzip2 is the other one dedalus finds.
+            bzip2_tool: brew install pbzip2
           - name: Linux x86-64
             os: ubuntu-24.04
             rustflags: -C target-cpu=x86-64-v2
-            lbzip2: sudo apt-get install --yes lbzip2
+            bzip2_tool: sudo apt-get install --yes lbzip2
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -93,9 +94,10 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/duckdb
-      # Real runs decompress with lbzip2 when it is on PATH, so the tests do too.
-      - name: Install lbzip2
-        run: ${{ matrix.lbzip2 }}
+      # Real runs decompress with lbzip2 or pbzip2 when one is on PATH, so the
+      # tests do too.
+      - name: Install a parallel bzip2
+        run: ${{ matrix.bzip2_tool }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
@@ -132,8 +134,8 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/duckdb
-      - name: Install lbzip2
-        run: brew install lbzip2
+      - name: Install pbzip2
+        run: brew install pbzip2
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
