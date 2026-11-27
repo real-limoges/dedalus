@@ -3,9 +3,9 @@
 //! Extraction reads the dump in chunks and saves a checkpoint after each chunk
 //! has been fully written and flushed. A checkpoint records how far into the
 //! dump the run got (`ResumePoint`) and the length of every CSV file at that
-//! moment. Resuming cuts each CSV back to its recorded length, discarding any
-//! rows written after the checkpoint, and continues from the resume point, so
-//! no page is skipped and none is written twice.
+//! moment. Resuming cuts each CSV back to its recorded length, which discards
+//! any rows written after the checkpoint. The run then continues from the
+//! resume point, so no page is skipped and none is written twice.
 //!
 //! Checkpoints are written atomically and removed when a run completes.
 
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
-/// Serializable snapshot of extraction counters for checkpoint persistence.
+/// The extraction counters as saved in a checkpoint.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CheckpointStats {
     pub articles_processed: u64,

@@ -2,9 +2,9 @@
 //! images and external links as CSV, and article content as JSON blobs.
 //!
 //! The dump is read in chunks of pages, in dump order. Each chunk is processed
-//! in parallel with rayon; then every writer is flushed and a checkpoint is
-//! saved, so a checkpoint only ever describes output that is completely on
-//! disk. Reading the next chunk overlaps with processing the current one.
+//! in parallel with rayon. Then every writer is flushed and a checkpoint is
+//! saved, so a checkpoint only describes output that is completely on disk.
+//! Reading the next chunk overlaps with processing the current one.
 //!
 //! CSV rows are distributed across `csv_shards` files by `page_id % csv_shards`.
 //! Category, image and external link nodes are deduplicated across the whole
@@ -687,8 +687,8 @@ pub fn run_extraction_with_stats(
         };
         processed?;
         extractor.csv.flush()?;
-        // A chunk cut short by --limit ends the run, and the source has read
-        // past the pages that were dropped, so it gets no checkpoint.
+        // A chunk cut short by --limit ends the run. The source has already
+        // read past the dropped pages, so this chunk gets no checkpoint.
         if let Some(mgr) = config.checkpoint_mgr
             && !limit_reached
         {

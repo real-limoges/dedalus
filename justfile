@@ -10,8 +10,9 @@ msrv := `sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml`
 default:
     @just --list
 
-# What runs before every push: everything that is fast and needs no network
-# beyond the advisory database. The release build and the MSRV check are CI's.
+# Everything here is fast and needs no network beyond the advisory database.
+# The release build and the MSRV check are left to CI.
+# Lint, dependency checks and tests: what runs before every push.
 pre-push: lint deny test
 
 # Formatting, clippy and unused dependencies. Compiles, but runs nothing.
@@ -20,8 +21,9 @@ lint:
     cargo clippy --all-targets --locked -- -D warnings
     cargo machete
 
-# Unit and integration tests under nextest, then doc tests (nextest does not
-# run those). CI passes `ci`, a nextest profile that reports every failure.
+# nextest does not run doc tests, so `cargo test --doc` follows it.
+# CI passes `ci`, a nextest profile that reports every failure.
+# Unit and integration tests under nextest, then doc tests.
 test profile="default":
     cargo nextest run --locked --profile {{ profile }}
     cargo test --doc --locked
@@ -35,9 +37,9 @@ msrv:
     rustup toolchain install {{ msrv }} --profile minimal --no-self-update
     cargo +{{ msrv }} check --all-targets --locked
 
-# The release binary, end to end on a tiny dump: extract, merge, analytics,
-# load. Unit tests always build with unwinding, so this is the only check of
-# the shipped profile (panic = 'abort', no overflow checks, LTO).
+# Unit tests always build with unwinding, so this is the only check of the
+# shipped profile (panic = 'abort', no overflow checks, LTO).
+# The release binary end to end on a tiny dump: extract, merge, analytics, load.
 smoke:
     #!/usr/bin/env bash
     set -euo pipefail

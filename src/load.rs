@@ -5,8 +5,9 @@
 //! `analytics.csv` becomes the `analytics` table when it exists.
 //!
 //! The database is built in a `.tmp` file and renamed over the target only
-//! once every table is loaded, so a failed load leaves any earlier database
-//! untouched.
+//! once every table is loaded, so a load that fails while building leaves any
+//! earlier database untouched. The old database is removed just before the
+//! rename, so a failed rename does lose it.
 
 use crate::analytics::ANALYTICS_FILE;
 use crate::csv_util::{self, CsvLayout, CsvType};

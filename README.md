@@ -1,7 +1,8 @@
 # Dedalus
 
 A Rust pipeline that turns a Wikipedia XML dump into graph data.
-Dedalus extracts articles, links, categories, images and external links from a compressed dump, computes PageRank, communities and degree over the link graph, and loads everything into a single [DuckDB](https://duckdb.org) file.
+Dedalus extracts articles, links, categories, images and external links from a compressed dump.
+It computes PageRank, communities and degree over the link graph, and loads everything into a single [DuckDB](https://duckdb.org) file.
 
 Every stage also leaves plain CSV files behind, so the output is usable without DuckDB.
 
@@ -54,14 +55,16 @@ Dedalus uses the index to decompress and parse streams in parallel on every core
 The index is found automatically when it sits beside the dump with the matching name; otherwise pass `--multistream-index`.
 A standard (single-stream) dump works too, but decompression is then sequential.
 
-Dedalus checks that every offset in the index lies inside the dump, so a dump that is still downloading is refused rather than read partway.
+Dedalus checks that every offset in the index lies inside the dump.
+A dump that is still downloading fails that check and is refused, instead of being read partway.
 
 ## Prerequisites
 
 - **Rust 1.94+**: [install via rustup](https://rustup.rs/).
 - **DuckDB 2.0** from Homebrew: `brew install duckdb`.
   `.cargo/config.toml` points the build at `/opt/homebrew/opt/duckdb`.
-  On a machine without Homebrew, download the prebuilt library from DuckDB's GitHub release (for example `duckdb-shared-libs-linux-amd64.tar.gz`) and set `DUCKDB_LIB_DIR` and `DUCKDB_INCLUDE_DIR` to where it was unpacked, as CI does; on Linux, `LD_LIBRARY_PATH` too.
+  On a machine without Homebrew, download the prebuilt library from DuckDB's GitHub release (for example `duckdb-shared-libs-linux-amd64.tar.gz`).
+  Then set `DUCKDB_LIB_DIR` and `DUCKDB_INCLUDE_DIR` to where it was unpacked, as CI does, and on Linux set `LD_LIBRARY_PATH` too.
   The `duckdb` crate version must match the library: crate `1.20000.x` wraps DuckDB 2.0.x.
 - **lbzip2** (optional): parallel decompression for standard, non-multistream dumps (`brew install lbzip2`).
 
@@ -104,7 +107,8 @@ Takes the same extraction flags as `pipeline` (`--csv-shards`, `--shard-count`, 
 
 Extraction reads the dump in chunks of `--checkpoint-interval` pages.
 After each chunk every file is flushed and a checkpoint is saved, recording where reading stopped and how long each CSV was.
-`--resume` cuts each CSV back to that length and continues from the next chunk, so an interrupted run ends with exactly the output of an uninterrupted one.
+`--resume` cuts each CSV back to that length and continues from the next chunk.
+An interrupted run then ends with exactly the output of an uninterrupted one.
 
 ### `merge-csvs`: Shard Merging
 
@@ -147,7 +151,8 @@ dedalus load -o <output-dir> [OPTIONS]
 | `--db-path` | DuckDB file, relative to the output directory | `wikipedia.duckdb` |
 | `--clean` | Replace the database if it already exists | Off |
 
-The database is built in a `.tmp` file and renamed into place when every table has loaded, so a failed load keeps the previous database.
+The database is built in a `.tmp` file and renamed into place once every table has loaded.
+A failed load keeps the previous database.
 
 ### `stats`: Output Statistics
 
@@ -229,7 +234,8 @@ output/
 ```
 
 The CSV headers use a typed-column style (`id:ID`, `:START_ID`, `:TYPE`).
-Titles are stored in MediaWiki's canonical form (first letter uppercase, underscores as spaces), so link targets and category names written either way resolve to the same entry.
+Titles are stored in MediaWiki's canonical form (first letter uppercase, underscores as spaces).
+A link target or category name written either way resolves to the same entry.
 
 ### DuckDB Tables
 
@@ -284,7 +290,9 @@ Empty lists and a false `is_disambiguation` are left out of the file.
 ## Resources
 
 Timings and peak memory on the full English dump have not been measured since the pipeline was reworked.
-As estimates: the analytics graph takes about 8 bytes per link (around 2 GB for 200 million links), and extraction holds the title index plus the sets of category, image and external link names seen so far, which together can run to several GB.
+The analytics graph is estimated at about 8 bytes per link, around 2 GB for 200 million links.
+Extraction holds the title index and the category, image and external link names seen so far.
+By estimate, together these can run to several GB.
 Plan for 16 GB of RAM or more and an SSD.
 In earlier benchmarks, 14 CSV shards extracted about 1.6 times faster than one.
 
@@ -295,7 +303,9 @@ In earlier benchmarks, 14 CSV shards extracted about 1.6 times faster than one.
 2. **Extract**: reads the dump again in ordered chunks, processing each chunk's pages in parallel with rayon.
    Rows go to `page_id % csv_shards`; category, image and external link names are deduplicated with `DashSet`s.
 3. **Merge**: concatenates shards per CSV type, deduplicating shared nodes with `FxHashSet`; each merged file is written to a `.tmp` sibling and renamed.
-4. **Analytics**: builds a compressed sparse row graph from LINKS_TO edges in two passes over `edges.csv`, then runs rayon-parallel PageRank (rank on pages with no outgoing links is spread evenly, so ranks sum to 1), rayon-parallel label propagation, and degree.
+4. **Analytics**: builds a compressed sparse row graph from LINKS_TO edges in two passes over `edges.csv`.
+   It then computes PageRank and label propagation, both in parallel with rayon, and degree.
+   PageRank spreads the rank of pages with no outgoing links evenly, so ranks sum to 1.
 5. **Load**: one `CREATE TABLE ... AS SELECT ... FROM read_csv(...)` per CSV, with explicit column types.
 
 `docs/reference/internal/architecture.md` has the longer version.
@@ -304,10 +314,13 @@ In earlier benchmarks, 14 CSV shards extracted about 1.6 times faster than one.
 
 ```bash
 cargo build --release                  # Optimized binary
-cargo test                             # All unit and integration tests
-cargo clippy --all-targets -- -D warnings
-cargo fmt -- --check
-git config core.hooksPath .githooks    # Run fmt, clippy, build and tests before every push
+just lint                              # fmt --check, clippy -D warnings, cargo machete
+just test                              # nextest, then doc tests
+just deny                              # Advisories, licenses, bans, sources (deny.toml)
+just msrv                              # Builds on rust-version from Cargo.toml
+just smoke                             # Release binary through the whole pipeline on tests/fixtures/smoke.xml
+just pre-push                          # lint, deny, test
+git config core.hooksPath .githooks    # Run `just pre-push` before every push
 ```
 
 ## Troubleshooting

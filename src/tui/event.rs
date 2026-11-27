@@ -1,7 +1,8 @@
 //! Terminal event handling for the TUI.
 //!
-//! Spawns a background thread that polls `crossterm` for keyboard events at a
-//! configurable tick rate, forwarding them as [`AppEvent`] variants over an `mpsc` channel.
+//! A background thread polls `crossterm` for key presses and sends each one as an
+//! [`AppEvent`] over an `mpsc` channel. When no key arrives within the tick rate,
+//! it sends a `Tick` instead.
 
 use crossterm::event::{self, Event, KeyEvent};
 use std::sync::mpsc;

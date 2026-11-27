@@ -1,47 +1,47 @@
 //! Dedalus: Wikipedia dump extraction pipeline producing graph CSVs, analytics and DuckDB
 //!
-//! This crate provides a multi-pass pipeline for extracting structured graph data from
-//! Wikipedia XML dumps into plain files, then loading them into a DuckDB database file:
+//! The pipeline reads a Wikipedia XML dump in several passes, writes graph data
+//! as plain files, then loads those files into a DuckDB database file:
 //!
-//! 1. **Indexing Pass** -- Build an in-memory title-to-ID mapping and redirect resolution
-//!    table by streaming through the dump without reading article text
-//! 2. **Extraction Pass** -- Process articles in parallel to extract nodes, edges, categories,
-//!    images, external links, and enriched content; output CSV files and JSON blobs
-//! 3. **Merge Pass** (when sharded) -- Combine sharded CSV files into single files with
-//!    deduplication
-//! 4. **Analytics Pass** -- Compute PageRank, label-propagation communities, and degree,
-//!    written to `analytics.csv`
-//! 5. **Load Pass** -- Copy the merged CSVs and `analytics.csv` into one DuckDB file
+//! 1. Index: stream the dump without reading article text, and build an in-memory
+//!    title-to-ID map and redirect table.
+//! 2. Extract: process articles in parallel into nodes, edges, categories, images,
+//!    external links and article content, written as CSV files and JSON blobs.
+//! 3. Merge (when sharded): combine the CSV shards into single files, deduplicating
+//!    across shards.
+//! 4. Analytics: compute PageRank, label-propagation communities and degree into
+//!    `analytics.csv`.
+//! 5. Load: copy the merged CSVs and `analytics.csv` into one DuckDB file.
 //!
 //! # Architecture
 //!
-//! The pipeline is designed for performance and memory efficiency:
+//! - The XML parser is event-based and streams the dump, so the whole dump is
+//!   never in memory.
+//! - Extraction processes articles concurrently with rayon.
+//! - CSV output is spread across N shard files during extraction.
+//! - A `DashSet` records the first sighting of each category and image across threads.
+//! - Statistics are lock-free atomic counters.
+//! - Checkpoints and the index cache let a rerun skip work already done.
 //!
-//! - **Streaming XML parsing** -- Never loads full dump into memory; uses event-based parsing
-//! - **Parallel extraction** -- Uses rayon to process articles concurrently
-//! - **CSV sharding** -- Distributes output across N files for parallel extraction
-//! - **Concurrent deduplication** -- DashSet for thread-safe first-seen category/image tracking
-//! - **Atomic operations** -- Lock-free counters for high-frequency statistics
-//! - **Resumable processing** -- Checkpointing and index caching to skip redundant work
+//! # Modules
 //!
-//! # Key Modules
-//!
-//! - [`parser`] -- Streaming XML parser with BZ2 decompression
-//! - [`index`] -- Title-to-ID mapping with redirect resolution
-//! - [`extract`] -- Parallel extraction with CSV sharding
-//! - [`merge`] -- CSV shard merging with deduplication
-//! - [`analytics`] -- Graph analytics (PageRank, label propagation, degree)
-//! - [`load`] -- DuckDB loader (one table per CSV)
-//! - [`csv_util`] -- CSV file names and layout detection
-//! - [`title`] -- Canonical title form (MediaWiki rules) and namespace detection
-//! - [`content`] -- Text extraction (abstracts, sections, links, categories)
-//! - [`infobox`] -- Structured infobox parsing with nested template support
-//! - [`models`] -- Core data types (WikiPage, ArticleBlob, PageType)
-//! - [`cache`] -- Index persistence with zero-copy serialization
-//! - [`checkpoint`] -- Extraction progress checkpointing
-//! - [`atomic_file`] -- Crash-safe file replacement
-//! - [`stats`] -- Thread-safe atomic counters for extraction metrics
-//! - [`config`] -- Constants for extraction, merge and analytics
+//! - [`parser`]: streaming XML parser with bz2 decompression
+//! - [`multistream`]: multistream index parsing and per-stream parallel parsing
+//! - [`index`]: title-to-ID map with redirect resolution
+//! - [`extract`]: parallel extraction with CSV sharding
+//! - [`merge`]: CSV shard merging with deduplication
+//! - [`analytics`]: PageRank, label propagation and degree
+//! - [`load`]: DuckDB loader, one table per CSV
+//! - [`csv_util`]: CSV file names and layout detection
+//! - [`title`]: canonical title form (MediaWiki rules) and namespace detection
+//! - [`content`]: text extraction (abstracts, sections, links, categories)
+//! - [`infobox`]: infobox parsing, including nested templates
+//! - [`models`]: core data types (`WikiPage`, `ArticleBlob`, `PageType`)
+//! - [`cache`]: index persistence in `index.cache` (postcard)
+//! - [`checkpoint`]: extraction progress checkpoints
+//! - [`atomic_file`]: crash-safe file replacement
+//! - [`stats`]: atomic counters for extraction metrics
+//! - [`config`]: constants for extraction, merge and analytics
 
 pub mod analytics;
 pub mod atomic_file;
@@ -62,7 +62,7 @@ pub mod stats;
 pub mod title;
 pub mod tui;
 
-// Re-export primary API types for convenient library use.
+// The main API types, re-exported at the crate root.
 pub use checkpoint::{Checkpoint, CheckpointManager};
 pub use csv_util::CsvType;
 pub use extract::ExtractionConfig;

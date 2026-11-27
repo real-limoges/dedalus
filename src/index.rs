@@ -149,8 +149,8 @@ impl WikiIndex {
         Ok(index)
     }
 
-    /// Build index using multistream parallel parsing.
-    /// Each rayon worker decompresses and parses streams independently.
+    /// Builds the index from a multistream dump. Each rayon worker decompresses
+    /// and parses its own streams.
     pub fn build_multistream(dump_path: &str, ranges: &[StreamRange]) -> Result<Self> {
         info!(
             streams = ranges.len(),
@@ -161,8 +161,8 @@ impl WikiIndex {
         let page_count = AtomicU64::new(0);
         let dump = crate::multistream::open_dump(dump_path)?;
 
-        // Parallel fold: each thread collects into local vecs, then reduce
-        // merges. Any unreadable stream fails the whole build.
+        // Each thread folds pages into its own vecs, and `try_reduce` merges
+        // them. Any unreadable stream fails the whole build.
         let (articles_vec, redirects_vec) = ranges
             .par_iter()
             .try_fold(

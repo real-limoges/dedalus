@@ -1,7 +1,8 @@
 //! Thread-safe atomic counters for extraction metrics.
 //!
-//! `ExtractionStats` uses `AtomicU64` for lock-free updates at high frequency
-//! (per-article). Supports checkpoint serialization for resumable processing.
+//! `ExtractionStats` keeps each counter in an `AtomicU64`, so workers update
+//! it per article without a lock. The counters are saved in each checkpoint
+//! and restored when a run resumes.
 
 use crate::checkpoint::CheckpointStats;
 use std::sync::atomic::{AtomicU64, Ordering};

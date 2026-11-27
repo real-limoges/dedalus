@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 Dedalus is a Rust pipeline that turns a compressed Wikipedia XML dump (`.xml.bz2`) into graph data.
-It writes nodes, edges, categories, images and external links as CSV files and article content as sharded JSON blobs, computes PageRank, label-propagation communities and degree into `analytics.csv`, and loads all of it into a single DuckDB file.
+It writes nodes, edges, categories, images and external links as CSV files, and article content as sharded JSON blobs.
+It computes PageRank, label-propagation communities and degree into `analytics.csv`, and loads all of it into a single DuckDB file.
 With a multistream dump and its index file, both the indexing and extraction passes decompress and parse bz2 streams in parallel across every core.
 `docs/reference/internal/architecture.md` is the one-page map of the passes and the files they write.
 
@@ -43,7 +44,8 @@ Always build with `cargo build --release` for real runs.
 The `duckdb` crate links Homebrew's `libduckdb.dylib` (`brew install duckdb`), which keeps builds fast.
 The crate version must match the library: crate `1.20000.x` wraps DuckDB 2.0.x, so a `brew upgrade` to a new DuckDB minor version needs a matching crate bump.
 CI does not use Homebrew.
-The `.github/actions/duckdb` action downloads DuckDB's prebuilt library for the runner (macOS arm64 or Linux x86-64), checks its SHA-256, and sets `DUCKDB_LIB_DIR`, `DUCKDB_INCLUDE_DIR` and `LD_LIBRARY_PATH`, which override `[env]`.
+The `.github/actions/duckdb` action downloads DuckDB's prebuilt library for the runner (macOS arm64 or Linux x86-64) and checks its SHA-256.
+It then sets `DUCKDB_LIB_DIR`, `DUCKDB_INCLUDE_DIR` and `LD_LIBRARY_PATH`, which override `[env]`.
 On macOS it also rewrites the library's install name to an absolute path and re-signs it, since SIP strips `DYLD_*` variables before they reach the test binaries.
 Its `VERSION` and digests move with the crate; Dependabot is told to leave `duckdb` alone for that reason.
 Nothing compiles DuckDB from source.
@@ -205,8 +207,8 @@ The CSVs are the hand-off between passes; the DuckDB file is a queryable copy of
 - **`infobox.rs`**: brace-matching `{{Infobox ...}}` parser; fields split only at template and link depth zero.
 - **`models.rs`**: `WikiPage`, `PageType`, `EdgeType`, `ArticleBlob` (empty fields skipped in JSON).
 - **`stats.rs`**: `ExtractionStats`, atomic counters with checkpoint round-tripping.
-- **`cache.rs`**: `index.cache` via `postcard`, validated against the input's mtime and size and `CACHE_VERSION`.
-- **`config.rs`**: constants: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `DEFAULT_CSV_SHARDS` (8), `CHECKPOINT_INTERVAL` (10000), `PAGES_PER_STREAM` (100), `CACHE_VERSION` (4), `CHECKPOINT_VERSION` (4), buffer sizes, `PAGERANK_ITERATIONS` (20), `PAGERANK_DAMPING` (0.85), `PAGERANK_EPSILON` (1e-6), `LABEL_PROPAGATION_MAX_ITERATIONS` (50).
+- **`cache.rs`**: `index.cache` via `postcard`, validated against `CACHE_VERSION`, the input path, and the input's mtime and size.
+- **`config.rs`**: constants: `REDIRECT_MAX_DEPTH` (5), `SHARD_COUNT` (1000), `DEFAULT_CSV_SHARDS` (8), `CHECKPOINT_INTERVAL` (10000), `PAGES_PER_STREAM` (100), `CACHE_VERSION` (5), `CHECKPOINT_VERSION` (5), buffer sizes, `PAGERANK_ITERATIONS` (20), `PAGERANK_DAMPING` (0.85), `PAGERANK_EPSILON` (1e-6), `LABEL_PROPAGATION_MAX_ITERATIONS` (50).
 - **`tui/`**: `ratatui` + `crossterm`.
   `mod.rs` runs the event loop and restores the terminal on exit and on panic; `app.rs` holds state and validation; `runner.rs` runs each operation on a worker thread that always reports completion, even after a panic; `ui.rs` draws forms, stats, the log and the done screen; `logging.rs` captures `tracing` output; `event.rs` polls input.
 

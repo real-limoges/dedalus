@@ -199,8 +199,8 @@ mod tests {
         assert!(!is_namespace_link("Mission: Impossible"));
     }
 
-    /// The earlier, multi-allocation `normalize_title`, kept as the reference
-    /// the single-pass version must agree with.
+    /// A simple, multi-allocation `normalize_title`. The single-pass version
+    /// must agree with it.
     fn reference_normalize(raw: &str) -> String {
         let without_anchor = raw.split('#').next().unwrap_or(raw);
         let starts_cleanly = match without_anchor.chars().next() {

@@ -1,8 +1,8 @@
 //! Interactive terminal UI for configuring and monitoring Dedalus operations.
 //!
-//! Provides a form-based interface for extract, merge-csvs, analytics, and load
-//! operations with real-time progress monitoring, live extraction stats, and log
-//! streaming. Built on `ratatui` and `crossterm`.
+//! Extract, merge-csvs, analytics and load each get a form. While an operation
+//! runs, the TUI shows its progress, live extraction stats and the log as it
+//! streams in. Built on `ratatui` and `crossterm`.
 
 pub mod app;
 pub mod event;
@@ -26,17 +26,16 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::extract::ExtractionEnd;
-use app::{App, Operation, Screen};
+use app::{App, Operation, Outcome, Screen};
 use event::{AppEvent, EventHandler};
 use logging::TuiLogLayer;
 
 /// Launches the interactive TUI, taking over the terminal until the user quits.
 ///
-/// Sets up a `tracing` subscriber that captures log output into a shared buffer
-/// (displayed in the TUI's log panel), initializes the `ratatui` alternate screen,
-/// and runs the main event loop.
+/// Installs a `tracing` subscriber that writes log lines to the shared buffer
+/// behind the log panel, switches to the alternate screen, and runs the event
+/// loop.
 pub fn run_tui() -> Result<()> {
-    // Set up TUI log capture
     let logs: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let log_layer = TuiLogLayer::new(Arc::clone(&logs));
 
@@ -53,7 +52,6 @@ pub fn run_tui() -> Result<()> {
         previous_hook(info);
     }));
 
-    // Set up terminal
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -97,7 +95,7 @@ fn run_app(
                         handle_progress_key(app, key.code);
                         false
                     }
-                    Screen::Done => handle_done_key(app, key.code),
+                    Screen::Done(_) => handle_done_key(app, key.code),
                 };
                 if quit {
                     return Ok(());
@@ -149,7 +147,6 @@ fn handle_config_key(app: &mut App, code: KeyCode) -> bool {
             if app.current_field_is_checkbox() {
                 app.toggle_checkbox();
             } else {
-                // Try to run
                 match app.validate() {
                     Ok(()) => {
                         app.error_message = None;
@@ -220,24 +217,50 @@ fn handle_tick(app: &mut App) {
     if !app.worker_done.load(Ordering::Acquire) {
         return;
     }
-    app.screen = Screen::Done;
     let report = runner::take_extract_report(app);
     let failed = app.worker_error.lock().map(|e| e.is_some()).unwrap_or(true);
-    if failed {
-        return;
-    }
-    app.done_message = match (app.operation, report.map(|r| r.end)) {
-        (Operation::Extract, Some(ExtractionEnd::Cancelled)) => {
+    let outcome = match (failed, report.map(|r| r.end)) {
+        (true, _) => Outcome::Failed,
+        (false, Some(ExtractionEnd::Cancelled)) => Outcome::Canceled,
+        (false, _) => Outcome::Completed,
+    };
+    app.done_message = done_message(app.operation, outcome);
+    app.screen = Screen::Done(outcome);
+}
+
+/// The summary line for the Done screen. A failed run has none, since its
+/// error is drawn from `worker_error`.
+fn done_message(operation: Operation, outcome: Outcome) -> String {
+    match (outcome, operation) {
+        (Outcome::Failed, _) => String::new(),
+        (Outcome::Canceled, _) => {
             "Extraction canceled; check Resume to continue from the last checkpoint".to_string()
         }
-        (Operation::Extract, _) => "Extraction completed successfully".to_string(),
-        (Operation::Analytics, _) => {
-            format!(
-                "Analytics completed successfully; results in {}",
-                crate::analytics::ANALYTICS_FILE
-            )
+        (Outcome::Completed, Operation::Extract) => "Extraction completed successfully".to_string(),
+        (Outcome::Completed, Operation::Analytics) => format!(
+            "Analytics completed successfully; results in {}",
+            crate::analytics::ANALYTICS_FILE
+        ),
+        (Outcome::Completed, Operation::Load) => "DuckDB load completed successfully".to_string(),
+        (Outcome::Completed, Operation::MergeCsvs) => {
+            "CSV merge completed successfully".to_string()
         }
-        (Operation::Load, _) => "DuckDB load completed successfully".to_string(),
-        (Operation::MergeCsvs, _) => "CSV merge completed successfully".to_string(),
-    };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_run_has_no_summary_line() {
+        for &operation in Operation::all() {
+            assert!(done_message(operation, Outcome::Failed).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_canceled_extraction_says_how_to_resume() {
+        assert!(done_message(Operation::Extract, Outcome::Canceled).contains("Resume"));
+    }
 }

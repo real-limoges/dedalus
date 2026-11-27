@@ -1,6 +1,8 @@
 # Dedalus Architecture
 
-Dedalus reads a compressed Wikipedia XML dump and produces CSV files describing the link graph, one JSON blob per article, an `analytics.csv` of PageRank, community and degree per article, and a DuckDB database file holding all of it.
+Dedalus reads a compressed Wikipedia XML dump.
+It writes CSV files describing the link graph and one JSON blob per article.
+It also writes `analytics.csv`, with PageRank, community and degree per article, and a DuckDB database file holding all of it.
 The CSVs are the hand-off between passes; the DuckDB file is a copy of them for querying.
 `dedalus pipeline` runs every pass in order; each pass is also its own subcommand.
 
@@ -23,11 +25,15 @@ Each redirect chain is followed once, up to `REDIRECT_MAX_DEPTH` hops, while the
 The index is cached as `index.cache` in the output directory, keyed on the dump's size and modification time and on `CACHE_VERSION`.
 
 **Extract** (`src/extract.rs`) reads every article again, with text, and writes rows through `ShardedCsvWriter`, which assigns each page to shard `page_id % csv_shards`.
-Wikitext is mined by `src/content.rs` (links, categories, images, external links, abstract, sections) and `src/infobox.rs` (the first infobox).
+Wikitext is mined by `src/content.rs` (links, categories, images, external links, abstract, sections) and `src/infobox.rs` (every infobox).
 Link targets are resolved through the index; a link inside the article's "See also" section becomes a SEE_ALSO edge and any other link a LINKS_TO edge.
-The dump is read in ordered chunks of `--checkpoint-interval` pages; each chunk's pages are processed in parallel, and reading the next chunk overlaps with processing the current one.
-After every chunk all writers are flushed and `checkpoint.bin` is saved with the run's identity (dump path, size and mtime, output directory, shard counts, reading mode), where reading stopped (pages read for a standard dump, streams read for a multistream one), and the byte length of every CSV.
-`--resume` truncates each CSV back to its recorded length and continues from the next chunk, so an interrupted run ends with the same output as an uninterrupted one.
+The dump is read in ordered chunks of `--checkpoint-interval` pages.
+Each chunk's pages are processed in parallel, and reading the next chunk overlaps with processing the current one.
+After every chunk all writers are flushed and `checkpoint.bin` is saved.
+The checkpoint holds the run's identity (dump path, size and mtime, output directory, shard counts, reading mode) and the byte length of every CSV.
+It also records where reading stopped: pages read for a standard dump, streams read for a multistream one.
+`--resume` truncates each CSV back to its recorded length and continues from the next chunk.
+An interrupted run then ends with the same output as an uninterrupted one.
 A checkpoint whose identity does not match the current run is ignored, and a completed run removes it.
 A fresh run first removes CSVs an earlier run left behind that it will not overwrite, including an old `analytics.csv`.
 
@@ -38,21 +44,26 @@ With `--archive` the shard files move to `shards/`, replacing any shards archive
 **Analytics** (`src/analytics.rs`) builds a compressed sparse row graph from the LINKS_TO edges of the merged CSVs and computes PageRank, label propagation communities and in plus out degree.
 SEE_ALSO edges are left out, as are edges whose endpoints are not in `nodes.csv`.
 PageRank and label propagation both run in parallel with rayon.
-Label propagation is synchronous: each pass computes every node's label from the previous pass's labels, with one vote for the node's own label so two linked nodes cannot swap labels forever, and ties going to the smallest label.
+Label propagation is synchronous: each pass computes every node's label from the previous pass's labels.
+Each node also casts one vote for its own label, so two linked nodes cannot swap labels forever.
+Ties go to the smallest label.
 It stops when no label changes or after `LABEL_PROPAGATION_MAX_ITERATIONS` passes, and logs how many labels changed in each pass at INFO.
 On the full English dump it does not reach zero changes within 50 passes; about 2% of nodes are still changing when it stops.
 Results go to `analytics.csv`, one row per article.
 
-**Load** (`src/load.rs`) copies each merged CSV into one table of `wikipedia.duckdb` with DuckDB's `read_csv` and explicit column types: `articles`, `links` (with its `type` column, LINKS_TO or SEE_ALSO), `categories`, `article_categories`, `images`, `article_images`, `external_links`, `article_external_links`, and `analytics` when `analytics.csv` exists.
+**Load** (`src/load.rs`) copies each merged CSV into one table of `wikipedia.duckdb`, using DuckDB's `read_csv` with explicit column types.
+The tables are `articles`, `links` (with its `type` column, LINKS_TO or SEE_ALSO), `categories`, `article_categories`, `images`, `article_images`, `external_links`, `article_external_links`, and `analytics` when `analytics.csv` exists.
 The database is built as a `.tmp` file and renamed into place, so a failed load keeps the previous database.
 `load` refuses to replace an existing database without `--clean`; `pipeline` always replaces it, since it has just rewritten the CSVs.
-Locally the build links Homebrew's `libduckdb` (set in `.cargo/config.toml`); CI downloads DuckDB's prebuilt Linux library and points the build at it with environment variables.
+Locally the build links Homebrew's `libduckdb`, as set in `.cargo/config.toml`.
+In CI, the `.github/actions/duckdb` action downloads DuckDB's prebuilt library for the runner (macOS arm64 or Linux x86-64) and points the build at it with environment variables.
 
 ## Two Ways to Read the Dump
 
 A standard dump is one bz2 stream, decompressed sequentially by `WikiReader` in `src/parser.rs` (through `lbzip2` or `pbzip2` when either is on `PATH`).
 A multistream dump is many independent bz2 streams plus an index file of their byte offsets.
-`src/multistream.rs` reads that index and lets each rayon worker seek to, decompress and parse its own stream, so both passes run on every core.
+`src/multistream.rs` reads that index.
+Each rayon worker then seeks to, decompresses and parses its own stream, so both passes run on every core.
 The index file is found from the dump's name (`*-multistream.xml.bz2` beside `*-multistream-index.txt.bz2`) or given with `--multistream-index`.
 
 ## On-Disk Output

@@ -6,7 +6,8 @@
 - DuckDB load pass (`dedalus load`, the last `pipeline` step, and a Load tab in the TUI): one table per merged CSV plus `analytics`, built in a `.tmp` file and renamed into place.
   The build links Homebrew's `libduckdb`; CI downloads DuckDB's prebuilt Linux library instead.
 - `analytics.csv`: PageRank, community and degree per article, replacing the fields written into SurrealDB.
-- Resumable chunked extraction: the dump is read in ordered chunks, every writer is flushed after each chunk, and the checkpoint records the read position and every CSV's length, so `--resume` produces exactly the output of an uninterrupted run.
+- Resumable chunked extraction: the dump is read in ordered chunks, and every writer is flushed after each chunk.
+  The checkpoint records the read position and every CSV's length, so `--resume` produces exactly the output of an uninterrupted run.
 - Canonical title form (`title::normalize_title`): underscores, leading colons, anchors and a lowercase first letter all resolve to the same article; namespace detection is case-insensitive.
 - `atomic_file::write_atomically`, used for the index cache, checkpoints, merged CSVs and `analytics.csv`.
 - `WikiReader::finish`, which reports XML errors and a failed `lbzip2`/`pbzip2` exit instead of treating a truncated dump as complete.
@@ -16,14 +17,16 @@
 ### Changed
 - Abstracts are plain text: links show their visible text, and file and category embeds, footnotes, comments and bold or italic quotes are removed.
 - SEE_ALSO edges are only links inside the article's "See also" section, which ends at the next level-2 heading.
-- Analytics uses LINKS_TO edges only; PageRank spreads the rank of pages without outgoing links so ranks sum to 1, and runs in f64.
+- Analytics uses LINKS_TO edges only.
+  PageRank runs in f64 and spreads the rank of pages without outgoing links, so ranks sum to 1.
 - Community detection is named for what it is (`compute_label_propagation`, `LABEL_PROPAGATION_MAX_ITERATIONS`) and breaks ties by smallest label.
 - The analytics graph is built in two passes over `edges.csv`, without a per-node `Vec`.
 - `merge-csvs` requires shards numbered `0..N`, checks every shard and header before writing, and `--archive` replaces previously archived shards.
 - Layout detection prefers merged `nodes.csv` over leftover shards; a fresh extraction removes CSVs and `analytics.csv` from an earlier run.
 - `--limit` stops reading the dump and is exact across chunks; cancelling in the TUI keeps the checkpoint.
 - Shard counts must be at least 1, in the CLI and the TUI; CLI and TUI defaults come from `config.rs`.
-- CI and the pre-push hook run clippy with `--all-targets`; `rustfmt.toml` uses edition 2024; the release profile is defined only in `Cargo.toml`.
+- CI and the pre-push hook run clippy with `--all-targets`.
+  `rustfmt.toml` uses edition 2024, and the release profile is defined only in `Cargo.toml`.
 - Index cache version 3 and checkpoint version 4; older files are rebuilt or ignored.
 
 ### Fixed

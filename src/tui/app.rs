@@ -1,7 +1,7 @@
 //! TUI application state and configuration types.
 //!
-//! Defines the data model for all three TUI screens (config, progress, done),
-//! per-operation form configurations, field enums for navigation, and validation logic.
+//! Holds the state of the three screens (config, progress, done), a form for
+//! each operation, the field order used for navigation, and form validation.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +16,19 @@ use crate::stats::ExtractionStats;
 pub enum Screen {
     Config,
     Progress,
-    Done,
+    /// The Done screen carries how the operation ended, so its title cannot
+    /// disagree with the run.
+    Done(Outcome),
+}
+
+/// How a finished operation ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Completed,
+    /// Extraction stopped at the user's request; a checkpoint allows a resume.
+    Canceled,
+    /// The worker returned an error or panicked; the error is in `worker_error`.
+    Failed,
 }
 
 /// Which Dedalus operation the user has selected in the config screen.
@@ -352,8 +364,8 @@ impl App {
                 {
                     return Err("Limit must be a number".to_string());
                 }
-                if self.extract_config.checkpoint.parse::<u32>().is_err() {
-                    return Err("Checkpoint interval must be a number".to_string());
+                if !matches!(self.extract_config.checkpoint.parse::<u32>(), Ok(n) if n >= 1) {
+                    return Err("Checkpoint interval must be a number of at least 1".to_string());
                 }
                 Ok(())
             }
@@ -390,5 +402,23 @@ impl App {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_app(checkpoint: &str) -> App {
+        let mut app = App::new(Arc::new(Mutex::new(VecDeque::new())));
+        app.extract_config.input = "dump.xml.bz2".to_string();
+        app.extract_config.checkpoint = checkpoint.to_string();
+        app
+    }
+
+    #[test]
+    fn extract_rejects_a_checkpoint_interval_of_zero() {
+        assert!(extract_app("0").validate().is_err());
+        assert!(extract_app("1").validate().is_ok());
     }
 }

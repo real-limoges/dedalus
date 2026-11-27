@@ -1,8 +1,9 @@
 //! Core data types for the extraction pipeline.
 //!
-//! Defines `WikiPage` (parsed from XML), `PageType` (Article/Redirect/Special),
-//! `EdgeType` (LinksTo/SeeAlso), and `ArticleBlob` (enriched JSON output with
-//! conditional serialization for compact storage).
+//! `WikiPage` is one page parsed from the XML, and `PageType` says whether it is an
+//! article, a redirect or a special page.
+//! `EdgeType` is `LinksTo` or `SeeAlso`.
+//! `ArticleBlob` is the per-article JSON; empty fields are left out of it.
 
 use crate::infobox::Infobox;
 use serde::{Deserialize, Serialize};
@@ -35,9 +36,9 @@ pub struct WikiPage {
     /// `None` during the indexing pass (skip_text mode), and for redirects and
     /// pages outside namespace 0, whose text is never used.
     pub text: Option<String>,
-    /// Namespace number from `<ns>` tag.
+    /// Namespace number from the `<ns>` tag.
     pub ns: Option<i32>,
-    /// Revision timestamp from `<timestamp>` tag.
+    /// Revision timestamp from the `<timestamp>` tag.
     pub timestamp: Option<String>,
 }
 
@@ -107,7 +108,7 @@ mod tests {
         assert!(json.contains("\"id\":42"));
         assert!(json.contains("\"title\":\"Test Article\""));
         assert!(json.contains("\"abstract_text\":\"Hello world\""));
-        // Empty vecs and false bools should be omitted
+        // Empty vecs, a `None` timestamp and a false flag are omitted.
         assert!(!json.contains("categories"));
         assert!(!json.contains("infoboxes"));
         assert!(!json.contains("sections"));
@@ -172,7 +173,7 @@ mod tests {
 
     #[test]
     fn article_blob_backward_compatible_deserialization() {
-        // Minimal JSON without optional fields should deserialize with defaults
+        // JSON without the optional fields deserializes with their defaults.
         let json = r#"{"id":1,"title":"Test","abstract_text":"Content"}"#;
         let blob: ArticleBlob = serde_json::from_str(json).unwrap();
         assert_eq!(blob.id, 1);

@@ -20,8 +20,7 @@ use tracing::info;
 
 /// Merges `shard_count` shards of every CSV type into single files.
 ///
-/// Every shard file is checked to exist before anything is written, so a
-/// missing shard fails the merge instead of producing a partial result.
+/// Fails before writing anything when any shard file is missing.
 pub fn merge_csv_shards(output_dir: &str, shard_count: u32) -> Result<()> {
     info!("Merging {shard_count} CSV shards in {output_dir}");
     for csv_type in CsvType::ALL {
@@ -46,8 +45,8 @@ pub fn merge_csv_shards(output_dir: &str, shard_count: u32) -> Result<()> {
 
 /// Counts the shards in `output_dir` and merges them. Returns the count.
 ///
-/// For a standalone merge, where no extraction run says how many shards to
-/// expect; fails unless the shards are numbered exactly `0..N`.
+/// This is for a standalone merge, where no extraction run gives the shard
+/// count. Fails unless the shards are numbered exactly `0..N`.
 pub fn merge_detected_shards(output_dir: &str) -> Result<u32> {
     let shard_count = csv_util::count_shards(output_dir)?;
     merge_csv_shards(output_dir, shard_count)?;
@@ -83,7 +82,7 @@ fn merge_type(output_dir: &str, csv_type: CsvType, shard_count: u32) -> Result<u
                 );
             }
 
-            // Rows are copied as bytes: one reused record, no UTF-8 check.
+            // Rows are copied as bytes through one reused record, without UTF-8 validation.
             let mut record = csv::ByteRecord::new();
             while reader
                 .read_byte_record(&mut record)

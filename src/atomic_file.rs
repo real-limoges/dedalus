@@ -2,9 +2,8 @@
 //!
 //! The file is written to a `.tmp` sibling, flushed, synced to disk, and only
 //! then renamed over the target. A crash or a full disk at any point leaves
-//! either the old file or the complete new one, never a truncated file under
-//! the final name, and every write error is returned rather than lost in a
-//! `BufWriter`'s drop.
+//! either the old file or the complete new one under the final name. Every
+//! write error is returned, including one a `BufWriter` would drop silently.
 
 use anyhow::{Context, Result};
 use std::fs::{self, File};

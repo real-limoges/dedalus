@@ -1,8 +1,8 @@
 //! CLI entry point for the Dedalus pipeline.
 //!
-//! Uses `clap` subcommands to orchestrate extract, merge-csvs, analytics, load,
-//! pipeline, stats, and tui operations. Initializes `tracing` logging with
-//! configurable verbosity and uses `mimalloc` as the global allocator.
+//! Each operation is a `clap` subcommand: extract, merge-csvs, analytics, load,
+//! pipeline, stats and tui. `-v` sets the `tracing` log level, and `mimalloc`
+//! is the global allocator.
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -36,7 +36,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Extract Wikipedia dumps into CSV/JSON format
+    /// Extract a Wikipedia dump into CSV files and JSON blobs
     Extract(ExtractArgs),
     /// Compute graph analytics (PageRank, communities, degree) into analytics.csv
     Analytics(AnalyticsArgs),
@@ -44,11 +44,11 @@ enum Commands {
     MergeCsvs(MergeCsvsArgs),
     /// Load merged CSVs and analytics.csv into a DuckDB database file
     Load(LoadArgs),
-    /// Run the full pipeline: extract -> merge -> analytics -> load
+    /// Run the full pipeline: extract, merge, analytics, load
     Pipeline(PipelineArgs),
     /// Show output directory statistics
     Stats(StatsArgs),
-    /// Launch interactive TUI for configuration and monitoring
+    /// Open the interactive TUI to configure and monitor runs
     Tui,
 }
 
@@ -70,11 +70,11 @@ struct ExtractArgs {
     #[arg(long, default_value_t = dedalus::config::DEFAULT_CSV_SHARDS, value_parser = at_least_one)]
     csv_shards: u32,
 
-    /// Limit number of pages read from the start of the dump (for testing)
+    /// Read only this many pages from the start of the dump (for testing)
     #[arg(long)]
     limit: Option<u64>,
 
-    /// Dry run - don't write output files
+    /// Run without writing any output files
     #[arg(long)]
     dry_run: bool,
 
@@ -82,7 +82,7 @@ struct ExtractArgs {
     #[arg(long)]
     resume: bool,
 
-    /// Force rebuild of index cache
+    /// Rebuild the index cache instead of loading it
     #[arg(long)]
     no_cache: bool,
 
@@ -158,7 +158,7 @@ struct PipelineArgs {
     #[arg(long, default_value_t = dedalus::config::DEFAULT_CSV_SHARDS, value_parser = at_least_one)]
     csv_shards: u32,
 
-    /// Limit number of pages read from the start of the dump (for testing)
+    /// Read only this many pages from the start of the dump (for testing)
     #[arg(long)]
     limit: Option<u64>,
 
@@ -166,7 +166,7 @@ struct PipelineArgs {
     #[arg(long)]
     resume: bool,
 
-    /// Force rebuild of index cache
+    /// Rebuild the index cache instead of loading it
     #[arg(long)]
     no_cache: bool,
 
@@ -309,7 +309,7 @@ fn print_load_stats(stats: &LoadStats) {
 fn run_pipeline(args: PipelineArgs) -> Result<()> {
     let overall_start = Instant::now();
 
-    // Pre-flight: validate dump file
+    // Fail early when the dump file is missing.
     let input_path = Path::new(&args.input);
     if !input_path.exists() {
         bail!(
@@ -443,7 +443,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     println!("Directory: {}", args.output);
     println!();
 
-    // CSV files
     println!("CSV Files:");
     let mut csv_files: Vec<_> = fs::read_dir(output_dir)?
         .filter_map(|e| e.ok())
@@ -468,7 +467,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
     println!();
 
-    // Blob directories
     println!("Blob Directories:");
     let blobs_dir = output_dir.join("blobs");
     if blobs_dir.exists() {
@@ -495,7 +493,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
     }
     println!();
 
-    // DuckDB database
     let db_file = output_dir.join(dedalus::load::DEFAULT_DB_FILE);
     if let Ok(meta) = fs::metadata(&db_file) {
         println!("DuckDB:");
@@ -504,7 +501,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         println!();
     }
 
-    // Archived shards
     let shards_dir = output_dir.join("shards");
     if shards_dir.exists() {
         let shard_count = fs::read_dir(&shards_dir)
@@ -517,7 +513,6 @@ fn run_stats(args: StatsArgs) -> Result<()> {
         }
     }
 
-    // Total size
     let total_size = dir_size(output_dir);
     println!("Total size: {}", format_size(total_size));
     println!();
@@ -556,7 +551,7 @@ fn format_size(bytes: u64) -> String {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    // TUI sets up its own tracing subscriber, so handle it before the default one
+    // The TUI installs its own tracing subscriber, so it runs before the default one is set.
     if matches!(cli.command, Commands::Tui) {
         return match dedalus::tui::run_tui() {
             Ok(()) => ExitCode::SUCCESS,

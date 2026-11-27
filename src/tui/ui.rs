@@ -1,7 +1,8 @@
-//! TUI rendering functions for all three screens (config, progress, done).
+//! Rendering for the three TUI screens (config, progress, done).
 //!
-//! Uses `ratatui` widgets to draw tabbed configuration forms, real-time stats panels
-//! with optional progress bars, scrollable log output, and completion summaries.
+//! The config screen is a tabbed form per operation. The progress screen shows
+//! live stats, a progress bar when a page limit is set, and a scrollable log.
+//! The done screen shows a summary of the run.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -11,12 +12,12 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
 use super::app::*;
 
-/// Top-level draw dispatcher -- delegates to the handler for the current screen.
+/// Draws whichever screen is current.
 pub fn draw(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Config => draw_config(f, app),
         Screen::Progress => draw_progress(f, app),
-        Screen::Done => draw_done(f, app),
+        Screen::Done(outcome) => draw_done(f, app, outcome),
     }
 }
 
@@ -273,10 +274,7 @@ fn draw_progress(f: &mut Frame, app: &App) {
     );
     f.render_widget(header, chunks[0]);
 
-    // Stats table
     draw_stats_panel(f, app, chunks[1]);
-
-    // Log panel
     draw_log_panel(f, app, chunks[2]);
 
     // Controls
@@ -408,7 +406,7 @@ fn draw_log_panel(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn draw_done(f: &mut Frame, app: &App) {
+fn draw_done(f: &mut Frame, app: &App, outcome: Outcome) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -418,22 +416,16 @@ fn draw_done(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let has_error = app
-        .worker_error
-        .lock()
-        .map(|e| e.is_some())
-        .unwrap_or(false);
-    let title_style = if has_error {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::Green)
+    let (border_title, heading, color) = match outcome {
+        Outcome::Completed => (" Done ", "Complete", Color::Green),
+        Outcome::Canceled => (" Canceled ", "Canceled", Color::Yellow),
+        Outcome::Failed => (" Error ", "Failed", Color::Red),
     };
-    let title_text = if has_error { " Error " } else { " Done " };
     let title = Paragraph::new(Line::from(Span::styled(
-        format!("  {} Complete", app.operation.label()),
-        title_style,
+        format!("  {} {}", app.operation.label(), heading),
+        Style::default().fg(color),
     )))
-    .block(Block::default().borders(Borders::ALL).title(title_text));
+    .block(Block::default().borders(Borders::ALL).title(border_title));
     f.render_widget(title, chunks[0]);
 
     // Summary
@@ -445,6 +437,11 @@ fn draw_done(f: &mut Frame, app: &App) {
             format!("  Error: {}", e),
             Style::default().fg(Color::Red),
         )));
+        lines.push(Line::from(""));
+    }
+
+    if !app.done_message.is_empty() {
+        lines.push(Line::from(format!("  {}", app.done_message)));
         lines.push(Line::from(""));
     }
 
@@ -487,8 +484,6 @@ fn draw_done(f: &mut Frame, app: &App) {
                 format_num(s.external_links())
             )),
         ]);
-    } else {
-        lines.push(Line::from(format!("  {}", app.done_message)));
     }
 
     let summary =

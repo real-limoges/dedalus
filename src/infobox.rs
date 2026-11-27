@@ -1,7 +1,7 @@
-//! Brace-matching `{{Infobox ...}}` parser for structured key-value extraction.
+//! Brace-matching parser that pulls key-value fields out of `{{Infobox ...}}` templates.
 //!
-//! Correctly handles nested `{{...}}` templates using depth tracking with
-//! SIMD-accelerated `memchr` to skip over plain text between brace pairs.
+//! It tracks brace depth to match nested `{{...}}` templates, and uses `memchr`
+//! (SIMD-accelerated) to skip the plain text between braces.
 
 use memchr::{memchr, memchr2};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ pub fn extract_infoboxes(text: &str) -> Vec<Infobox> {
 }
 
 /// Byte offset of the first `{{Infobox` (case-insensitive, whitespace allowed
-/// after the braces). Uses SIMD-accelerated memchr to jump between `{` candidates.
+/// after the braces). `memchr` jumps from one `{` to the next.
 fn find_infobox_start(bytes: &[u8]) -> Option<usize> {
     let mut offset = 0;
     while let Some(pos) = memchr(b'{', &bytes[offset..]) {
@@ -66,8 +66,8 @@ fn is_infobox_open(bytes: &[u8]) -> bool {
     }
 }
 
-/// Finds the matching `}}` for a `{{` starting at `start`.
-/// Uses SIMD-accelerated memchr2 to skip over plain text between braces.
+/// Finds the `}}` that closes the `{{` at `start`.
+/// `memchr2` skips the plain text between braces.
 fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth: i32 = 0;
     let mut i = start;
@@ -82,7 +82,7 @@ fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
             }
             i += 2;
         } else {
-            // SIMD jump to next brace character
+            // Jump to the next `{` or `}`.
             match memchr2(b'{', b'}', &bytes[i..]) {
                 Some(offset) if offset > 0 => i += offset,
                 _ => i += 1,

@@ -1,8 +1,9 @@
 //! Multistream dump support for parallel decompression and parsing.
 //!
 //! Parses the bz2-compressed index file to extract `StreamRange` byte offsets,
-//! then provides `par_iter_pages()` where each rayon worker independently seeks,
-//! decompresses, and parses its own bz2 stream.
+//! then parses streams with `parse_stream` (one stream) or `parse_streams` (a
+//! run in dump order). Each rayon worker seeks to, decompresses and parses its
+//! own bz2 stream.
 
 use crate::models::WikiPage;
 use crate::parser::PageParser;
@@ -23,13 +24,13 @@ pub struct StreamRange {
     pub length: u64,
 }
 
-/// Parse the multistream index file to extract bz2 stream byte offsets.
+/// Parses the multistream index file into the byte range of each bz2 stream.
 ///
 /// The index file is bz2-compressed. Each decompressed line has the format:
 ///   `byte_offset:page_id:page_title`
 ///
-/// Multiple lines sharing the same byte_offset belong to the same bz2 stream.
-/// We group by offset and compute stream lengths from consecutive offsets.
+/// Lines that share a `byte_offset` belong to the same bz2 stream. Each
+/// stream's length is the distance to the next offset.
 pub fn parse_multistream_index(index_path: &str, dump_path: &str) -> Result<Vec<StreamRange>> {
     info!("Parsing multistream index: {}", index_path);
 
@@ -38,7 +39,8 @@ pub fn parse_multistream_index(index_path: &str, dump_path: &str) -> Result<Vec<
     let decoder = MultiBzDecoder::new(file);
     let reader = BufReader::with_capacity(256 * 1024, decoder);
 
-    // Collect unique offsets in order
+    // Collect offsets in file order, skipping a repeat of the previous one.
+    // `ranges_from_offsets` rejects any other repeat, since offsets must increase.
     let mut offsets: Vec<u64> = Vec::with_capacity(250_000);
     let mut last_offset: Option<u64> = None;
 
@@ -159,18 +161,16 @@ pub fn parse_streams(
     Ok(per_stream.into_iter().flatten().collect())
 }
 
-/// Try to auto-detect the multistream index file from the dump path.
+/// Finds the multistream index file for a dump from the dump's path.
 ///
-/// Wikipedia naming convention:
+/// Wikipedia names the two files like this:
 ///   Dump:  `*-multistream.xml.bz2`
 ///   Index: `*-multistream-index.txt.bz2`
 pub fn detect_index_path(dump_path: &str) -> Option<String> {
-    // Check if the dump filename contains "multistream"
     if !dump_path.contains("multistream") {
         return None;
     }
 
-    // Replace `.xml.bz2` with `-index.txt.bz2`
     let index_path = dump_path.replace(".xml.bz2", "-index.txt.bz2");
     if index_path == dump_path {
         return None;
@@ -352,7 +352,6 @@ mod tests {
             .path()
             .join("enwiki-latest-pages-articles-multistream-index.txt.bz2");
 
-        // Create empty files
         File::create(&dump_path).unwrap();
         File::create(&index_path).unwrap();
 

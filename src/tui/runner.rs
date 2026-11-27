@@ -1,8 +1,9 @@
 //! Background worker threads for TUI operations.
 //!
 //! Each operation (extract, merge, analytics, load) runs on its own thread
-//! through `spawn_worker`, which always marks the worker done, even if the
-//! operation panics, and records any error for the Done screen.
+//! through `spawn_worker`, which marks the worker done and records any error
+//! for the Done screen. In a debug build that holds after a panic too; release
+//! builds set `panic = 'abort'`, so a panic ends the process.
 
 use crate::extract::{ExtractJob, ExtractReport, run_extract_job};
 use crate::stats::ExtractionStats;

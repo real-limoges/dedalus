@@ -8,8 +8,9 @@ When the design changes, rewrite it in place, with no dated changelog and no cor
 Nothing here cites the private parts of `docs/`.
 Decision records may point at these pages; these pages state the facts themselves rather than pointing back.
 
-Other material written here about how the system works (guides, explainers, walkthroughs) is not reference and is not committed; it stays in private notes.
+Guides, explainers and walkthroughs about how the system works are not reference.
+They are not committed; they stay in private notes.
 
 | File | Shows |
 |---|---|
-| | |
+| `architecture.md` | The passes (index, extract, merge, analytics, load) and the files each one writes |

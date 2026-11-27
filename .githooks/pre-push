@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Lint, dependency check and tests before every push: `just pre-push`.
-# CI runs the same recipes, plus macOS and Linux, the minimum Rust version
-# and a release smoke run. Enable with: git config core.hooksPath .githooks
+# CI runs the same recipes on macOS and Linux, and adds the minimum Rust
+# version check and a release smoke run.
+# Enable with: git config core.hooksPath .githooks
 set -euo pipefail
 
 if ! command -v just > /dev/null; then

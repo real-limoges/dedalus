@@ -1,38 +1,33 @@
-//! Comprehensive integration tests for the Dedalus Wikipedia extraction pipeline.
+//! Integration tests for the whole pipeline: bz2-compressed XML in, then CSV extraction
+//! and JSON blobs, then merge, analytics and the DuckDB load. The sections:
 //!
-//! This module tests the complete data flow from BZ2-compressed XML input through
-//! CSV extraction and JSON blobs to merge, analytics and the DuckDB load. Tests are
-//! organized into logical sections:
-//!
-//! - **Parser Tests** -- XML parsing, BZ2 decompression, page type classification
-//! - **Index Tests** -- Title-to-ID mapping, redirect chain resolution
-//! - **Extraction Tests** -- CSV generation, exact edges, JSON blob output, abstracts
-//! - **Feature Tests** -- Categories, images, external links, infoboxes, see-also sections
-//! - **Sharding Tests** -- CSV shard distribution for parallel extraction
-//! - **Resume and Limit Tests** -- Crash recovery and exact page limits across chunks
-//! - **End to End** -- Extract, merge, analytics and load into DuckDB
+//! - Parser: XML parsing, bz2 decompression, page type classification.
+//! - Index: title-to-id mapping and redirect chain resolution.
+//! - Extraction: CSV output, exact edges, JSON blobs, abstracts.
+//! - Features: categories, images, external links, infoboxes, "See also" sections.
+//! - Sharding: how CSV rows spread across shards for parallel extraction.
+//! - Resume and limits: crash recovery, and exact page limits across chunks.
+//! - End to end: extract, merge, analytics and the load into DuckDB.
 //!
 //! # Test Strategy
 //!
-//! All tests use a shared `sample_xml()` fixture representing a minimal Wikipedia dump
-//! with articles, redirects, and special pages. This approach ensures consistency and
-//! makes it easy to trace expected behavior across tests.
+//! Most tests share the `sample_xml()` fixture, a minimal dump with articles, a redirect
+//! and special pages, so an expected value in one test can be traced to the same input
+//! as the others.
 //!
-//! ## Key Patterns
-//!
-//! - **Fixture creation**: Use `create_bz2_xml(sample_xml())` to get a temp BZ2 file
-//! - **Index building**: Always build index before extraction to resolve redirects
-//! - **Output validation**: Check both file existence and content correctness
-//! - **Statistics**: Verify counters match extracted data (articles, edges, categories)
-//! - **Isolation**: Each test uses its own TempDir to avoid cross-test pollution
+//! - `create_bz2_xml(sample_xml())` gives a temporary bz2 file.
+//! - The index is built before extraction, since extraction needs it to resolve redirects.
+//! - Assertions check that each output file exists and what it contains.
+//! - Counters in the stats are compared with the extracted articles, edges and categories.
+//! - Each test writes to its own `TempDir`.
 //!
 //! # Sample Data
 //!
-//! The test fixture includes:
-//! - 2 articles: "Rust (programming language)", "Python (programming language)"
-//! - 1 redirect: "Rust" → "Rust (programming language)"
-//! - 2 special pages: File:Rust logo.svg, Category:Programming languages
-//! - Article features: wikilinks, categories, infoboxes, see-also sections, images, external links
+//! - 2 articles: "Rust (programming language)" and "Python (programming language)".
+//! - 1 redirect: "Rust" to "Rust (programming language)".
+//! - 2 special pages: "File:Rust logo.svg" and "Category:Programming languages".
+//! - The articles carry wikilinks, categories, infoboxes, "See also" sections, images
+//!   and external links.
 
 use bzip2::Compression;
 use bzip2::write::BzEncoder;
@@ -47,10 +42,8 @@ use dedalus::parser::WikiReader;
 use std::io::Write;
 use tempfile::{NamedTempFile, TempDir};
 
-/// Helper: create a BZ2-compressed XML file from a string and return the temp file handle.
-///
-/// This simulates real Wikipedia dump format by compressing XML with BZ2.
-/// The returned NamedTempFile keeps the file alive until it goes out of scope.
+/// Compresses `xml` with bz2 into a temporary file, the way a real dump is stored.
+/// The file is deleted when the returned `NamedTempFile` drops.
 fn create_bz2_xml(xml: &str) -> NamedTempFile {
     let mut encoder = BzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(xml.as_bytes()).unwrap();
@@ -144,7 +137,7 @@ Some refs.
     </mediawiki>"#
 }
 
-/// Helper to build an ExtractionConfig with common defaults.
+/// An `ExtractionConfig` with the settings most tests share.
 fn make_config<'a>(
     input_path: &'a str,
     output_dir: &'a str,
@@ -292,10 +285,9 @@ fn extraction_produces_csv_files() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Should have processed the 2 articles (not redirects/special)
+    // The redirect and the special pages are not articles.
     assert_eq!(stats.articles(), 2);
 
-    // nodes.csv should exist with header + article rows
     let nodes_path = output_dir.path().join("nodes.csv");
     assert!(nodes_path.exists());
     let nodes_content = std::fs::read_to_string(&nodes_path).unwrap();
@@ -305,7 +297,6 @@ fn extraction_produces_csv_files() {
     assert!(lines[0].contains("title"));
     assert!(lines[0].contains(":LABEL"));
 
-    // edges.csv should exist
     let edges_path = output_dir.path().join("edges.csv");
     assert!(edges_path.exists());
     let edges_content = std::fs::read_to_string(&edges_path).unwrap();
@@ -365,7 +356,7 @@ fn extraction_writes_json_blobs() {
 
     assert!(stats.blobs() >= 1);
 
-    // Check that a blob file exists and is valid JSON (page id 1 is in shard 001)
+    // Page id 1 lands in shard 001, and its blob must parse as JSON.
     let blob_path = output_dir.path().join("blobs/001/1.json");
     assert!(
         blob_path.exists(),
@@ -377,7 +368,7 @@ fn extraction_writes_json_blobs() {
     let blob: ArticleBlob = serde_json::from_str(&blob_content).unwrap();
     assert_eq!(blob.id, 1);
     assert_eq!(blob.title, "Rust (programming language)");
-    // abstract_text should contain the lead section, not the full text
+    // `abstract_text` holds the lead section, not the whole article.
     assert!(blob.abstract_text.contains("systems programming language"));
 }
 
@@ -397,10 +388,9 @@ fn extraction_dry_run_writes_no_files() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Stats should still be collected
+    // A dry run still counts pages, but writes no blobs.
     assert_eq!(stats.articles(), 2);
 
-    // But no blob files should be written
     assert_eq!(stats.blobs(), 0);
     let blobs_dir = output_dir.path().join("blobs");
     assert!(!blobs_dir.exists());
@@ -422,8 +412,8 @@ fn extraction_respects_limit() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // With limit=1, at most 1 article should be processed
-    // (the limit applies to all page types seen, not just articles)
+    // The limit counts every page read, whatever its type, so a limit of 1
+    // allows at most one article.
     assert!(stats.articles() <= 1);
 }
 
@@ -453,11 +443,9 @@ fn nodes_csv_has_typed_headers_and_numeric_ids() {
 
     for record in rdr.records() {
         let record = record.unwrap();
-        // id should be numeric
+        // The id must parse as a number.
         record.get(0).unwrap().parse::<u32>().unwrap();
-        // title should be non-empty
         assert!(!record.get(1).unwrap().is_empty());
-        // label should be "Page"
         assert_eq!(record.get(2).unwrap(), "Page");
     }
 }
@@ -488,10 +476,9 @@ fn edges_csv_has_typed_headers_and_known_types() {
 
     for record in rdr.records() {
         let record = record.unwrap();
-        // start and end IDs should be numeric
+        // Both ids must parse as numbers.
         record.get(0).unwrap().parse::<u32>().unwrap();
         record.get(1).unwrap().parse::<u32>().unwrap();
-        // type should be LINKS_TO or SEE_ALSO
         let edge_type = record.get(2).unwrap();
         assert!(
             edge_type == "LINKS_TO" || edge_type == "SEE_ALSO",
@@ -502,7 +489,7 @@ fn edges_csv_has_typed_headers_and_known_types() {
 }
 
 // ---------------------------------------------------------------------------
-// New feature tests
+// Feature tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -521,7 +508,6 @@ fn extraction_produces_category_files() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // categories.csv should exist with correct headers
     let cats_path = output_dir.path().join("categories.csv");
     assert!(cats_path.exists());
     let mut rdr = csv::Reader::from_path(&cats_path).unwrap();
@@ -530,7 +516,6 @@ fn extraction_produces_category_files() {
     assert_eq!(headers.get(1).unwrap(), "name");
     assert_eq!(headers.get(2).unwrap(), ":LABEL");
 
-    // article_categories.csv should exist
     let cat_edges_path = output_dir.path().join("article_categories.csv");
     assert!(cat_edges_path.exists());
     let mut rdr = csv::Reader::from_path(&cat_edges_path).unwrap();
@@ -539,8 +524,7 @@ fn extraction_produces_category_files() {
     assert_eq!(headers.get(1).unwrap(), ":END_ID(Category)");
     assert_eq!(headers.get(2).unwrap(), ":TYPE");
 
-    // Should have found categories
-    assert!(stats.categories() >= 2); // "Programming languages" + "Systems programming languages"
+    assert!(stats.categories() >= 2); // "Programming languages", "Systems programming languages"
     assert!(stats.category_edges() >= 3); // Rust has 2, Python has 1
 }
 
@@ -560,7 +544,6 @@ fn extraction_produces_images_csv() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Check image nodes file
     let image_nodes_path = output_dir.path().join("image_nodes.csv");
     assert!(image_nodes_path.exists());
     let mut rdr = csv::Reader::from_path(&image_nodes_path).unwrap();
@@ -568,7 +551,6 @@ fn extraction_produces_images_csv() {
     assert_eq!(headers.get(0).unwrap(), "id:ID(Image)");
     assert_eq!(headers.get(1).unwrap(), "filename");
 
-    // Check article-images relationship file
     let article_images_path = output_dir.path().join("article_images.csv");
     assert!(article_images_path.exists());
     let mut rdr = csv::Reader::from_path(&article_images_path).unwrap();
@@ -595,7 +577,6 @@ fn extraction_produces_external_links_csv() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Check external link nodes file
     let extlink_nodes_path = output_dir.path().join("external_link_nodes.csv");
     assert!(extlink_nodes_path.exists());
     let mut rdr = csv::Reader::from_path(&extlink_nodes_path).unwrap();
@@ -603,7 +584,6 @@ fn extraction_produces_external_links_csv() {
     assert_eq!(headers.get(0).unwrap(), "id:ID(ExternalLink)");
     assert_eq!(headers.get(1).unwrap(), "url");
 
-    // Check article-external-links relationship file
     let article_extlinks_path = output_dir.path().join("article_external_links.csv");
     assert!(article_extlinks_path.exists());
     let mut rdr = csv::Reader::from_path(&article_extlinks_path).unwrap();
@@ -634,14 +614,12 @@ fn blob_contains_enriched_data() {
     let blob_content = std::fs::read_to_string(&blob_path).unwrap();
     let blob: ArticleBlob = serde_json::from_str(&blob_content).unwrap();
 
-    // Should have categories
     assert!(!blob.categories.is_empty());
     assert!(
         blob.categories
             .contains(&"Programming languages".to_string())
     );
 
-    // Should have infobox
     assert!(!blob.infoboxes.is_empty());
     assert!(
         blob.infoboxes[0]
@@ -649,15 +627,12 @@ fn blob_contains_enriched_data() {
             .contains("Infobox programming language")
     );
 
-    // Should have sections
     assert!(!blob.sections.is_empty());
     assert!(blob.sections.contains(&"History".to_string()));
 
-    // Should have timestamp
     assert!(blob.timestamp.is_some());
     assert_eq!(blob.timestamp.as_deref(), Some("2024-01-15T10:30:00Z"));
 
-    // Should not be disambiguation
     assert!(!blob.is_disambiguation);
 }
 
@@ -677,10 +652,9 @@ fn extraction_finds_see_also_edges() {
     );
     let stats = run_extraction(&config).unwrap();
 
-    // Rust has a "See also" section with Python
+    // Rust has a "See also" section with Python.
     assert!(stats.see_also_edges() >= 1);
 
-    // Verify edge types in CSV
     let edges_path = output_dir.path().join("edges.csv");
     let content = std::fs::read_to_string(&edges_path).unwrap();
     assert!(content.contains("SEE_ALSO"));
@@ -771,11 +745,10 @@ fn sharded_csv_produces_numbered_files() {
 
     assert_eq!(stats.articles(), 2);
 
-    // With csv_shards=4, should produce numbered files, not the single-file names
+    // With 4 CSV shards, every type gets 4 numbered files and no unnumbered one.
     assert!(!output_dir.path().join("nodes.csv").exists());
     assert!(!output_dir.path().join("edges.csv").exists());
 
-    // Should have 4 shard files for each CSV type
     for base in &[
         "nodes",
         "edges",
@@ -792,7 +765,7 @@ fn sharded_csv_produces_numbered_files() {
         }
     }
 
-    // Each shard file should have a header
+    // Every shard has its own header.
     for shard in 0..4u32 {
         let path = output_dir.path().join(format!("nodes_{:03}.csv", shard));
         let content = std::fs::read_to_string(&path).unwrap();
@@ -800,7 +773,7 @@ fn sharded_csv_produces_numbered_files() {
         assert!(lines[0].contains("id:ID"), "Shard {} missing header", shard);
     }
 
-    // All node records across shards should total 2 articles
+    // Between them, the shards hold the 2 articles.
     let mut total_records = 0;
     for shard in 0..4u32 {
         let path = output_dir.path().join(format!("nodes_{:03}.csv", shard));
@@ -826,7 +799,7 @@ fn single_csv_shard_produces_original_filenames() {
     );
     run_extraction(&config).unwrap();
 
-    // With csv_shards=1, should produce original filenames
+    // One CSV shard writes the unnumbered names and no numbered ones.
     assert!(output_dir.path().join("nodes.csv").exists());
     assert!(output_dir.path().join("edges.csv").exists());
     assert!(output_dir.path().join("categories.csv").exists());
@@ -841,7 +814,6 @@ fn single_csv_shard_produces_original_filenames() {
             .exists()
     );
 
-    // Should NOT have numbered files
     assert!(!output_dir.path().join("nodes_000.csv").exists());
 }
 

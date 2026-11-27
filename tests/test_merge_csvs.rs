@@ -1,30 +1,30 @@
 //! Tests for CSV shard merging and deduplication.
 //!
-//! This module validates `merge::merge_csv_shards()` and `merge::merge_detected_shards()`,
-//! which combine numbered CSV files (e.g., `nodes_000.csv`, `nodes_001.csv`) into the
-//! single merged files that `dedalus load` and `dedalus analytics` read.
+//! `merge::merge_csv_shards()` and `merge::merge_detected_shards()` combine numbered
+//! CSV files (`nodes_000.csv`, `nodes_001.csv`, ...) into the single files that
+//! `dedalus load` and `dedalus analytics` read.
 //!
 //! # Merge Strategy
 //!
-//! The merge process handles all 8 CSV types with special deduplication for:
-//! - **categories.csv** -- Deduplicated by category name (ID field)
-//! - **image_nodes.csv** -- Deduplicated by filename (ID field)
-//! - **external_link_nodes.csv** -- Deduplicated by URL (ID field)
+//! The merge handles all 8 CSV types. Three of them are deduplicated on their ID field:
+//! - `categories.csv` by category name
+//! - `image_nodes.csv` by filename
+//! - `external_link_nodes.csv` by URL
 //!
-//! Other CSV types (nodes, edges, article relationships) are simply concatenated
-//! because they don't have cross-shard duplicates by design (page_id sharding).
+//! The rest (nodes, edges, article relationships) are concatenated. Rows are sharded
+//! by `page_id`, so those files have no duplicates across shards.
 //!
 //! # Test Fixtures
 //!
-//! Tests use the `create_test_shard()` helper to generate realistic CSV shards with
-//! intentional duplicates across shards to validate that deduplication works correctly.
-//! The helper writes the same typed-column headers that extraction writes.
+//! `create_test_shard()` writes shards with the same typed-column headers that
+//! extraction writes. The fixtures repeat some entities across shards on purpose,
+//! so the tests can count them after the merge.
 //!
 //! # Typical Workflow
 //!
-//! 1. Extract with `--csv-shards 8` to get 8 shard files per CSV type (1.62x faster)
-//! 2. Run `dedalus merge-csvs` to produce single files (<5 min overhead)
-//! 3. Run `dedalus load`, which reads only the merged files
+//! 1. Extract with `--csv-shards 8` to get 8 shard files per CSV type (1.62x faster).
+//! 2. Run `dedalus merge-csvs` to produce single files (under 5 minutes of overhead).
+//! 3. Run `dedalus load`, which reads only the merged files.
 
 use anyhow::Result;
 use dedalus::merge;
@@ -33,10 +33,8 @@ use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Helper to create a test CSV shard file.
-///
-/// Creates a numbered CSV shard (e.g., `nodes_003.csv`) with the given header and rows.
-/// This simulates the output format from `--csv-shards N` extraction.
+/// Writes a numbered CSV shard (`nodes_003.csv`, say) with the given header and rows,
+/// in the layout that extraction with `--csv-shards N` produces.
 fn create_test_shard(
     dir: &Path,
     base_name: &str,
@@ -58,8 +56,8 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_dir = temp_dir.path().to_str().unwrap();
 
-    // Create all 6 CSV types with 2 shards each
-    // Nodes - no duplicates
+    // All 8 CSV types, 2 shards each.
+    // Nodes: no duplicates.
     create_test_shard(
         temp_dir.path(),
         "nodes",
@@ -75,7 +73,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         &["3,Article_Three,Article", "4,Article_Four,Article"],
     )?;
 
-    // Edges - no duplicates
+    // Edges: no duplicates.
     create_test_shard(
         temp_dir.path(),
         "edges",
@@ -91,7 +89,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         &["3,4,LINKS_TO", "4,1,LINKS_TO"],
     )?;
 
-    // Categories - WITH DUPLICATES (Science appears in both shards)
+    // Categories: Science appears in both shards.
     create_test_shard(
         temp_dir.path(),
         "categories",
@@ -127,7 +125,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         &["3,History,HAS_CATEGORY", "4,Biology,HAS_CATEGORY"],
     )?;
 
-    // Image nodes - WITH DUPLICATES (image1.jpg appears in both shards)
+    // Image nodes: image1.jpg appears in both shards.
     create_test_shard(
         temp_dir.path(),
         "image_nodes",
@@ -159,7 +157,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         &["3,image3.gif,HAS_IMAGE", "4,image1.jpg,HAS_IMAGE"],
     )?;
 
-    // External link nodes - WITH DUPLICATES (example.com appears in both shards)
+    // External link nodes: example.com appears in both shards.
     create_test_shard(
         temp_dir.path(),
         "external_link_nodes",
@@ -198,10 +196,8 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         ],
     )?;
 
-    // Run merge
     merge::merge_csv_shards(output_dir, 2)?;
 
-    // Verify merged files exist
     assert!(temp_dir.path().join("nodes.csv").exists());
     assert!(temp_dir.path().join("edges.csv").exists());
     assert!(temp_dir.path().join("categories.csv").exists());
@@ -211,31 +207,30 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
     assert!(temp_dir.path().join("external_link_nodes.csv").exists());
     assert!(temp_dir.path().join("article_external_links.csv").exists());
 
-    // Verify nodes - should have 4 data rows + 1 header = 5 lines
+    // Nodes are concatenated: 4 rows plus the header.
     let nodes_content = fs::read_to_string(temp_dir.path().join("nodes.csv"))?;
     assert_eq!(nodes_content.lines().count(), 5);
     assert!(nodes_content.contains("Article_One"));
     assert!(nodes_content.contains("Article_Four"));
 
-    // Verify edges - should have 4 data rows + 1 header = 5 lines
+    // Edges too: 4 rows plus the header.
     let edges_content = fs::read_to_string(temp_dir.path().join("edges.csv"))?;
     assert_eq!(edges_content.lines().count(), 5);
 
-    // Verify categories - should have DEDUPLICATED to 4 unique categories (Science, Math, History, Biology)
+    // Categories collapse to 4: Science, Math, History and Biology.
     let categories_content = fs::read_to_string(temp_dir.path().join("categories.csv"))?;
     let category_lines: Vec<&str> = categories_content.lines().collect();
 
-    // 1 header + 4 unique categories = 5 lines total
     assert_eq!(
         category_lines.len(),
         5,
         "Expected 5 lines (1 header + 4 unique categories)"
     );
 
-    // Count occurrences of "Science" - should appear exactly once (excluding header)
+    // The shared category survives exactly once.
     let science_count = category_lines
         .iter()
-        .skip(1) // Skip header
+        .skip(1) // The header
         .filter(|line| line.starts_with("Science,"))
         .count();
     assert_eq!(
@@ -243,7 +238,6 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "Science should appear exactly once after deduplication"
     );
 
-    // Verify all expected categories are present
     assert!(
         categories_content.contains("Science,Science,Category"),
         "Science category should be present"
@@ -261,12 +255,12 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "Biology category should be present"
     );
 
-    // Verify article_categories - should have 4 data rows + 1 header = 5 lines
+    // Article categories are concatenated: 4 rows plus the header.
     let article_categories_content =
         fs::read_to_string(temp_dir.path().join("article_categories.csv"))?;
     assert_eq!(article_categories_content.lines().count(), 5);
 
-    // Verify image_nodes - should have DEDUPLICATED to 3 unique images (image1.jpg, image2.png, image3.gif)
+    // Images collapse to 3: image1.jpg, image2.png and image3.gif.
     let image_nodes_content = fs::read_to_string(temp_dir.path().join("image_nodes.csv"))?;
     let image_lines: Vec<&str> = image_nodes_content.lines().collect();
     assert_eq!(
@@ -275,7 +269,6 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "Expected 4 lines (1 header + 3 unique images)"
     );
 
-    // Count occurrences of "image1.jpg" - should appear exactly once
     let image1_count = image_lines
         .iter()
         .skip(1)
@@ -286,11 +279,11 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "image1.jpg should appear exactly once after deduplication"
     );
 
-    // Verify article_images - should have 4 data rows + 1 header = 5 lines
+    // Article images are concatenated: 4 rows plus the header.
     let article_images_content = fs::read_to_string(temp_dir.path().join("article_images.csv"))?;
     assert_eq!(article_images_content.lines().count(), 5);
 
-    // Verify external_link_nodes - should have DEDUPLICATED to 3 unique links
+    // External links collapse to 3.
     let extlink_nodes_content =
         fs::read_to_string(temp_dir.path().join("external_link_nodes.csv"))?;
     let extlink_lines: Vec<&str> = extlink_nodes_content.lines().collect();
@@ -300,7 +293,6 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "Expected 4 lines (1 header + 3 unique external links)"
     );
 
-    // Count occurrences of "example.com" - should appear exactly once
     let example_com_count = extlink_lines
         .iter()
         .skip(1)
@@ -311,7 +303,7 @@ fn test_merge_csvs_with_category_deduplication() -> Result<()> {
         "example.com should appear exactly once after deduplication"
     );
 
-    // Verify article_external_links - should have 3 data rows + 1 header = 4 lines
+    // Article external links are concatenated: 3 rows plus the header.
     let article_extlinks_content =
         fs::read_to_string(temp_dir.path().join("article_external_links.csv"))?;
     assert_eq!(article_extlinks_content.lines().count(), 4);
@@ -324,7 +316,7 @@ fn test_merge_csvs_handles_many_shards() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let output_dir = temp_dir.path().to_str().unwrap();
 
-    // Create 8 shards (typical for production)
+    // 8 shards, the usual count for a real run.
     for shard in 0..8 {
         let node_row = format!("{},Article{},Article", shard * 10, shard);
         create_test_shard(
@@ -343,7 +335,7 @@ fn test_merge_csvs_handles_many_shards() -> Result<()> {
             &[],
         )?;
 
-        // Create categories with overlapping "Common" category across all shards
+        // Every shard has "Common" and one category of its own.
         let cat_row = format!("Cat{},Cat{},Category", shard, shard);
         create_test_shard(
             temp_dir.path(),
@@ -394,14 +386,12 @@ fn test_merge_csvs_handles_many_shards() -> Result<()> {
         )?;
     }
 
-    // Run merge, letting it count the shards
+    // The merge counts the shards itself.
     assert_eq!(merge::merge_detected_shards(output_dir)?, 8);
 
-    // Verify categories deduplication worked - "Common" should appear only once
     let categories_content = fs::read_to_string(temp_dir.path().join("categories.csv"))?;
     let category_lines: Vec<&str> = categories_content.lines().collect();
 
-    // Count "Common" occurrences (excluding header)
     let common_count = category_lines
         .iter()
         .skip(1)
@@ -413,7 +403,7 @@ fn test_merge_csvs_handles_many_shards() -> Result<()> {
         "Common category should appear exactly once despite being in 8 shards"
     );
 
-    // Should have 1 header + 1 Common + 8 unique Cat0-Cat7 = 10 lines
+    // The header, Common, and Cat0 through Cat7.
     assert_eq!(
         category_lines.len(),
         10,

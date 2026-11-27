@@ -2,7 +2,7 @@
 //!
 //! `PageParser<R>` implements `Iterator<Item = WikiPage>` over any `Read` source
 //! using a state machine over `quick-xml` events. `WikiReader` wraps it with BZ2
-//! decompression, probing PATH for `lbzip2`/`pbzip2` for parallel decompression.
+//! decompression, using `lbzip2` or `pbzip2` from `PATH` when one is present.
 
 use crate::models::{PageType, WikiPage};
 use anyhow::{Context, Result};
@@ -39,8 +39,7 @@ impl Read for DecompressSource {
     }
 }
 
-/// Generic XML page parser that works with any `Read` source.
-/// Extracts `WikiPage` items from a MediaWiki XML stream.
+/// Reads `WikiPage` items from a MediaWiki XML stream over any `Read` source.
 ///
 /// Iteration ends at end of input or at the first XML or read error. The two
 /// look the same to a `for` loop, so callers that must not accept truncated
@@ -284,10 +283,10 @@ impl<R: Read> Iterator for PageParser<R> {
     }
 }
 
-/// High-level Wikipedia dump reader with automatic BZ2 decompression.
+/// Reads a bz2-compressed Wikipedia dump as an `Iterator<Item = WikiPage>`.
 ///
-/// Probes PATH for `lbzip2`/`pbzip2` for parallel decompression; falls back
-/// to in-process `MultiBzDecoder`. Implements `Iterator<Item = WikiPage>`.
+/// Decompresses with `lbzip2` or `pbzip2` when one is on `PATH`, since both
+/// run in parallel. Otherwise it uses the in-process `MultiBzDecoder`.
 pub struct WikiReader {
     parser: PageParser<DecompressSource>,
     _child: Option<Child>,
@@ -358,7 +357,7 @@ impl WikiReader {
         self
     }
 
-    /// Constructor that forces in-process decompression, bypassing external tool detection.
+    /// Opens the dump with in-process decompression, without looking for an external tool.
     #[cfg(test)]
     fn new_inprocess(path: &str, skip_text: bool) -> Result<Self> {
         let file = File::open(path).with_context(|| format!("Could not open file: {}", path))?;

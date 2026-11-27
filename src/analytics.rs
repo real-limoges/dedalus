@@ -358,9 +358,9 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
     let mut rank = vec![1.0 / n as f64; n];
     let mut new_rank = vec![0.0f64; n];
     // What each node sends along each of its links this iteration. Computing
-    // it once per node, not once per link, is the same arithmetic in the same
-    // order, so the ranks do not change. A dangling node sends nothing along
-    // links (it has none); its rank goes through `dangling_mass` instead.
+    // it once per node gives the same ranks as computing it per link, since
+    // the arithmetic and its order are the same. A dangling node has no links
+    // to send along; its rank goes through `dangling_mass` instead.
     let mut contrib = vec![0.0f64; n];
     let mut iterations = 0u32;
     let mut residual = f64::INFINITY;
@@ -410,12 +410,13 @@ fn compute_pagerank(graph: &CsrGraph, damping: f64, max_iterations: u32, epsilon
 /// Finds communities by label propagation, in parallel with rayon.
 ///
 /// Every node starts with its own label. Each pass computes every node's new
-/// label from the previous pass's labels: the label most common among its
-/// neighbors (both directions) plus one vote for its own current label. Ties
-/// go to the smallest label, so the result does not depend on thread timing or
-/// hash map order. The self vote stops two linked nodes from swapping labels
-/// forever, which a plain synchronous update would do. Runs until no label
-/// changes or `max_iterations` passes, logging how many changed in each.
+/// label from the previous pass's labels. The new label is the most common one
+/// among its neighbors in both directions, plus one vote for its own current
+/// label. Ties go to the smallest label, so the result does not depend on
+/// thread timing or hash map order. The self vote stops two linked nodes from
+/// swapping labels forever, as a plain synchronous update would. Passes run
+/// until no label changes or `max_iterations` is reached, and each pass logs
+/// how many labels changed.
 fn compute_label_propagation(graph: &CsrGraph, max_iterations: u32) -> Vec<u32> {
     let mut labels: Vec<u32> = (0..graph.n as u32).collect();
     let mut next: Vec<u32> = vec![0; graph.n];
@@ -642,8 +643,8 @@ mod tests {
         assert_ne!(labels[0], labels[3]);
     }
 
-    /// The hash-map vote count `most_common_label` replaced, kept as the
-    /// reference it must agree with.
+    /// A hash-map vote count: the reference that `most_common_label` must
+    /// agree with.
     fn reference_label(graph: &CsrGraph, labels: &[u32], i: usize) -> u32 {
         let mut counts: FxHashMap<u32, u32> = FxHashMap::default();
         counts.insert(labels[i], 1);

@@ -30,7 +30,8 @@ allow = [
 confidence-threshold = 0.9
 
 [bans]
-# Two versions of one crate are common in this tree and harmless; say so.
+# Two versions of one crate are common in this tree and harmless, so they
+# only warn.
 multiple-versions = "warn"
 wildcards = "deny"
 

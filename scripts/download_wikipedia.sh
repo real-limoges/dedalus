@@ -17,10 +17,10 @@ MIRRORS=(
 DUMP_PATH="${OUTPUT_DIR}/${DUMP_FILENAME}"
 INDEX_PATH="${OUTPUT_DIR}/${INDEX_FILENAME}"
 
-# Create output directory if needed
 mkdir -p "${OUTPUT_DIR}"
 
-# Pick the fastest mirror by timing a small HEAD request
+# Picks the mirror that answers a HEAD request for the checksum file fastest,
+# giving each 5 seconds.
 pick_mirror() {
     if [ -n "${DUMP_URL:-}" ]; then
         echo "${DUMP_URL}"
@@ -32,7 +32,6 @@ pick_mirror() {
     local best_time="999"
 
     for url in "${MIRRORS[@]}"; do
-        # Time a HEAD request, timeout after 5s
         local t
         t=$(curl -sI -o /dev/null -w "%{time_total}" --max-time 5 "${url}${CHECKSUM_FILE}" 2>/dev/null || echo "999")
         echo "    ${url} -> ${t}s" >&2
@@ -59,7 +58,8 @@ echo "Dump:   ${DUMP_PATH}"
 echo "Index:  ${INDEX_PATH}"
 echo
 
-# Download a file with resume support, falling back through mirrors on failure
+# Downloads a file, resuming a partial one, and falls back through the other
+# mirrors when one fails.
 download() {
     local filename="$1"
     local dest="$2"
@@ -72,7 +72,7 @@ download() {
         fi
     fi
 
-    # Try the selected mirror first, then fall back to others
+    # The selected mirror first, then the rest in list order.
     local urls=("${BASE_URL}")
     for url in "${MIRRORS[@]}"; do
         if [ "${url}" != "${BASE_URL}" ]; then
@@ -92,21 +92,20 @@ download() {
     return 1
 }
 
-# Download the multistream index (small, ~250MB compressed)
+# The index is small next to the dump: about 250MB compressed.
 echo "==> Downloading multistream index..."
 download "${INDEX_FILENAME}" "${INDEX_PATH}"
 echo
 
-# Download the dump (resumable, ~22GB)
+# The dump is about 22GB, and an interrupted download resumes.
 echo "==> Downloading multistream dump (~22GB, may take a while)..."
 download "${DUMP_FILENAME}" "${DUMP_PATH}"
 echo
 
-# Download checksums
+# If the checksum file cannot be fetched, the script warns and skips verification.
 echo "==> Downloading checksums..."
 curl -sL --fail -o "${OUTPUT_DIR}/${CHECKSUM_FILE}" "${BASE_URL}${CHECKSUM_FILE}" || true
 
-# Extract expected checksum for our file
 if [ ! -f "${OUTPUT_DIR}/${CHECKSUM_FILE}" ]; then
     echo "WARNING: Could not download checksum file. Skipping verification."
     exit 0
@@ -119,7 +118,6 @@ if [ -z "${EXPECTED}" ]; then
     exit 0
 fi
 
-# Verify checksum
 echo "==> Verifying SHA1 checksum for dump..."
 if command -v shasum &>/dev/null; then
     ACTUAL=$(shasum "${DUMP_PATH}" | awk '{print $1}')

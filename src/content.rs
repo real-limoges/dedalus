@@ -1,8 +1,8 @@
 //! Regex-based text extraction from Wikipedia article wikitext.
 //!
-//! Provides functions for extracting abstracts, section headings, see-also links,
-//! categories, images, external links, and disambiguation detection. Uses
-//! SIMD-accelerated `memchr` for fast template stripping.
+//! Extracts the abstract, section headings, the "See also" section, categories,
+//! images and external links, and detects disambiguation pages.
+//! `strip_templates` uses SIMD-accelerated `memchr2` to find braces.
 
 use crate::title::normalize_title;
 use memchr::memchr2;
@@ -11,9 +11,11 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::ops::Range;
 
-// Link-shaped patterns exclude `[` and `]` from the target and the piped text,
-// so `[[File:X.jpg|See [[Rust]] here]]` cannot swallow the inner `[[Rust]]`,
-// and accept an empty piped part for the pipe trick (`[[Foo (bar)|]]`).
+// LINK_REGEX and CATEGORY_REGEX exclude `[` and `]` from the target and the
+// piped text, so `[[File:X.jpg|See [[Rust]] here]]` cannot swallow the inner
+// `[[Rust]]`. Both accept an empty piped part for the pipe trick
+// (`[[Foo (bar)|]]`). IMAGE_REGEX only keeps `|` and `]` out of the file name;
+// its caption may contain `[`, since only the name is used.
 
 static CATEGORY_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)\[\[\s*Category\s*:([^|\[\]]+?)(?:\|[^\[\]]*)?\]\]").unwrap());
@@ -94,7 +96,7 @@ pub fn extract_abstract(text: &str) -> String {
         .unwrap_or(stripped.len());
     let lead = to_plain_text(&stripped[..end_pos]);
 
-    // Build result string directly instead of collect + join to reduce allocations
+    // Push into one preallocated string, which allocates less than collect and join.
     let mut result = String::with_capacity(lead.len());
     for line in lead.lines() {
         let trimmed = line.trim();
@@ -218,10 +220,11 @@ fn unique_nonempty<'a>(items: impl Iterator<Item = Cow<'a, str>>) -> Vec<Cow<'a,
         .collect()
 }
 
-/// Collapses newlines into spaces so CSV fields stay on a single line.
-/// Returns `Cow::Borrowed` when no transformation is needed (>99% of inputs),
-/// avoiding allocation for clean strings.
-/// Uses SIMD-accelerated memchr2 for the fast-path check.
+/// Keeps a CSV field on one line.
+/// A string with no `\n` or `\r` (over 99% of inputs) comes back as
+/// `Cow::Borrowed`, without allocating. SIMD-accelerated `memchr2` does that check.
+/// Otherwise every run of whitespace, newlines included, becomes one space,
+/// and leading and trailing whitespace is dropped.
 fn sanitize_field(s: &str) -> Cow<'_, str> {
     if memchr2(b'\n', b'\r', s.as_bytes()).is_none() {
         return Cow::Borrowed(s);
@@ -284,14 +287,14 @@ pub fn is_disambiguation(text: &str) -> bool {
 }
 
 /// Strips `{{...}}` templates from text, handling nested braces.
-/// Uses SIMD-accelerated memchr2 to skip over plain text between brace pairs.
+/// SIMD-accelerated `memchr2` skips the plain text between braces.
 fn strip_templates(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut run_start = 0;
 
-    // Outer loop: use SIMD to jump to the next '{' character
+    // Outer loop: use SIMD to jump to the next '{' or '}'
     while i < bytes.len() {
         match memchr2(b'{', b'}', &bytes[i..]) {
             None => break, // No more braces; the rest is plain text
@@ -302,7 +305,7 @@ fn strip_templates(text: &str) -> String {
                     if run_start < i {
                         result.push_str(&text[run_start..i]);
                     }
-                    // Inner loop: find matching '}}' using SIMD to skip between braces
+                    // Inner loop: find the matching '}}'.
                     let mut depth: i32 = 0;
                     while i + 1 < bytes.len() {
                         if bytes[i] == b'{' && bytes[i + 1] == b'{' {
@@ -316,7 +319,7 @@ fn strip_templates(text: &str) -> String {
                             }
                             i += 2;
                         } else {
-                            // SIMD jump to next brace inside template
+                            // Jump to the next brace inside the template.
                             match memchr2(b'{', b'}', &bytes[i..]) {
                                 Some(inner_offset) if inner_offset > 0 => i += inner_offset,
                                 _ => {

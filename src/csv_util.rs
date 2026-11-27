@@ -132,9 +132,9 @@ impl std::fmt::Display for CsvLayout {
 
 /// Detects whether the output directory holds merged or sharded CSV files.
 ///
-/// A merged `nodes.csv` wins when both are present: that is the state after
-/// a merge that did not archive its shards, and the merged files are the
-/// ones load and analytics need.
+/// A merged `nodes.csv` wins when both are present. That happens after a
+/// merge that did not archive its shards, and load and analytics need the
+/// merged files.
 pub fn detect_csv_layout(output_dir: &str) -> Result<CsvLayout> {
     if Path::new(output_dir)
         .join(CsvType::Nodes.merged_file_name())
@@ -155,9 +155,9 @@ pub fn detect_csv_layout(output_dir: &str) -> Result<CsvLayout> {
 
 /// The number of node shards in `output_dir`.
 ///
-/// Fails unless the shards are numbered exactly `0..N`, since a gap means
-/// files from different runs (or a lost file) and merging them would
-/// silently drop or mix data.
+/// Fails unless the shards are numbered exactly `0..N`. A gap means a lost
+/// file or files from different runs, and merging those would silently drop
+/// or mix data.
 pub fn count_shards(output_dir: &str) -> Result<u32> {
     let indices = shard_indices(output_dir, CsvType::Nodes)?;
     if indices.is_empty() {

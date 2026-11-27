@@ -1,8 +1,8 @@
 //! Index persistence using `postcard` serialization.
 //!
-//! Saves and loads `WikiIndex` as `index.cache`, validating against input file
-//! mtime and size. Uses zero-copy serialization via `IndexCacheSer` to avoid
-//! cloning ~17M strings during writes.
+//! Saves and loads `WikiIndex` as `index.cache`. A cache is used only when its
+//! `CACHE_VERSION`, input path, and the input's mtime and size all match.
+//! `IndexCacheSer` borrows the maps, so writing does not clone ~17M strings.
 
 use crate::atomic_file::write_atomically;
 use crate::config::CACHE_VERSION;
@@ -69,7 +69,8 @@ fn get_input_metadata(input_path: &str) -> Result<(u64, u64)> {
     Ok((mtime, size))
 }
 
-/// Returns `Ok(Some(index))` if the cache is valid, `Ok(None)` if missing or stale.
+/// Returns `Ok(Some(index))` if the cache is valid. Returns `Ok(None)` if it is
+/// missing, corrupt, has trailing bytes, or is stale.
 pub fn try_load_index(cache_path: &Path, input_path: &str) -> Result<Option<WikiIndex>> {
     if !cache_path.exists() {
         return Ok(None);
