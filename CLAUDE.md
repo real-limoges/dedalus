@@ -75,7 +75,16 @@ The binary uses `mimalloc` as the global allocator.
 
 ## Running
 
-Subcommands: `extract`, `merge-csvs`, `analytics`, `load`, `pipeline`, `stats`, and `tui`.
+Subcommands: `download`, `extract`, `merge-csvs`, `analytics`, `load`, `pipeline`, `stats`, and `tui`.
+
+### Download
+
+```bash
+dedalus download -o ~/models [--date 20261101] [--mirror <url>]
+```
+
+Fetches one dated multistream dump and its index from `enwiki/<date>/`, with the date taken from `latest/` when `--date` is absent.
+Each file resumes from `<name>.part` and gets its final, dated name only once its SHA-1 matches Wikimedia's list.
 
 ### Pipeline (Recommended)
 
@@ -186,6 +195,7 @@ The CSVs are the hand-off between passes; the DuckDB file is a queryable copy of
 ### Core Modules
 
 - **`main.rs`**: CLI entry point (`clap` subcommands), `tracing` setup, `mimalloc` allocator.
+- **`download.rs`**: `run_download` reads the release from the SHA-1 list (`release_from_checksums`), then fetches the index and the dump through `fetch_verified`: Range resumes into `.part`, mirror fallback, and a rename only after the SHA-1 matches.
 - **`parser.rs`**: `PageParser<R>`, a streaming `quick-xml` state machine implementing `Iterator<Item = WikiPage>`; per-page state is reset on every `<page>`, and a parse error is recorded rather than ending the stream silently.
   `WikiReader` wraps it with bz2 decompression, using `lbzip2` or `pbzip2` from `PATH` when present; `WikiReader::finish` fails on a parser error or a nonzero decompressor exit, and kills the child if reading stopped early.
 - **`multistream.rs`**: parses the multistream index into `StreamRange`s (offsets must increase and lie inside the dump), parses one stream (`parse_stream`, a positioned read on a dump handle shared by every thread, from `open_dump`) or a run of streams in dump order (`parse_streams`), and finds the index from the dump's name (`detect_index_path`).
@@ -247,12 +257,14 @@ Sharded extraction is faster (about 1.6x with 14 shards in earlier benchmarks), 
 - `duckdb`: DuckDB client (links Homebrew's library locally, DuckDB's prebuilt release in CI)
 - `ratatui` / `crossterm`: TUI
 - `mimalloc`: global allocator
+- `ureq`: blocking HTTP for `download` (rustls, no gzip, so Range resumes stay byte-exact)
+- `sha1`: dump verification
 
 ## Testing
 
 `just pre-push` must pass before committing; CI adds `just msrv` and `just smoke`.
 
-- **Unit tests**: inline in most modules (parser, multistream, title, index, extract, checkpoint, cache, atomic_file, stats, csv_util, merge, analytics, load, content, infobox, models, tui/ui).
+- **Unit tests**: inline in most modules (download, parser, multistream, title, index, extract, checkpoint, cache, atomic_file, stats, csv_util, merge, analytics, load, content, infobox, models, tui/ui).
 - **`tests/integration_test.rs`**: parsing, indexing, exact edges, blobs and abstracts, sharding, crash-and-resume equivalence, exact limits, and a round trip from extract through merge, analytics and load into DuckDB.
 - **`tests/test_merge_csvs.rs`**: merging with cross-shard deduplication.
 

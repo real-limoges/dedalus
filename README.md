@@ -42,13 +42,17 @@ duckdb output/wikipedia.duckdb
 
 ## Getting a Wikipedia Dump
 
-Download from [Wikimedia Downloads](https://dumps.wikimedia.org/enwiki/latest/), or run `scripts/download_wikipedia.sh`, which picks the fastest mirror.
-Use the **multistream** format and fetch its index too:
+`dedalus download` fetches the **multistream** dump and its index, and checks both against Wikimedia's SHA-1 list:
 
 ```bash
-wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
-wget https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream-index.txt.bz2
+dedalus download -o ~/models                  # the release latest/ points at
+dedalus download -o ~/models --date 20261101  # a specific release
 ```
+
+It reads the release date from `latest/`, then downloads from that date's directory, so the files keep their dated names (`enwiki-20261101-pages-articles-multistream.xml.bz2`).
+An interrupted download resumes from its `.part` file, and a mirror that fails or stalls for 60 seconds hands over to the next.
+A file gets its final name only once its SHA-1 matches; a mismatched part is deleted so a rerun starts over.
+`--mirror <url>` replaces the built-in mirror list.
 
 A multistream dump is a few hundred thousand independent bz2 streams of about 100 pages each, and the index file lists their byte offsets.
 Dedalus uses the index to decompress and parse streams in parallel on every core.
@@ -337,4 +341,5 @@ git config core.hooksPath .githooks    # Run `just pre-push` before every push
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+BSD 2-Clause License.
+See [LICENSE](LICENSE).
