@@ -25,6 +25,7 @@
 //!
 //! # Modules
 //!
+//! - [`download`]: fetch one dated multistream dump and its index, SHA-1 verified
 //! - [`parser`]: streaming XML parser with bz2 decompression
 //! - [`multistream`]: multistream index parsing and per-stream parallel parsing
 //! - [`index`]: title-to-ID map with redirect resolution
@@ -50,6 +51,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod content;
 pub mod csv_util;
+pub mod download;
 pub mod extract;
 pub mod index;
 pub mod infobox;

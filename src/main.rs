@@ -1,7 +1,7 @@
 //! CLI entry point for the Dedalus pipeline.
 //!
-//! Each operation is a `clap` subcommand: extract, merge-csvs, analytics, load,
-//! pipeline, stats and tui. `-v` sets the `tracing` log level, and `mimalloc`
+//! Each operation is a `clap` subcommand: download, extract, merge-csvs,
+//! analytics, load, pipeline, stats and tui. `-v` sets the `tracing` log level, and `mimalloc`
 //! is the global allocator.
 
 use anyhow::{Context, Result, bail};
@@ -36,6 +36,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Download one dated multistream dump and its index, verified by SHA-1
+    Download(DownloadArgs),
     /// Extract a Wikipedia dump into CSV files and JSON blobs
     Extract(ExtractArgs),
     /// Compute graph analytics (PageRank, communities, degree) into analytics.csv
@@ -50,6 +52,21 @@ enum Commands {
     Stats(StatsArgs),
     /// Open the interactive TUI to configure and monitor runs
     Tui,
+}
+
+#[derive(Args)]
+struct DownloadArgs {
+    /// Directory to download the dump and index into
+    #[arg(short, long)]
+    output: String,
+
+    /// Dump date (YYYYMMDD); defaults to the release latest/ points at
+    #[arg(long)]
+    date: Option<dedalus::download::DumpDate>,
+
+    /// Mirror base URL, ending in `/`, to use instead of the built-in list
+    #[arg(long)]
+    mirror: Option<String>,
 }
 
 #[derive(Args)]
@@ -213,6 +230,35 @@ fn at_least_one(s: &str) -> Result<u32, String> {
         Ok(_) => Err("must be at least 1".to_string()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+fn run_download(args: DownloadArgs) -> Result<()> {
+    let mirrors = match args.mirror {
+        Some(mirror) => vec![mirror],
+        None => dedalus::download::MIRRORS
+            .iter()
+            .map(|mirror| mirror.to_string())
+            .collect(),
+    };
+    let job = dedalus::download::DownloadJob {
+        output_dir: args.output.into(),
+        date: args.date,
+        mirrors,
+    };
+    let downloaded = dedalus::download::run_download(&job)?;
+
+    println!();
+    println!("=== Download Summary ===");
+    println!("Dump date: {}", downloaded.date);
+    println!("Dump:      {}", downloaded.dump.display());
+    println!("Index:     {}", downloaded.index.display());
+    println!();
+    println!("Both match Wikimedia's SHA-1 list. Run:");
+    println!(
+        "  dedalus pipeline -i {} -o output/ -v",
+        downloaded.dump.display()
+    );
+    Ok(())
 }
 
 fn run_extract(args: ExtractArgs) -> Result<()> {
@@ -577,6 +623,7 @@ fn main() -> ExitCode {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     let result = match cli.command {
+        Commands::Download(args) => run_download(args),
         Commands::Extract(args) => run_extract(args),
         Commands::Analytics(args) => run_analytics(args),
         Commands::Load(args) => run_load(args),

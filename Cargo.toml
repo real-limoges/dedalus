@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A Rust pipeline that extracts Wikipedia dumps into graph CSVs, JSON blobs and graph analytics"
 repository = "https://github.com/real-limoges/dedalus"
-license = "MIT"
+license = "BSD-2-Clause"
 authors = ["Real Limoges"]
 keywords = ["wikipedia", "graph", "extraction", "pagerank"]
 categories = ["command-line-utilities"]
@@ -32,8 +32,11 @@ regex = "1.12.3"
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha1 = "0.11.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# No gzip: a transparently decompressed body would break Range resumes.
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
